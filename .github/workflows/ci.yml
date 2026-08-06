@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # rodio needs ALSA to build on Linux.
+      - name: Install ALSA
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - run: cargo fmt --all -- --check
+
+      - run: cargo clippy --all-targets -- -D warnings
+
+      - run: cargo build --verbose
+
+      # The tests open an audio device; give Linux a dummy one.
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y alsa-utils
+          sudo modprobe snd-dummy || true
+          cargo test --verbose
+        continue-on-error: true
+
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --verbose

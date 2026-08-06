@@ -1,0 +1,23 @@
+[package]
+name = "tuneterm"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal music player that shows real album art"
+license = "MIT"
+repository = "https://github.com/fess932/tuneterm"
+keywords = ["music", "player", "tui", "terminal", "ratatui"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0.104"
+image = "0.25"
+lofty = "0.24"
+ratatui = "0.30"
+# chafa is a C library and only improves the halfblocks fallback; the kitty /
+# sixel / iterm2 protocols work without it. Opt back in with `chafa-dyn` after
+# `brew install chafa` if you want nicer art on graphics-less terminals.
+ratatui-image = { version = "11", default-features = false, features = [
+    "image-defaults",
+    "crossterm",
+] }
+rodio = "0.22"

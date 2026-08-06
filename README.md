@@ -1,0 +1,226 @@
+<div align="center">
+
+# tuneterm
+
+**A terminal music player that shows real album art.**
+
+Three panes, mouse support, and covers rendered through the kitty / iTerm2 / sixel
+graphics protocols — with a unicode-halfblock fallback so it degrades instead of
+breaking.
+
+[![CI](https://github.com/fess932/tuneterm/actions/workflows/ci.yml/badge.svg)](https://github.com/fess932/tuneterm/actions/workflows/ci.yml)
+[![Release](https://github.com/fess932/tuneterm/actions/workflows/release.yml/badge.svg)](https://github.com/fess932/tuneterm/actions/workflows/release.yml)
+![Rust](https://img.shields.io/badge/rust-2024%20edition-orange?logo=rust)
+![License](https://img.shields.io/badge/license-MIT-blue)
+
+</div>
+
+```
+╭ Library ───────────────╮╭ Tracks ───────────────────────╮╭ Now Playing ──────╮
+│FOLDER              №   ││  #  TITLE          ARTIST TIME││                   │
+│Deep Purple / =1    13  ││▶  1 Show Me        Deep P 3:41││   ▄▄▄▄▄▄▄▄▄▄▄▄▄   │
+│Lumen / Диссонанс   20  ││   2 A Bit On The S Deep P 4:12││   █ real cover █  │
+│Moby / Last Night   14  ││   3 Sharp Shooter  Deep P 3:29││   █   pixels  █   │
+│                        ││   4 Portable Door  Deep P 3:12││   ▀▀▀▀▀▀▀▀▀▀▀▀▀   │
+│                        ││                               ││                   │
+│                        ││                               ││     Show Me       │
+│                        ││                               ││    Deep Purple    │
+│                        ││                               ││        =1         │
+│                        ││                               ││ 1:02 / 3:41 ──────│
+│                        ││                               ││╭───╮╭───────╮╭───╮│
+│                        ││                               │││ ⏮ ││⏸ Pause││ ⏭ ││
+│                        ││                               ││╰───╯╰───────╯╰───╯│
+╰────────────────────────╯╰───────────────────────────────╯╰───────────────────╯
+ Tab pane  ↑↓ move  ⏎ play  Space pause  n/p track  [/] seek  +/- vol  q quit
+```
+
+## Install
+
+Grab a binary from [Releases](https://github.com/fess932/tuneterm/releases) —
+macOS (Apple Silicon and Intel) and Linux x86-64 are built on every tag.
+
+```sh
+tar xzf tuneterm-aarch64-apple-darwin.tar.gz
+./tuneterm-aarch64-apple-darwin/tuneterm
+```
+
+Or build it yourself. No system libraries needed on macOS; on Linux you need ALSA
+headers (`libasound2-dev`).
+
+```sh
+git clone https://github.com/fess932/tuneterm
+cd tuneterm
+cargo build --release      # a debug build is ~30x slower at drawing covers
+./target/release/tuneterm
+```
+
+## Use
+
+```sh
+tuneterm                     # the Apple Music library if present, else ~/Music
+tuneterm ~/path/to/music     # any folder tree
+tuneterm --scan              # headless: dump folders, tags and cover sizes
+```
+
+`--scan` exists because a TUI swallows errors. Use it to confirm scanning, tag
+reading and cover extraction work before blaming the rendering.
+
+### Keys
+
+| Key | Action |
+| --- | --- |
+| `Tab`, `h`/`l`, `←`/`→` | switch pane |
+| `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn` | move selection |
+| `Enter` | folders: jump to tracks · tracks: play |
+| `Space` | play / pause |
+| `n` / `p` | next / previous track |
+| `[` / `]` | seek ∓5 s |
+| `+` / `-` | volume |
+| `q`, `Esc`, `Ctrl-C` | quit |
+
+### Mouse
+
+| Action | Effect |
+| --- | --- |
+| click a row | focus that pane and select the row |
+| double-click a track | play it |
+| click `⏮` / `⏭` | previous / next track |
+| click `▶ Play` | toggle playback |
+| click the progress bar | seek there |
+| drag the progress bar | scrub |
+| scroll wheel | moves **the pane under the cursor**, focused or not |
+
+A single click never starts audio — that is what the second click is for.
+
+Selecting a folder loads its tracks immediately, and playback advances to the next
+track at the end of a file.
+
+## How it works
+
+| File | Role |
+| --- | --- |
+| `src/main.rs` | entry point, graphics-protocol detection, event loop, input |
+| `src/app.rs` | all mutable state; no rendering |
+| `src/ui.rs` | rendering only; writes back just the hit-test rects |
+| `src/cover.rs` | cover-art worker thread: decode + pre-shrink, with cancellation |
+| `src/library.rs` | folder/track scanning, tags and cover extraction (`lofty`) |
+| `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
+
+Built on [ratatui](https://ratatui.rs) +
+[ratatui-image](https://github.com/benjajaja/ratatui-image) for drawing,
+[rodio](https://github.com/RustAudio/rodio)/symphonia for audio and
+[lofty](https://github.com/Serial-ATA/lofty-rs) for tags.
+
+Cover art comes from the embedded picture tag first, then a sidecar file
+(`cover.jpg`, `folder.jpg`, …) next to the track. Note that Apple Music does **not**
+embed artwork in files — it keeps it in a separate cache — so its library shows no
+covers.
+
+## Notes from building it
+
+Most of the interesting work was in things that are not obvious from the docs.
+
+### Covers load on a worker thread
+
+Album art is routinely 1400 px even though the pane is 300 px, and it *has* to be
+shrunk to fit. In a debug build that costs real time:
+
+| Cover in the file | decode | shrink + encode | total |
+| --- | --- | --- | --- |
+| 300 px | 13 ms | 14 ms | 27 ms |
+| 1000 px | 96 ms | 240 ms | 337 ms |
+| 1400 px | 190 ms | 399 ms | 589 ms |
+| 3000 px | 865 ms | 1.4 s | 2.3 s |
+
+Doing that inline made switching tracks feel like it hung. `src/cover.rs` moves
+decoding *and* pre-shrinking onto one worker thread, so `play_index` now blocks for
+0.6–20 ms — just long enough to start the audio — and the cover appears when it is
+ready.
+
+Requests are **replaced, not queued**: the slot holds at most one, so holding `n`
+down cannot pile up work, and a job is dropped both before and after the expensive
+part if a newer generation has been requested. One thread, ever.
+
+### The cover is drawn at native size
+
+`StatefulImage` letterboxes towards the top-left of the rect it is handed, so
+centring has to be computed by the caller — passing it the full pane width leaves a
+small cover glued to the left edge. `art_cells()` is the single source of truth for
+the size and `centre_in()` centres it; the layout reserves exactly those rows, so no
+rounding gap can open between what is reserved and what is drawn.
+
+Enlarging is deliberately off (`MAX_UPSCALE = 1.0`). Upscaling a 300 px cover to
+600 px means four times the pixels to resize, base64 and push through the terminal —
+16 ms became 450 ms with a Lanczos3 filter. Raise the constant if you want a bigger,
+softer cover.
+
+Cells are not square, so all of this happens in pixels via `picker.font_size()` and
+converts back to cells at the end.
+
+### Graphics protocol detection avoids querying the terminal
+
+| Terminal | Protocol used |
+| --- | --- |
+| kitty, Ghostty | Kitty — the only one with unicode placeholders |
+| WezTerm, iTerm2, Konsole, mintty | iTerm2 inline images |
+| foot, contour, mlterm, `*sixel*` | Sixel |
+| anything else | unicode halfblocks |
+
+The protocol comes from environment variables and the cell size from a `TIOCGWINSZ`
+ioctl — no round-trip to the terminal. That is on purpose.
+
+`Picker::from_query_stdio` (ratatui-image 11.0.6, `picker.rs::query_with_timeout`)
+asks the terminal about its capabilities on a detached thread. If the terminal never
+answers, the main thread gives up on its timeout **but that thread stays blocked in
+`io::stdin().read()` forever** and from then on races crossterm for every keystroke.
+The app then renders perfectly and ignores the keyboard completely. Reproducible in
+any terminal that does not reply — proxied terminals, some multiplexers, CI.
+
+`TUNETERM_QUERY=1` opts into the accurate detection when you know your terminal
+answers.
+
+WezTerm gets the iTerm2 path deliberately: its kitty implementation has no unicode
+placeholders.
+
+### Seeking needs the stream length
+
+`player.rs` hands `Decoder::try_from` the `File` itself. Wrapping it in a
+`BufReader` first hides the length, and symphonia then refuses to seek *backwards* —
+forward works, so it is easy to miss. rodio also reports a seek as successful
+without performing it when nothing is queued.
+
+### chafa is not required
+
+`ratatui-image`'s default features link the C library `chafa`, which only improves
+the *halfblocks* fallback — kitty, sixel and iTerm2 do not touch it. It is disabled
+in `Cargo.toml` so the build needs no system libraries. For nicer art on
+graphics-less terminals:
+
+```sh
+brew install chafa
+# then add "chafa-dyn" to ratatui-image's features
+```
+
+## Tests
+
+```sh
+cargo test                                    # 30 tests
+cargo test -- --ignored --nocapture           # benchmarks, printed
+```
+
+The suite renders the whole UI into a `TestBackend` at sizes down to 8×3, checks the
+cover geometry against a table of source sizes, drives clicks and drags through the
+real hit-testing code, and plays actual audio — the fixture synthesises silent WAV
+files so playback and seeking really run instead of falling into the error path.
+
+## Limitations
+
+- No shuffle, no repeat, no playlist files (`.m3u`).
+- Folder scanning is depth-limited to 5 and runs at startup, so a very large
+  library pauses briefly before the first frame.
+- rodio's decoders cover mp3, flac, m4a/aac, ogg/vorbis and wav. Opus does not work.
+- Seeking a track that has already drained does nothing, per rodio.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
