@@ -37,6 +37,12 @@ pub struct App {
     pub cover_pending: bool,
     /// Where the scaled cover landed on disk, for the OS "now playing" artwork.
     cover_file: Option<PathBuf>,
+    /// The decoded cover kept in memory, with the folder and box it belongs to.
+    ///
+    /// Tracks of an album share a picture, so switching within one can reuse this
+    /// straight away instead of waiting on the worker — which even on a cache hit
+    /// costs a tag read, a PNG decode and a trip through the channel.
+    cover_memo: Option<(PathBuf, (u32, u32), image::DynamicImage)>,
     cover_loader: CoverLoader,
     /// Bumped on every request so late replies can be recognised and dropped.
     cover_generation: u64,
@@ -94,6 +100,7 @@ impl App {
             cover_size: None,
             cover_pending: false,
             cover_file: None,
+            cover_memo: None,
             cover_loader: CoverLoader::new(),
             cover_generation: 0,
             cover_requested_box: (0, 0),
@@ -167,12 +174,28 @@ impl App {
     /// Hand the cover off to the worker and carry on. The old cover is cleared at
     /// once so a stale image never sits under a new track's title.
     fn request_cover(&mut self, path: &Path) {
-        self.cover = None;
-        self.cover_size = None;
-        self.cover_file = None;
+        let box_px = self.art_box_px();
+
+        // Same album, same pane: show the picture we already hold. The worker still
+        // runs and will replace it, so a folder with per-track art self-corrects
+        // instead of being stuck on the wrong cover.
+        let reused = match (&self.cover_memo, path.parent()) {
+            (Some((dir, memo_box, img)), Some(parent)) if dir == parent && *memo_box == box_px => {
+                self.cover_size = Some((img.width().max(1), img.height().max(1)));
+                self.cover = Some(self.picker.new_resize_protocol(img.clone()));
+                true
+            }
+            _ => false,
+        };
+        if !reused {
+            self.cover = None;
+            self.cover_size = None;
+            self.cover_file = None;
+        }
+
         self.cover_pending = true;
         self.cover_generation += 1;
-        self.cover_requested_box = self.art_box_px();
+        self.cover_requested_box = box_px;
         self.cover_loader.request(cover::Request {
             generation: self.cover_generation,
             path: path.to_path_buf(),
@@ -236,11 +259,20 @@ impl App {
         match loaded.image {
             Some(img) => {
                 self.cover_size = Some((img.width().max(1), img.height().max(1)));
+                // Keep a copy so the rest of the album needs no worker at all.
+                if let Some(dir) = self
+                    .now_playing()
+                    .and_then(|t| t.path.parent())
+                    .map(Path::to_path_buf)
+                {
+                    self.cover_memo = Some((dir, self.cover_requested_box, img.clone()));
+                }
                 self.cover = Some(self.picker.new_resize_protocol(img));
             }
             None => {
                 self.cover_size = None;
                 self.cover = None;
+                self.cover_memo = None;
             }
         }
     }
@@ -894,6 +926,8 @@ mod bench {
             let t = Instant::now();
             app.play_index(round);
             let blocked = t.elapsed();
+            // Reused from the album already in memory, so no blank frame.
+            let instant = app.cover.is_some();
 
             let t = Instant::now();
             let mut waited = Duration::ZERO;
@@ -903,8 +937,8 @@ mod bench {
                 waited = t.elapsed();
             }
             println!(
-                "  play_index blocked {:>8.1?}   cover ready after {:>8.1?}   size {:?}",
-                blocked, waited, app.cover_size
+                "  play_index blocked {:>8.1?}   shown at once: {:<5}   worker replied after {:>8.1?}",
+                blocked, instant, waited
             );
         }
         let _ = std::fs::remove_dir_all(&root);

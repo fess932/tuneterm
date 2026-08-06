@@ -184,6 +184,13 @@ Requests are **replaced, not queued**: the slot holds at most one, so holding `n
 down cannot pile up work, and a job is dropped both before and after the expensive
 part if a newer generation has been requested. One thread, ever.
 
+Switching within an album shows the cover **in the same frame**, with no blank gap:
+the decoded picture stays in memory, keyed by folder and pane size, and is reused
+directly. That costs ~1 ms against the ~20 ms it takes to start the audio. The worker
+still runs and replaces the image, so a folder with per-track art corrects itself
+rather than being stuck. While a cover is in flight the event loop also polls at
+15 ms instead of 120 ms, since the worker has no way to wake it.
+
 ### Scaled covers are cached on disk
 
 Every track on an album carries the same picture, so the cache is keyed on the
@@ -221,6 +228,22 @@ can open between what is reserved and what is drawn.
 
 Cells are not square, so all of this happens in pixels via `picker.font_size()` and
 converts back to cells at the end.
+
+### Russian tags that lie about their encoding
+
+`Аффинаж — Дети` showed up as `Âàíÿ`, `Ñàøà`, `Ïàïà`. Not a decoder bug: the ID3v2.3
+`TIT2` frame declares encoding `0x00` (ISO-8859-1) and then carries CP1251 bytes —
+`c2 e0 ed ff` for `Ваня`. Decoding that per spec gives exactly the mojibake above,
+which is why ffmpeg prints it too.
+
+Very common in Russian MP3s, so tags are run through a recovery pass. It only fires
+when the text really looks like that mistake: two or more high bytes which
+*outnumber* the ASCII letters, and a CP1251 reading that comes out mostly Cyrillic.
+Cyrillic-as-Latin-1 turns whole words into high bytes, while an accented Latin word
+has one or two among ASCII letters — so `Björk`, `Motörhead`, `Sigur Rós` and
+`Éléphant` are left alone. There are tests for each.
+
+Tags carrying only an album artist and no track artist fall back to it.
 
 ### Graphics protocol detection avoids querying the terminal
 
@@ -269,7 +292,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 50 tests
+cargo test                                    # 56 tests
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```

@@ -343,8 +343,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        // Poll so the progress bar keeps ticking while idle.
-        let ready = event::poll(Duration::from_millis(120))?;
+        // Idle at a lazy 120ms, but poll briskly while a cover is in flight: the
+        // worker cannot wake this loop, so the timeout is what delays the artwork.
+        let timeout = if app.cover_pending {
+            Duration::from_millis(15)
+        } else {
+            Duration::from_millis(120)
+        };
+        let ready = event::poll(timeout)?;
         if ready {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => on_key(app, key),
