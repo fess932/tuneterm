@@ -168,24 +168,24 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
     draw_controls(frame, app, controls);
 }
 
-/// How far a small cover may be enlarged. `1.0` means never: a cover smaller than
-/// its box is drawn at native size and centred.
+/// The render thread never enlarges a cover — `cover.rs` already scaled it to fill
+/// the pane on a worker thread.
 ///
-/// Enlarging is what makes switching tracks feel slow. Measured on a 300 px cover
-/// in a debug build, cost of the first frame after a new cover:
+/// Doing it here instead is what made switching tracks feel slow. Cost of the first
+/// frame after a new cover, 300 px source, debug build:
 ///
-/// | target        | filter   | first frame |
+/// | drawn at      | filter   | first frame |
 /// |---------------|----------|-------------|
-/// | 300px, native | —        | 16 ms       |
+/// | 300px, as-is  | —        | 16 ms       |
 /// | 600px (2x)    | Nearest  | 153 ms      |
 /// | 600px (2x)    | Lanczos3 | 450 ms      |
 ///
-/// Four times the pixels to resize, base64 and push through the terminal. Raise
-/// this for a bigger cover and accept the lag; a release build divides it by ~30.
+/// Four times the pixels to resize, base64 and push through the terminal. The
+/// worker pays that off-screen instead, so this stays at 1.0.
 const MAX_UPSCALE: f32 = 1.0;
 
-/// Only ever used to shrink an oversized cover, so a cheap filter is plenty —
-/// Lanczos3 costs 3x more for no visible gain at these sizes.
+/// Only reached when the pane shrank and the worker has not caught up yet, so a
+/// cheap filter is right: Lanczos3 costs 3x more for a frame or two of transition.
 const ART_FILTER: FilterType = FilterType::Triangle;
 
 fn cell_size(app: &App) -> (f32, f32) {
@@ -604,7 +604,7 @@ mod bench {
             // 60x30 cells at 10x20 px == 600x600 px target: the real-world case.
             let area = Rect::new(0, 0, 60, 30);
             let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
-            let mut render = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+            let render = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
                 let r = resize.clone();
                 terminal
                     .draw(|f| {

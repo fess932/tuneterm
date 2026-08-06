@@ -157,14 +157,19 @@ fn read_track(path: PathBuf) -> Track {
     track
 }
 
-/// Cover art for a track: embedded picture first, then a sidecar file in the folder.
-pub fn load_cover(path: &Path) -> Option<DynamicImage> {
+/// Raw encoded bytes of a track's cover: embedded picture first, then a sidecar
+/// file in the folder.
+///
+/// Returned undecoded on purpose. Decoding is the expensive half, and the bytes are
+/// what the cache is keyed on — every track on an album carries the same ones.
+pub fn load_cover_bytes(path: &Path) -> Option<Vec<u8>> {
     if let Ok(tagged) = lofty::read_from_path(path) {
         for tag in tagged.tags() {
-            if let Some(pic) = tag.pictures().first()
-                && let Ok(img) = image::load_from_memory(pic.data())
-            {
-                return Some(img);
+            if let Some(pic) = tag.pictures().first() {
+                let data = pic.data();
+                if !data.is_empty() {
+                    return Some(data.to_vec());
+                }
             }
         }
     }
@@ -173,12 +178,18 @@ pub fn load_cover(path: &Path) -> Option<DynamicImage> {
     for name in COVER_NAMES {
         let candidate = dir.join(name);
         if candidate.is_file()
-            && let Ok(img) = image::open(&candidate)
+            && let Ok(bytes) = std::fs::read(&candidate)
+            && !bytes.is_empty()
         {
-            return Some(img);
+            return Some(bytes);
         }
     }
     None
+}
+
+/// Cover art for a track, decoded. Convenience wrapper over [`load_cover_bytes`].
+pub fn load_cover(path: &Path) -> Option<DynamicImage> {
+    image::load_from_memory(&load_cover_bytes(path)?).ok()
 }
 
 pub fn fmt_duration(d: Duration) -> String {

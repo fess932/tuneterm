@@ -37,8 +37,8 @@ pub struct App {
     cover_loader: CoverLoader,
     /// Bumped on every request so late replies can be recognised and dropped.
     cover_generation: u64,
-    /// `max_px` of the outstanding/last request, to notice when the pane outgrows it.
-    cover_requested_px: u32,
+    /// Box of the outstanding/last request, to notice when the pane changes size.
+    cover_requested_box: (u32, u32),
     /// Largest box the art could occupy, in cells. Written during render; used to
     /// tell the worker how far to shrink.
     pub art_budget: Rect,
@@ -87,7 +87,7 @@ impl App {
             cover_pending: false,
             cover_loader: CoverLoader::new(),
             cover_generation: 0,
-            cover_requested_px: 0,
+            cover_requested_box: (0, 0),
             art_budget: Rect::ZERO,
             play_area: Rect::ZERO,
             prev_area: Rect::ZERO,
@@ -160,23 +160,27 @@ impl App {
         self.cover_size = None;
         self.cover_pending = true;
         self.cover_generation += 1;
-        self.cover_requested_px = self.art_max_px();
+        self.cover_requested_box = self.art_box_px();
         self.cover_loader.request(cover::Request {
             generation: self.cover_generation,
             path: path.to_path_buf(),
-            max_px: self.cover_requested_px,
+            box_px: self.cover_requested_box,
         });
     }
 
-    /// Re-fetch the cover when the pane has grown past what we asked for, since a
-    /// cover pre-shrunk for a small pane would otherwise stay small forever.
-    /// Shrinking the pane needs nothing: `Resize::Fit` handles that on the fly.
+    /// Re-scale the cover after the pane changed size. The worker pre-scales to
+    /// exactly fit the pane, so any real change needs a new pass — otherwise the
+    /// render thread would have to resize, which is what the worker exists to avoid.
+    ///
+    /// A small threshold keeps a one-column nudge from restarting the work.
     pub fn refresh_cover_for_resize(&mut self) {
-        if self.cover_pending || self.cover_requested_px == 0 {
+        const SLACK: u32 = 16;
+        if self.cover_pending || self.cover_requested_box == (0, 0) {
             return;
         }
-        let wanted = self.art_max_px();
-        if wanted <= self.cover_requested_px {
+        let (want_w, want_h) = self.art_box_px();
+        let (had_w, had_h) = self.cover_requested_box;
+        if want_w.abs_diff(had_w) < SLACK && want_h.abs_diff(had_h) < SLACK {
             return;
         }
         let Some(path) = self.now_playing().map(|t| t.path.clone()) else {
@@ -185,20 +189,20 @@ impl App {
         self.request_cover(&path);
     }
 
-    /// Longest side the art could be drawn at.
+    /// The pixel box the art will occupy.
     ///
-    /// Must be exact, not a floor: asking for more than the pane can show means
-    /// the render thread has to shrink the image again, which is the work this
-    /// whole detour exists to avoid.
-    fn art_max_px(&self) -> u32 {
+    /// Must be exact: the worker scales to fill it, and the renderer then draws the
+    /// result 1:1. Asking for the wrong size puts a resize back on the render thread.
+    fn art_box_px(&self) -> (u32, u32) {
         /// Used only before the first frame, when the budget is still zero.
-        const FALLBACK: u32 = 512;
+        const FALLBACK: (u32, u32) = (512, 512);
         let font = self.picker.font_size();
         let width = self.art_budget.width as u32 * font.width.max(1) as u32;
         let height = self.art_budget.height as u32 * font.height.max(1) as u32;
-        match width.max(height) {
-            0 => FALLBACK,
-            longest => longest,
+        if width == 0 || height == 0 {
+            FALLBACK
+        } else {
+            (width, height)
         }
     }
 
@@ -728,9 +732,12 @@ mod tests {
         assert!(!app.cover_pending, "a stale reply revived the pending flag");
     }
 
-    /// Growing the pane must re-request; shrinking must not.
+    /// The worker scales to fill the pane exactly, so both growing and shrinking
+    /// need a fresh pass — otherwise the render thread ends up resizing. A nudge
+    /// smaller than the slack must be ignored, or every column of a drag restarts
+    /// the work.
     #[test]
-    fn only_a_bigger_pane_refetches_the_cover() {
+    fn a_resized_pane_refetches_but_a_nudge_does_not() {
         let lib = Library::new("cover-resize");
         let mut app = lib.app();
         app.art_budget = Rect::new(0, 0, 30, 15);
@@ -740,11 +747,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        app.art_budget = Rect::new(0, 0, 10, 5); // smaller
+        // One column at 10 px per cell is inside the 16 px slack.
+        app.art_budget = Rect::new(0, 0, 31, 15);
         app.refresh_cover_for_resize();
-        assert!(!app.cover_pending, "shrinking needs no refetch");
+        assert!(!app.cover_pending, "a one-column nudge must not refetch");
 
-        app.art_budget = Rect::new(0, 0, 90, 45); // bigger
+        app.art_budget = Rect::new(0, 0, 10, 5);
+        app.refresh_cover_for_resize();
+        assert!(app.cover_pending, "shrinking must refetch");
+
+        while app.cover_pending {
+            app.poll_cover();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.art_budget = Rect::new(0, 0, 90, 45);
         app.refresh_cover_for_resize();
         assert!(app.cover_pending, "growing must refetch");
     }

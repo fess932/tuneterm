@@ -102,7 +102,8 @@ track at the end of a file.
 | `src/main.rs` | entry point, graphics-protocol detection, event loop, input |
 | `src/app.rs` | all mutable state; no rendering |
 | `src/ui.rs` | rendering only; writes back just the hit-test rects |
-| `src/cover.rs` | cover-art worker thread: decode + pre-shrink, with cancellation |
+| `src/cover.rs` | cover-art worker thread: decode + scale, cached, with cancellation |
+| `src/cache.rs` | on-disk cover cache, content-keyed, 200 MB cap, oldest-first eviction |
 | `src/library.rs` | folder/track scanning, tags and cover extraction (`lofty`) |
 | `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
 
@@ -133,7 +134,7 @@ shrunk to fit. In a debug build that costs real time:
 | 3000 px | 865 ms | 1.4 s | 2.3 s |
 
 Doing that inline made switching tracks feel like it hung. `src/cover.rs` moves
-decoding *and* pre-shrinking onto one worker thread, so `play_index` now blocks for
+decoding *and* scaling onto one worker thread, so `play_index` now blocks for
 0.6–20 ms — just long enough to start the audio — and the cover appears when it is
 ready.
 
@@ -141,18 +142,40 @@ Requests are **replaced, not queued**: the slot holds at most one, so holding `n
 down cannot pile up work, and a job is dropped both before and after the expensive
 part if a newer generation has been requested. One thread, ever.
 
-### The cover is drawn at native size
+### Scaled covers are cached on disk
+
+Every track on an album carries the same picture, so the cache is keyed on the
+**bytes of the source picture** (FNV-1a, ~0.2 ms) rather than the track path — one
+entry per album, shared across runs. Scaling to a 600 px pane, debug build:
+
+| Source | first track | rest of the album |
+| --- | --- | --- |
+| 300 px | 445 ms | **21 ms** |
+| 1400 px | 1.6 s | **24 ms** |
+
+Entries live in the platform cache directory (`~/Library/Caches/tuneterm`,
+`$XDG_CACHE_HOME/tuneterm`, `%LOCALAPPDATA%\tuneterm`), capped at **200 MB** and
+evicted oldest-first after each write. `TUNETERM_CACHE_DIR` overrides the location.
+
+### Who scales the cover, and why it matters
+
+The worker scales to *fill* the pane; the render thread never resizes. That split is
+the whole point — doing it inline is what made switching tracks feel slow:
+
+| drawn at | filter | first frame |
+| --- | --- | --- |
+| 300 px, as-is | — | 16 ms |
+| 600 px (2×) | Nearest | 153 ms |
+| 600 px (2×) | Lanczos3 | 450 ms |
+
+Four times the pixels to resize, base64 and push through the terminal. The worker
+pays that off-screen and uses Lanczos3, which it can afford.
 
 `StatefulImage` letterboxes towards the top-left of the rect it is handed, so
-centring has to be computed by the caller — passing it the full pane width leaves a
-small cover glued to the left edge. `art_cells()` is the single source of truth for
-the size and `centre_in()` centres it; the layout reserves exactly those rows, so no
-rounding gap can open between what is reserved and what is drawn.
-
-Enlarging is deliberately off (`MAX_UPSCALE = 1.0`). Upscaling a 300 px cover to
-600 px means four times the pixels to resize, base64 and push through the terminal —
-16 ms became 450 ms with a Lanczos3 filter. Raise the constant if you want a bigger,
-softer cover.
+centring is the caller's job — passing it the full pane width leaves a small cover
+glued to the left edge. `art_cells()` is the single source of truth for the size and
+`centre_in()` centres it; the layout reserves exactly those rows, so no rounding gap
+can open between what is reserved and what is drawn.
 
 Cells are not square, so all of this happens in pixels via `picker.font_size()` and
 converts back to cells at the end.
@@ -204,7 +227,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 30 tests
+cargo test                                    # 40 tests
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```
 
