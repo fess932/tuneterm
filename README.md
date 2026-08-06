@@ -302,6 +302,13 @@ cover geometry against a table of source sizes, drives clicks and drags through 
 real hit-testing code, and plays actual audio — the fixture synthesises silent WAV
 files so playback and seeking really run instead of falling into the error path.
 
+## Where this could go
+
+[PLAN.md](PLAN.md) sketches the other places music could come from — Subsonic,
+WebDAV, podcasts, cloud storage, radio, Spotify — ranked by how well each fits the
+table interface and what it would cost. The recurring conclusion is that the sources
+are the easy part; the `Source` abstraction and a seekable HTTP reader are the work.
+
 ## Limitations
 
 - No shuffle, no repeat, no playlist files (`.m3u`).
