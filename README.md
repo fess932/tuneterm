@@ -37,7 +37,8 @@ breaking.
 ## Install
 
 Grab a binary from [Releases](https://github.com/fess932/tuneterm/releases) —
-macOS (Apple Silicon and Intel) and Linux x86-64 are built on every tag.
+macOS (Apple Silicon and Intel), Linux x86-64 and Windows x86-64 are built on
+every tag.
 
 ```sh
 tar xzf tuneterm-aarch64-apple-darwin.tar.gz
@@ -60,10 +61,39 @@ cargo build --release      # a debug build is ~30x slower at drawing covers
 tuneterm                     # the Apple Music library if present, else ~/Music
 tuneterm ~/path/to/music     # any folder tree
 tuneterm --scan              # headless: dump folders, tags and cover sizes
+tuneterm --no-media          # skip the OS media-key integration
 ```
 
 `--scan` exists because a TUI swallows errors. Use it to confirm scanning, tag
 reading and cover extraction work before blaming the rendering.
+
+### Media keys
+
+Play/pause, next and previous work from the keyboard's media keys, headphone
+buttons, Control Center and MPRIS — **including while the terminal is in the
+background**. Title, artist and cover art show up in the system's now-playing panel.
+
+Media keys never reach a terminal app through stdin; the OS takes them first. So
+there is no cheaper "only while focused" version — either the app registers with the
+OS, which also makes it work in the background, or it does nothing at all.
+
+| Platform | Mechanism | State |
+| --- | --- | --- |
+| macOS | `MPRemoteCommandCenter` | works; needs a run loop on the main thread |
+| Linux | MPRIS over D-Bus | works; also gives `playerctl` and desktop widgets |
+| Windows | `SystemMediaTransportControls` | builds; **runtime untested** |
+
+Windows needs an `HWND`, which a console app has via `GetConsoleWindow()` — but under
+a pseudo console (Windows Terminal, WezTerm) that window is the hidden ConPTY host,
+and whether Windows accepts it for a media session is unverified. Failure is not
+fatal: the player runs and says so in the status line.
+
+`--no-media` skips the whole thing.
+
+That macOS requirement is why `main` is shaped the way it is: AppKit only delivers to
+the main thread's run loop, so the TUI runs on a worker thread and the main thread
+services the OS. The app is built inside that worker because cpal's audio stream is
+not `Send`.
 
 ### Keys
 
@@ -106,6 +136,7 @@ track at the end of a file.
 | `src/cache.rs` | on-disk cover cache, content-keyed, 200 MB cap, oldest-first eviction |
 | `src/library.rs` | folder/track scanning, tags and cover extraction (`lofty`) |
 | `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
+| `src/media.rs` | OS media keys and now-playing metadata (`souvlaki`) |
 
 Built on [ratatui](https://ratatui.rs) +
 [ratatui-image](https://github.com/benjajaja/ratatui-image) for drawing,
@@ -227,7 +258,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 40 tests
+cargo test                                    # 44 tests
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```
 

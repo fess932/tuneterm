@@ -421,7 +421,12 @@ mod tests {
     use crate::app::App;
 
     fn app() -> App {
-        App::new(PathBuf::from("."), Picker::halfblocks()).expect("app init")
+        App::new(
+            PathBuf::from("."),
+            Picker::halfblocks(),
+            crate::media::Bridge::detached(),
+        )
+        .expect("app init")
     }
 
     #[test]
@@ -430,6 +435,7 @@ mod tests {
         let mut app = App::new(
             PathBuf::from(std::env::var("TUNETERM_ROOT").unwrap_or_else(|_| ".".into())),
             Picker::halfblocks(),
+            crate::media::Bridge::detached(),
         )
         .expect("app init");
         terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
@@ -597,7 +603,12 @@ mod bench {
         for (name, resize) in cases {
             let mut picker = Picker::halfblocks();
             picker.set_protocol_type(ProtocolType::Kitty);
-            let mut app = App::new(std::path::PathBuf::from("."), picker).expect("app");
+            let mut app = App::new(
+                std::path::PathBuf::from("."),
+                picker,
+                crate::media::Bridge::detached(),
+            )
+            .expect("app");
             app.cover_size = Some((img.width(), img.height()));
             app.cover = Some(app.picker.new_resize_protocol(img.clone()));
 
@@ -659,7 +670,12 @@ mod bench {
 
             let mut picker = Picker::halfblocks();
             picker.set_protocol_type(ProtocolType::Kitty);
-            let mut app = App::new(std::path::PathBuf::from("."), picker).expect("app");
+            let mut app = App::new(
+                std::path::PathBuf::from("."),
+                picker,
+                crate::media::Bridge::detached(),
+            )
+            .expect("app");
             app.cover_size = Some((side, side));
             app.cover = Some(app.picker.new_resize_protocol(decoded));
 

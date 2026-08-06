@@ -2,11 +2,14 @@ mod app;
 mod cache;
 mod cover;
 mod library;
+mod media;
 mod player;
 mod ui;
 
 use std::io::stdout;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -155,7 +158,55 @@ fn main() -> Result<()> {
     // Must query the terminal before we switch to the alternate screen.
     let picker = build_picker();
 
-    let mut app = App::new(root, picker)?;
+    // An escape hatch: if registering with the OS misbehaves, the player still works.
+    let (bridge, host, media_warning) = if std::env::args().any(|a| a == "--no-media") {
+        (media::Bridge::detached(), None, None)
+    } else {
+        media::start()
+    };
+
+    // macOS only delivers media keys to the *main* thread's run loop, so the TUI
+    // moves to a worker and the main thread is left to service the OS. The app is
+    // built inside that worker because cpal's audio stream is not `Send`.
+    let finished = Arc::new(AtomicBool::new(false));
+    let tui = {
+        let finished = Arc::clone(&finished);
+        std::thread::Builder::new()
+            .name("tui".into())
+            .spawn(move || {
+                let result = tui_main(root, picker, bridge, media_warning);
+                finished.store(true, Ordering::Release);
+                // Cut the host's current wait short so quitting is immediate.
+                media::wake();
+                result
+            })?
+    };
+
+    if let Some(mut host) = host {
+        while !finished.load(Ordering::Acquire) {
+            host.pump();
+        }
+    }
+
+    match tui.join() {
+        Ok(result) => result,
+        // `ratatui::init` installs a panic hook that restores the terminal, so by
+        // here the screen is already usable and only the report is left to make.
+        Err(_) => anyhow::bail!("the interface thread panicked"),
+    }
+}
+
+/// Everything that touches the terminal, on one thread.
+fn tui_main(
+    root: PathBuf,
+    picker: Picker,
+    bridge: media::Bridge,
+    media_warning: Option<String>,
+) -> Result<()> {
+    let mut app = App::new(root, picker, bridge)?;
+    if let Some(warning) = media_warning {
+        app.status = warning;
+    }
 
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
@@ -182,7 +233,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         }
         app.poll_cover();
         app.refresh_cover_for_resize();
+        app.poll_media();
         app.tick();
+        app.publish_now_playing();
     }
     Ok(())
 }

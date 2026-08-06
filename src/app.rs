@@ -9,6 +9,7 @@ use ratatui_image::protocol::StatefulProtocol;
 
 use crate::cover::{self, CoverLoader};
 use crate::library::{self, Folder, Track};
+use crate::media::{self, Command, NowPlaying};
 use crate::player::AudioPlayer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,8 @@ pub struct App {
     pub cover_size: Option<(u32, u32)>,
     /// True between asking the worker for a cover and getting an answer.
     pub cover_pending: bool,
+    /// Where the scaled cover landed on disk, for the OS "now playing" artwork.
+    cover_file: Option<PathBuf>,
     cover_loader: CoverLoader,
     /// Bumped on every request so late replies can be recognised and dropped.
     cover_generation: u64,
@@ -57,6 +60,11 @@ pub struct App {
     /// Pane, row and time of the last left click, for double-click detection.
     last_click: Option<(Pane, usize, Instant)>,
 
+    /// Media keys and the OS "now playing" panel.
+    media: media::Bridge,
+    /// Last state handed to the OS, so we only publish on a real change.
+    published: Option<NowPlaying>,
+
     pub status: String,
     pub should_quit: bool,
 }
@@ -65,7 +73,7 @@ pub struct App {
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl App {
-    pub fn new(root: PathBuf, picker: Picker) -> Result<Self> {
+    pub fn new(root: PathBuf, picker: Picker, media: media::Bridge) -> Result<Self> {
         let folders = library::scan_folders(&root, 5);
         let mut folder_state = TableState::default();
         if !folders.is_empty() {
@@ -85,6 +93,7 @@ impl App {
             audio: AudioPlayer::new()?,
             cover_size: None,
             cover_pending: false,
+            cover_file: None,
             cover_loader: CoverLoader::new(),
             cover_generation: 0,
             cover_requested_box: (0, 0),
@@ -96,6 +105,8 @@ impl App {
             folder_rows: Rect::ZERO,
             track_rows: Rect::ZERO,
             last_click: None,
+            media,
+            published: None,
             status: String::new(),
             should_quit: false,
         };
@@ -158,6 +169,7 @@ impl App {
     fn request_cover(&mut self, path: &Path) {
         self.cover = None;
         self.cover_size = None;
+        self.cover_file = None;
         self.cover_pending = true;
         self.cover_generation += 1;
         self.cover_requested_box = self.art_box_px();
@@ -220,6 +232,7 @@ impl App {
         };
 
         self.cover_pending = false;
+        self.cover_file = loaded.file;
         match loaded.image {
             Some(img) => {
                 self.cover_size = Some((img.width().max(1), img.height().max(1)));
@@ -255,6 +268,63 @@ impl App {
         if let Some(i) = self.playing.filter(|i| *i > 0) {
             self.play_index(i - 1);
         }
+    }
+
+    /// Act on media keys, headphone buttons and Control Center / MPRIS.
+    pub fn poll_media(&mut self) {
+        let commands: Vec<Command> = self.media.commands().collect();
+        for command in commands {
+            match command {
+                Command::Toggle => self.toggle_play(),
+                Command::Play if self.playing.is_none() => self.play_selected_track(),
+                Command::Play => {
+                    if self.audio.is_paused() {
+                        self.audio.toggle();
+                    }
+                }
+                Command::Pause => {
+                    if !self.audio.is_paused() {
+                        self.audio.toggle();
+                    }
+                }
+                Command::Stop => {
+                    self.audio.stop();
+                    self.playing = None;
+                }
+                Command::Next => self.next_track(),
+                Command::Previous => self.prev_track(),
+                Command::SeekBy(delta) => self.seek_by(delta),
+                Command::SetPosition(at) => {
+                    if let Some(total) = self.now_playing().and_then(|t| t.duration) {
+                        let fraction = at.as_secs_f32() / total.as_secs_f32().max(f32::EPSILON);
+                        self.seek_to(fraction);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tell the OS what is playing. Cheap to call often: the host drops updates
+    /// that match what it already published.
+    pub fn publish_now_playing(&mut self) {
+        let now = match self.now_playing() {
+            Some(track) => NowPlaying {
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                album: track.album.clone(),
+                duration: track.duration,
+                // Round off, or a once-a-second publish would never match.
+                elapsed: Duration::from_secs(self.audio.position().as_secs()),
+                playing: !self.audio.is_paused(),
+                cover: self.cover_file.clone(),
+            },
+            None => NowPlaying::default(),
+        };
+        if self.published.as_ref() == Some(&now) {
+            return;
+        }
+        self.media.publish(now.clone());
+        self.published = Some(now);
     }
 
     /// Advance automatically when the current source has drained.
@@ -484,7 +554,12 @@ mod tests {
         }
 
         fn app(&self) -> App {
-            App::new(self.0.clone(), Picker::halfblocks()).expect("app init")
+            App::new(
+                self.0.clone(),
+                Picker::halfblocks(),
+                media::Bridge::detached(),
+            )
+            .expect("app init")
         }
     }
 
@@ -807,7 +882,12 @@ mod bench {
             std::fs::write(dir.join(format!("{i:02}.wav")), super::tests::silent_wav(2)).unwrap();
         }
 
-        let mut app = App::new(root.clone(), Picker::halfblocks()).unwrap();
+        let mut app = App::new(
+            root.clone(),
+            Picker::halfblocks(),
+            media::Bridge::detached(),
+        )
+        .unwrap();
         app.art_budget = Rect::new(0, 0, 30, 15);
 
         for round in 0..4 {

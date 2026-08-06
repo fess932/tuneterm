@@ -21,3 +21,14 @@ ratatui-image = { version = "11", default-features = false, features = [
     "crossterm",
 ] }
 rodio = "0.22"
+# Media keys. Default features pull libdbus (a C library) on Linux; use_zbus is
+# pure Rust, so the build needs no system packages there either.
+souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+
+# Pumping the AppKit run loop, which is what macOS needs to deliver media keys.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8"
+
+# GetConsoleWindow: souvlaki wants an HWND, and a console app has one.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

@@ -64,6 +64,11 @@ pub fn key(picture: &[u8], box_px: (u32, u32)) -> String {
     format!("{hash:016x}-{}x{}.png", box_px.0, box_px.1)
 }
 
+/// Where an entry lives, whether or not it exists yet.
+pub fn path(key: &str) -> Option<PathBuf> {
+    Some(dir()?.join(key))
+}
+
 /// A previously scaled cover, if it is on disk.
 pub fn get(key: &str) -> Option<DynamicImage> {
     get_in(&dir()?, key)

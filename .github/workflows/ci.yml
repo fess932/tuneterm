@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +26,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # rodio needs ALSA to build on Linux.
+      # rodio needs ALSA to build on Linux. souvlaki uses its pure-Rust zbus
+      # backend, so no libdbus is required.
       - name: Install ALSA
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
@@ -46,6 +47,13 @@ jobs:
           cargo test --verbose
         continue-on-error: true
 
+      # macOS has a real audio device; Windows runners do not, so the audio tests
+      # there are informational.
       - name: Test (macOS)
         if: runner.os == 'macOS'
         run: cargo test --verbose
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --verbose
+        continue-on-error: true

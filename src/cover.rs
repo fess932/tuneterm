@@ -22,6 +22,8 @@ pub struct Loaded {
     pub generation: u64,
     /// `None` means the track simply has no cover.
     pub image: Option<DynamicImage>,
+    /// Where the scaled cover sits in the cache, for the OS "now playing" artwork.
+    pub file: Option<PathBuf>,
 }
 
 /// Loads and pre-shrinks cover art on a worker thread.
@@ -65,7 +67,7 @@ impl CoverLoader {
                     continue;
                 }
 
-                let image = prepare(&request.path, request.box_px);
+                let (image, file) = prepare(&request.path, request.box_px);
 
                 // Superseded while we were decoding; do not bother the UI with it.
                 if request.generation < worker_latest.load(Ordering::Acquire) {
@@ -74,6 +76,7 @@ impl CoverLoader {
                 let reply = Loaded {
                     generation: request.generation,
                     image,
+                    file,
                 };
                 if tx.send(reply).is_err() {
                     return; // the app is gone
@@ -114,17 +117,25 @@ impl Default for CoverLoader {
 /// Ordered so the cheap steps come first: reading the tag is ~15 ms, hashing the
 /// picture ~0.2 ms, and decoding a cached 300 px PNG ~13 ms — against ~190 ms to
 /// decode the 1400 px original plus ~400 ms to scale it.
-fn prepare(path: &Path, box_px: (u32, u32)) -> Option<DynamicImage> {
-    let picture = library::load_cover_bytes(path)?;
+fn prepare(path: &Path, box_px: (u32, u32)) -> (Option<DynamicImage>, Option<PathBuf>) {
+    let Some(picture) = library::load_cover_bytes(path) else {
+        return (None, None);
+    };
     let key = cache::key(&picture, box_px);
+    let file = cache::path(&key);
 
     if let Some(cached) = cache::get(&key) {
-        return Some(cached);
+        return (Some(cached), file);
     }
 
-    let scaled = fill(image::load_from_memory(&picture).ok()?, box_px);
+    let Some(decoded) = image::load_from_memory(&picture).ok() else {
+        return (None, None);
+    };
+    let scaled = fill(decoded, box_px);
     cache::put(&key, &scaled);
-    Some(scaled)
+    // Only advertise the file if it really landed.
+    let file = file.filter(|path| path.is_file());
+    (Some(scaled), file)
 }
 
 /// Scale to fill `box_px` as far as the aspect ratio allows, enlarging if needed.
@@ -351,11 +362,11 @@ mod bench {
 
             let box_px = (600, 600);
             let t = Instant::now();
-            let first = prepare(&dir.join("01.wav"), box_px);
+            let (first, _) = prepare(&dir.join("01.wav"), box_px);
             let cold = t.elapsed();
 
             let t = Instant::now();
-            let second = prepare(&dir.join("02.wav"), box_px);
+            let (second, _) = prepare(&dir.join("02.wav"), box_px);
             let warm = t.elapsed();
 
             println!(
