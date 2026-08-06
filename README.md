@@ -62,6 +62,17 @@ tuneterm                     # the Apple Music library if present, else ~/Music
 tuneterm ~/path/to/music     # any folder tree
 tuneterm --scan              # headless: dump folders, tags and cover sizes
 tuneterm --no-media          # skip the OS media-key integration
+tuneterm --help              # full help, including every key binding
+```
+
+There is a `Makefile` for the usual chores — `make` lists them:
+
+```sh
+make install       # into ~/.cargo/bin
+make run MUSIC=~/Downloads
+make check         # fmt + clippy + tests, exactly what CI runs
+make bench         # print the benchmark numbers quoted below
+make clean-cache   # empty the cover cache
 ```
 
 `--scan` exists because a TUI swallows errors. Use it to confirm scanning, tag
@@ -258,7 +269,8 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 44 tests
+cargo test                                    # 50 tests
+make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```
 

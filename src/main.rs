@@ -6,8 +6,8 @@ mod media;
 mod player;
 mod ui;
 
-use std::io::stdout;
-use std::path::PathBuf;
+use std::io::{self, Write, stdout};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -24,10 +24,105 @@ use ratatui_image::picker::{Picker, ProtocolType};
 
 use app::{App, Pane};
 
-fn music_root() -> PathBuf {
-    if let Some(arg) = std::env::args().nth(1).filter(|a| !a.starts_with("--")) {
-        return PathBuf::from(arg);
+/// Parsed command line. Hand-rolled: three flags do not justify a dependency.
+struct Args {
+    root: Option<PathBuf>,
+    scan: bool,
+    media: bool,
+}
+
+/// `Err` carries the message to print; the caller decides the exit code.
+#[derive(Debug)]
+enum ArgsError {
+    /// Printed to stdout, exit 0 — the user asked for it.
+    Handled(String),
+    /// Printed to stderr, exit 2.
+    Bad(String),
+}
+
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, ArgsError> {
+    let mut parsed = Args {
+        root: None,
+        scan: false,
+        media: true,
+    };
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => return Err(ArgsError::Handled(help())),
+            "-V" | "--version" => {
+                return Err(ArgsError::Handled(format!(
+                    "{} {}",
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION")
+                )));
+            }
+            "--scan" => parsed.scan = true,
+            "--no-media" => parsed.media = false,
+            // Catch typos instead of silently launching with a default library.
+            other if other.starts_with('-') => {
+                return Err(ArgsError::Bad(format!(
+                    "unknown option: {other}\n\nTry --help."
+                )));
+            }
+            path if parsed.root.is_none() => parsed.root = Some(PathBuf::from(path)),
+            extra => {
+                return Err(ArgsError::Bad(format!(
+                    "unexpected argument: {extra}\n\nOnly one folder can be given."
+                )));
+            }
+        }
     }
+    Ok(parsed)
+}
+
+fn help() -> String {
+    format!(
+        "\
+{name} {version} — {about}
+
+USAGE
+    {name} [FOLDER] [OPTIONS]
+
+ARGS
+    FOLDER            Music folder to browse. Defaults to the Apple Music
+                      library if present, otherwise ~/Music.
+
+OPTIONS
+    --scan            Print folders, tags and cover sizes, then exit. A TUI
+                      hides errors; use this to check scanning works.
+    --no-media        Skip the OS media-key integration.
+    -h, --help        Print this help.
+    -V, --version     Print the version.
+
+KEYS
+    Tab, h/l, arrows  Switch pane            Space         Play / pause
+    j/k, PgUp/PgDn    Move selection         n / p         Next / previous
+    Enter             Play the track         [ / ]         Seek -/+ 5s
+    q, Esc, Ctrl-C    Quit                   + / -         Volume
+
+    The mouse works too: click a row to select, double-click to play, click the
+    transport buttons, and click or drag the progress bar to seek.
+
+    Media keys, headphone buttons, Control Center and MPRIS control playback
+    even while the terminal is in the background.
+
+ENVIRONMENT
+    TUNETERM_CACHE_DIR   Where scaled covers are cached. Defaults to the
+                         platform cache directory, capped at 200 MB.
+    TUNETERM_QUERY=1     Ask the terminal which graphics protocol it supports
+                         instead of guessing from the environment. More
+                         accurate, but a terminal that never answers leaves the
+                         app unable to read the keyboard.
+
+{repo}",
+        name = env!("CARGO_PKG_NAME"),
+        version = env!("CARGO_PKG_VERSION"),
+        about = env!("CARGO_PKG_DESCRIPTION"),
+        repo = env!("CARGO_PKG_REPOSITORY"),
+    )
+}
+
+fn default_root() -> PathBuf {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     // Apple Music keeps its library a few levels down; prefer it when present.
     let itunes = home.join("Music/Music/Media.localized/Music");
@@ -111,58 +206,84 @@ fn protocol_from_env() -> Option<ProtocolType> {
 }
 
 /// Headless dump of what the scanner sees. Handy because a TUI hides errors.
-fn scan_report(root: &std::path::Path) {
+///
+/// Writes through a locked handle and stops on the first write error, so piping
+/// into `head` closes the pipe quietly instead of panicking in `println!`.
+fn scan_report(root: &Path) -> io::Result<()> {
+    let stdout = io::stdout();
+    let out = &mut stdout.lock();
+
     let folders = library::scan_folders(root, 5);
-    println!("root: {}", root.display());
-    println!("folders: {}", folders.len());
+    writeln!(out, "root: {}", root.display())?;
+    writeln!(out, "folders: {}", folders.len())?;
     for folder in folders.iter().take(10) {
-        println!("  {} ({} files)", folder.label, folder.count);
+        writeln!(out, "  {} ({} files)", folder.label, folder.count)?;
     }
-    if let Some(first) = folders.first() {
-        let tracks = library::scan_tracks(&first.path);
-        println!("\ntracks in \"{}\": {}", first.label, tracks.len());
-        for track in tracks.iter().take(5) {
-            println!(
-                "  {} — {} [{}] {}",
-                track.artist,
-                track.title,
-                track.album,
-                track
-                    .duration
-                    .map(library::fmt_duration)
-                    .unwrap_or_else(|| "--:--".into())
-            );
-        }
-        println!("\ncovers:");
-        for track in tracks.iter().take(8) {
-            let name = track
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            match library::load_cover(&track.path) {
-                Some(img) => println!("  {}x{}  {}", img.width(), img.height(), name),
-                None => println!("  none       {}", name),
-            }
+
+    let Some(first) = folders.first() else {
+        return Ok(());
+    };
+    let tracks = library::scan_tracks(&first.path);
+    writeln!(out, "\ntracks in \"{}\": {}", first.label, tracks.len())?;
+    for track in tracks.iter().take(5) {
+        writeln!(
+            out,
+            "  {} — {} [{}] {}",
+            track.artist,
+            track.title,
+            track.album,
+            track
+                .duration
+                .map(library::fmt_duration)
+                .unwrap_or_else(|| "--:--".into())
+        )?;
+    }
+
+    writeln!(out, "\ncovers:")?;
+    for track in tracks.iter().take(8) {
+        let name = track
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match library::load_cover(&track.path) {
+            Some(img) => writeln!(out, "  {}x{}  {}", img.width(), img.height(), name)?,
+            None => writeln!(out, "  none       {name}")?,
         }
     }
+    Ok(())
 }
 
 fn main() -> Result<()> {
-    let root = music_root();
-    if std::env::args().any(|a| a == "--scan") {
-        scan_report(&root);
-        return Ok(());
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(ArgsError::Handled(text)) => {
+            println!("{text}");
+            return Ok(());
+        }
+        Err(ArgsError::Bad(text)) => {
+            eprintln!("{text}");
+            std::process::exit(2);
+        }
+    };
+
+    let root = args.root.unwrap_or_else(default_root);
+    if args.scan {
+        // A closed pipe (`| head`) is not a failure worth reporting.
+        return match scan_report(&root) {
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            other => other.map_err(Into::into),
+        };
     }
 
     // Must query the terminal before we switch to the alternate screen.
     let picker = build_picker();
 
     // An escape hatch: if registering with the OS misbehaves, the player still works.
-    let (bridge, host, media_warning) = if std::env::args().any(|a| a == "--no-media") {
-        (media::Bridge::detached(), None, None)
-    } else {
+    let (bridge, host, media_warning) = if args.media {
         media::start()
+    } else {
+        (media::Bridge::detached(), None, None)
     };
 
     // macOS only delivers media keys to the *main* thread's run loop, so the TUI
@@ -282,5 +403,89 @@ fn on_mouse(app: &mut App, mouse: MouseEvent) {
         MouseEventKind::ScrollDown => app.scroll(pos, 1),
         MouseEventKind::ScrollUp => app.scroll(pos, -1),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, ArgsError> {
+        parse_args(args.iter().map(|a| a.to_string()))
+    }
+
+    #[test]
+    fn defaults_to_no_folder_and_media_on() {
+        let args = parse(&[]).expect("empty is valid");
+        assert!(args.root.is_none());
+        assert!(!args.scan);
+        assert!(args.media, "media integration is on unless refused");
+    }
+
+    #[test]
+    fn takes_a_folder_and_flags_in_any_order() {
+        for order in [
+            vec!["--scan", "/music", "--no-media"],
+            vec!["/music", "--no-media", "--scan"],
+            vec!["--no-media", "--scan", "/music"],
+        ] {
+            let args = parse(&order).unwrap_or_else(|_| panic!("{order:?}"));
+            assert_eq!(args.root.as_deref(), Some(Path::new("/music")), "{order:?}");
+            assert!(args.scan, "{order:?}");
+            assert!(!args.media, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn help_and_version_are_handled_not_errors() {
+        for flag in ["-h", "--help"] {
+            match parse(&[flag]) {
+                Err(ArgsError::Handled(text)) => {
+                    assert!(text.contains("USAGE"), "{flag}");
+                    assert!(text.contains("--scan"), "{flag} omits a real flag");
+                }
+                _ => panic!("{flag} should be handled"),
+            }
+        }
+        for flag in ["-V", "--version"] {
+            match parse(&[flag]) {
+                Err(ArgsError::Handled(text)) => {
+                    assert!(text.contains(env!("CARGO_PKG_VERSION")), "{flag}");
+                }
+                _ => panic!("{flag} should be handled"),
+            }
+        }
+    }
+
+    /// A typo must not silently launch against the default library.
+    #[test]
+    fn rejects_unknown_options() {
+        for bad in ["--scna", "--help=1", "-x"] {
+            match parse(&[bad]) {
+                Err(ArgsError::Bad(text)) => assert!(text.contains(bad), "{bad}"),
+                _ => panic!("{bad} should be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_a_second_folder() {
+        match parse(&["/one", "/two"]) {
+            Err(ArgsError::Bad(text)) => assert!(text.contains("/two")),
+            _ => panic!("two folders should be rejected"),
+        }
+    }
+
+    /// Every option the help text advertises must actually parse.
+    #[test]
+    fn help_does_not_advertise_options_that_do_not_exist() {
+        let text = help();
+        for flag in ["--scan", "--no-media", "--help", "--version"] {
+            assert!(text.contains(flag), "help omits {flag}");
+            assert!(
+                !matches!(parse(&[flag]), Err(ArgsError::Bad(_))),
+                "help advertises {flag} but parsing rejects it"
+            );
+        }
     }
 }
