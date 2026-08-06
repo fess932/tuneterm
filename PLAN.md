@@ -118,15 +118,59 @@ Spotify can break it and their terms are not written with it in mind. Technicall
 also bypasses rodio entirely — librespot decodes and emits samples itself — so it is a
 *second playback path*, not another `Source`. That is the largest single item here.
 
-**YouTube / YouTube Music** — shelling out to `yt-dlp` works and people do it. It is
-fragile by nature (it breaks whenever the site changes) and sits outside YouTube's
-terms. Reasonable as an opt-in, not as a default.
+**YouTube Music** — see its own section below. Architecturally it is the *easiest*
+of the streaming services, and the hard parts are elsewhere.
 
 **Deezer, Tidal, Apple Music** — their public APIs are *metadata only*. Playback needs
 reverse-engineered endpoints or a proprietary SDK. Not worth building on.
 
 **Bandcamp** — no API. Purchased downloads are just files, so they already work via the
 filesystem.
+
+### YouTube Music, in more detail
+
+Worth separating out, because it is the streaming service that fits this architecture
+*best* — and for a reason that is easy to miss.
+
+**It needs no second playback path.** Spotify has to go through librespot, which
+decodes internally and bypasses rodio. YouTube hands back a plain HTTPS audio URL on
+`googlevideo.com` that answers range requests and reports a length — which is exactly
+what the `Read + Seek` reader from step 1 already needs. So once that reader exists,
+playback is nearly free. Its catalogue is also the widest of anything here, and it
+does not demand a paid tier the way librespot does.
+
+The difficulty is entirely in *getting* the URL and in browsing.
+
+| | Browsing | Stream URL | Licence | Runtime |
+| --- | --- | --- | --- | --- |
+| [rustypipe](https://codeberg.org/ThetaDev/rustypipe) | excellent | yes | **GPL-3.0** | Rust + tokio, plus a helper binary |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | weak | yes | Unlicense | Python |
+| Innertube directly | do it yourself | yes | n/a | just HTTP |
+
+**rustypipe** is a Rust Innertube client and covers YouTube Music properly: search,
+albums, artists, playlists, radio, charts, saved items, history, even lyrics. It maps
+onto the interface almost as neatly as Subsonic does. Two problems:
+
+- **It is GPL-3.0.** Linking it into this MIT binary relicenses the whole thing.
+  Either accept that, relicense, or keep it behind a process boundary.
+- **PO tokens.** Since August 2024 YouTube requires a proof-of-origin token for
+  streams, and rustypipe delegates that to a *separate* CLI, `rustypipe-botguard`.
+  So it is not self-contained either.
+
+**yt-dlp** is the pragmatic opposite: an external process, Unlicense in source form so
+nothing propagates, and by far the best-maintained extractor because it is patched
+whenever YouTube changes. `-f bestaudio -g` prints a URL; `--flat-playlist -J` prints
+JSON. Its weakness is browsing — YouTube Music playlists are still not first-class
+(yt-dlp#14591), so a music-shaped catalogue is awkward to walk.
+
+**The likely split, then:** browse through Innertube or `rustypipe` in a separate
+process, resolve stream URLs through `yt-dlp`, play through the ordinary HTTP reader.
+
+**The real risk is not code, it is the arms race.** Signature deobfuscation, PO tokens
+and bot detection change on YouTube's schedule, not ours, and both tools need frequent
+updates to keep working. Extraction also sits outside YouTube's terms of service. That
+argues for making it an opt-in feature that can fail loudly and be switched off,
+rather than something the player depends on.
 
 ### Bonus: internet radio
 
@@ -161,6 +205,8 @@ Independent of which source lands first:
 2. **Subsonic.** Highest payoff, and it validates the abstraction against a real API.
 3. **WebDAV and podcasts.** Nearly free once the HTTP reader exists.
 4. **Radio.** Forces the unknown-duration work, which everything else benefits from.
-5. **Spotify**, behind a feature flag, if the Premium requirement is acceptable.
+5. **YouTube Music**, behind a feature flag. Cheap on the playback side once step 1
+   exists; budget the time for browsing and for keeping extraction alive.
+6. **Spotify**, only if Premium is acceptable and a second playback path is worth it.
 
 Steps 1 and 2 are the ones that matter. Everything after is incremental.
