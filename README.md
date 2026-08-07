@@ -115,6 +115,7 @@ not `Send`.
 | `Enter` | folders: descend · tracks: play |
 | `Backspace` | go back up a folder |
 | `1`–`4` | switch source tab |
+| `a` / `d` | on a source tab: add / remove a feed |
 | `Space` | play / pause |
 | `n` / `p` | next / previous track |
 | `[` / `]` | seek ∓5 s |
@@ -126,6 +127,7 @@ not `Send`.
 | Action | Effect |
 | --- | --- |
 | click a tab | switch source |
+| click `+ Add feed` | open the URL field |
 | click a row | focus that pane and select the row |
 | double-click a folder | descend into it |
 | double-click `..` | go back up |
@@ -150,7 +152,12 @@ playing outlives whatever the panes are showing, and `Now Playing` stays on scre
 every tab. The hidden panes also forget where their rows were, so a click in that space
 cannot select a row that is no longer visible.
 
-[PLAN.md](PLAN.md) is what the other tabs would take.
+**Feeds** and **Casts** already hold the list: `+ Add feed` (or `a`) opens a floating
+field, paste an RSS URL, Enter. `d` removes the highlighted one. The list is written to
+`feeds.txt` in the platform config directory — plain text, one entry per line, `#`
+comments, optional `name = url` — and ships with
+[musicforprogramming.net](https://musicforprogramming.net) in it. Fetching the episodes
+is the next piece; [PLAN.md](PLAN.md) has the rest.
 
 ### Browsing
 
@@ -185,6 +192,7 @@ is instant.
 | `src/worker.rs` | one thread with a replaceable request slot; used by both workers |
 | `src/cache.rs` | on-disk cover cache, content-keyed, 200 MB cap, oldest-first eviction |
 | `src/library.rs` | folder/track scanning, tags and cover extraction (`lofty`) |
+| `src/config.rs` | the user's feed list: `feeds.txt`, parsing and writing |
 | `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
 | `src/media.rs` | OS media keys and now-playing metadata (`souvlaki`) |
 
@@ -341,7 +349,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 80 tests
+cargo test                                    # 95 tests
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```

@@ -21,7 +21,10 @@ use image::DynamicImage;
 pub enum Kind {
     /// Scaled cover art. Small, many entries, cheap to lose.
     Art,
-    /// Downloaded audio. Huge, few entries, expensive to lose.
+    /// Downloaded audio. Huge, few entries, expensive to lose. Nothing writes these
+    /// yet — they arrive with the streamed sources — but the split is the point:
+    /// deciding it later would mean discovering the eviction problem in the field.
+    #[allow(dead_code)]
     Audio,
 }
 
@@ -47,10 +50,6 @@ impl Kind {
 ///
 /// `TUNETERM_CACHE_DIR` overrides it, which is how the tests avoid writing into the
 /// real user cache.
-pub fn dir() -> Option<PathBuf> {
-    dir_for(Kind::Art)
-}
-
 /// Directory for one kind of entry. Each gets its own folder so a sweep of one
 /// cannot touch the other.
 pub fn dir_for(kind: Kind) -> Option<PathBuf> {
@@ -120,16 +119,9 @@ pub fn key(picture: &[u8], box_px: (u32, u32)) -> String {
     format!("{hash:016x}-{}x{}.png", box_px.0, box_px.1)
 }
 
-/// Where an entry lives, whether or not it exists yet.
-pub fn path(key: &str) -> Option<PathBuf> {
-    Some(dir()?.join(key))
-}
-
-/// A previously scaled cover, if it is on disk.
-pub fn get(key: &str) -> Option<DynamicImage> {
-    get_in(&dir()?, key)
-}
-
+/// A previously scaled cover, if it is on disk. The directory is passed in rather
+/// than looked up, so a caller can be pointed somewhere else — which is how the
+/// tests stay out of the real cache.
 pub fn get_in(dir: &Path, key: &str) -> Option<DynamicImage> {
     let path = dir.join(key);
     let img = image::open(&path).ok()?;
@@ -145,11 +137,6 @@ pub fn get_in(dir: &Path, key: &str) -> Option<DynamicImage> {
 ///
 /// Every failure here is ignored on purpose: a cache that cannot be written is a
 /// slower app, not a broken one.
-pub fn put(key: &str, img: &DynamicImage) {
-    let Some(dir) = dir() else { return };
-    put_in(&dir, key, img);
-}
-
 pub fn put_in(dir: &Path, key: &str, img: &DynamicImage) {
     if fs::create_dir_all(dir).is_err() {
         return;

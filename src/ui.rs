@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, LineGauge, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, BorderType, Cell, Clear, LineGauge, Paragraph, Row, Table, Wrap};
 use ratatui_image::{FilterType, Resize, StatefulImage};
 
 use crate::app::{App, Pane, Tab};
@@ -44,24 +44,143 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Always drawn: switching sources must not look like playback stopped.
     draw_now_playing(frame, app, right);
 
+    // The strip covers the top border of whichever pane starts at the left, so it is
+    // drawn once here rather than by each pane — doing it per pane put a second copy
+    // in the middle one.
+    let strip = match app.tab {
+        Tab::Radio => Rect {
+            width: left.width + middle.width,
+            ..left
+        },
+        _ => left,
+    };
+
     match app.tab {
         Tab::Local => {
             draw_folders(frame, app, left);
             draw_tracks(frame, app, middle);
         }
-        unbuilt => {
+        Tab::Feeds | Tab::Casts => {
             // Forget where the rows were, or clicks would still land on panes that
             // are no longer on screen.
             app.folder_rows = Rect::ZERO;
             app.track_rows = Rect::ZERO;
-            let span = Rect {
-                width: left.width + middle.width,
-                ..left
-            };
-            draw_placeholder(frame, app, span, unbuilt);
+            draw_feeds(frame, app, left);
+            draw_placeholder(frame, middle, app.tab);
+        }
+        Tab::Radio => {
+            app.folder_rows = Rect::ZERO;
+            app.track_rows = Rect::ZERO;
+            app.add_area = Rect::ZERO;
+            draw_placeholder(frame, strip, Tab::Radio);
         }
     }
+    // After the panes, so it overwrites their border.
+    draw_tabs(frame, app, strip);
     draw_help(frame, app, help);
+
+    // Last, so it sits over everything.
+    if app.prompt.is_some() {
+        draw_prompt(frame, app);
+    }
+}
+
+/// The feed list, with the Add button as its last row so it scrolls with them and
+/// needs no extra chrome.
+fn draw_feeds(frame: &mut Frame, app: &mut App, area: Rect) {
+    let mut rows: Vec<Row> = app
+        .feeds
+        .iter()
+        .map(|feed| {
+            Row::new(vec![
+                Cell::from(feed.name.clone()).style(Style::new().fg(TEXT)),
+                Cell::from(Line::from("RSS").alignment(Alignment::Right))
+                    .style(Style::new().fg(DIM)),
+            ])
+        })
+        .collect();
+    rows.push(Row::new(vec![
+        Cell::from("+ Add feed").style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Cell::from(""),
+    ]));
+
+    let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(5)])
+        .header(
+            Row::new(vec![
+                Cell::from("FEED"),
+                Cell::from(Line::from("KIND").alignment(Alignment::Right)),
+            ])
+            .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
+        )
+        .block(pane_block("", true).title_bottom(Span::styled(
+            format!(" a add · d remove · {} feeds ", app.feeds.len()),
+            Style::new().fg(DIM),
+        )))
+        .row_highlight_style(
+            Style::new()
+                .bg(Color::Rgb(49, 50, 68))
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let rows_area = rows_area(area);
+    // The button is the row after the last feed.
+    app.add_area = Rect {
+        y: rows_area.y + app.feeds.len() as u16,
+        height: 1,
+        ..rows_area
+    };
+    frame.render_stateful_widget(table, area, &mut app.feed_state);
+}
+
+/// A floating input, drawn over whatever is behind it.
+fn draw_prompt(frame: &mut Frame, app: &App) {
+    let Some(prompt) = app.prompt.as_ref() else {
+        return;
+    };
+    let screen = frame.area();
+    if screen.width < 4 || screen.height < 3 {
+        return;
+    }
+    // Wide enough for a URL, never wider than the screen — a minimum would overflow
+    // a narrow terminal instead of protecting anything.
+    let width = screen.width.saturating_sub(4).clamp(1, 72);
+    let height = 5.min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 3,
+        width,
+        height,
+    };
+
+    // Wipe what is underneath, or the pane below shows through the box.
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(
+            format!(" {} ", prompt.title),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [field, hint] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    // A block cursor, since the real one is hidden while drawing.
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prompt.input.clone(), Style::new().fg(TEXT)),
+            Span::styled("█", Style::new().fg(ACCENT)),
+        ])),
+        field,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            prompt.hint.clone(),
+            Style::new().fg(DIM),
+        )))
+        .wrap(Wrap { trim: true }),
+        hint,
+    );
 }
 
 /// Tabs live in the top border of the browsing pane, and their rects are recorded so
@@ -118,7 +237,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, pane: Rect) {
 }
 
 /// A source that exists as a tab but not yet as code.
-fn draw_placeholder(frame: &mut Frame, app: &mut App, area: Rect, tab: Tab) {
+fn draw_placeholder(frame: &mut Frame, area: Rect, tab: Tab) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(DIM));
@@ -138,7 +257,6 @@ fn draw_placeholder(frame: &mut Frame, app: &mut App, area: Rect, tab: Tab) {
             .map(|text| Line::from(Span::styled(*text, Style::new().fg(DIM)))),
     );
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
-    draw_tabs(frame, app, area);
 }
 
 fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -191,7 +309,6 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
 
     app.folder_rows = rows_area(area);
     frame.render_stateful_widget(table, area, &mut app.folder_state);
-    draw_tabs(frame, app, area);
 }
 
 /// The data rows of a bordered table with a one-line header — what a click on a
@@ -602,12 +719,17 @@ mod tests {
     /// Regression: a short pane used to panic on `clamp(min, max)` with max < min.
     #[test]
     fn survives_tiny_terminals() {
-        for (w, h) in [(20, 5), (40, 10), (8, 3), (200, 60)] {
-            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-            let mut app = app();
-            terminal
-                .draw(|frame| super::draw(frame, &mut app))
-                .unwrap_or_else(|e| panic!("{w}x{h} failed: {e}"));
+        for (w, h) in [(20, 5), (40, 10), (8, 3), (4, 2), (1, 1), (200, 60)] {
+            for prompt in [false, true] {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                let mut app = app();
+                if prompt {
+                    app.open_add_feed();
+                }
+                terminal
+                    .draw(|frame| super::draw(frame, &mut app))
+                    .unwrap_or_else(|e| panic!("{w}x{h} prompt={prompt} failed: {e}"));
+            }
         }
     }
 
@@ -858,22 +980,28 @@ mod preview {
         for (label, step) in [
             ("at the root", 0),
             ("inside a folder", 1),
-            ("the radio tab", 2),
+            ("the feeds tab", 2),
+            ("the add prompt", 3),
         ] {
             match step {
                 1 => {
                     app.enter_folder();
                     app.wait_for_tracks();
                 }
-                2 => app.select_tab(crate::app::Tab::Radio),
+                2 => app.select_tab(crate::app::Tab::Feeds),
+                3 => app.open_add_feed(),
                 _ => {}
             }
-            let mut terminal = Terminal::new(TestBackend::new(78, 14)).unwrap();
+            let width: u16 = std::env::var("TUNETERM_W")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(78);
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
             terminal.draw(|f| draw(f, &mut app)).unwrap();
             println!("\n--- {label} ---");
             for line in format!("{}", terminal.backend()).lines() {
                 let chars: Vec<char> = line.chars().collect();
-                let cut: String = chars[..chars.len().min(58)].iter().collect();
+                let cut: String = chars[..chars.len().min(60)].iter().collect();
                 println!("{cut}");
             }
         }

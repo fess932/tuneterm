@@ -310,7 +310,7 @@ mod bench {
 
         println!(
             "cache dir: {:?}   profile: {}",
-            cache::dir(),
+            cache::dir_for(cache::Kind::Art),
             if cfg!(debug_assertions) {
                 "debug"
             } else {

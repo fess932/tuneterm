@@ -1,5 +1,6 @@
 mod app;
 mod cache;
+mod config;
 mod cover;
 mod library;
 mod media;
@@ -96,9 +97,13 @@ OPTIONS
     -V, --version     Print the version.
 
 SOURCES
-    Tabs in the top border of the browsing pane: Local works, Feeds, Casts and
-    Radio are placeholders. Click one or press 1 - 4. Switching never stops
-    playback.
+    Tabs in the top border of the browsing pane. Click one or press 1 - 4;
+    switching never stops playback.
+
+    Local browses the filesystem. Feeds and Casts keep a list of RSS URLs:
+    "+ Add feed" or `a` opens a field, `d` removes the highlighted entry, and the
+    list lives in feeds.txt in the config directory. Fetching episodes is not
+    built yet. Radio is a placeholder.
 
 BROWSING
     The left pane is a folder browser. Moving the cursor lists everything in the
@@ -120,8 +125,10 @@ KEYS
     even while the terminal is in the background.
 
 ENVIRONMENT
-    TUNETERM_CACHE_DIR   Where scaled covers are cached. Defaults to the
-                         platform cache directory, capped at 200 MB.
+    TUNETERM_CACHE_DIR   Cache root. Defaults to the platform cache directory,
+                         with art capped at 200 MB and audio at 2000 MB.
+    TUNETERM_CONFIG_DIR  Where feeds.txt lives. Defaults to the platform
+                         config directory.
     TUNETERM_QUERY=1     Ask the terminal which graphics protocol it supports
                          instead of guessing from the environment. More
                          accurate, but a terminal that never answers leaves the
@@ -421,6 +428,21 @@ fn on_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // While an input is open every key belongs to it, or typing a URL containing
+    // "q" would quit and "n" would skip a track.
+    if app.prompt.is_some() {
+        match key.code {
+            KeyCode::Esc => app.cancel_prompt(),
+            KeyCode::Enter => app.submit_prompt(),
+            KeyCode::Backspace => app.prompt_backspace(),
+            KeyCode::Char(c) => {
+                app.prompt_key(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Tab | KeyCode::BackTab => app.focus_next(),
@@ -441,6 +463,12 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') => app.prev_track(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.audio.nudge_volume(0.05),
         KeyCode::Char('-') => app.audio.nudge_volume(-0.05),
+        KeyCode::Char('a') if app.tab == app::Tab::Feeds || app.tab == app::Tab::Casts => {
+            app.open_add_feed();
+        }
+        KeyCode::Char('d') if app.tab == app::Tab::Feeds || app.tab == app::Tab::Casts => {
+            app.remove_selected_feed();
+        }
         KeyCode::Char('1') => app.select_tab(app::Tab::Local),
         KeyCode::Char('2') => app.select_tab(app::Tab::Feeds),
         KeyCode::Char('3') => app.select_tab(app::Tab::Casts),

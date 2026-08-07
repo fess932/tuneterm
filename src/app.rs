@@ -8,6 +8,7 @@ use ratatui::widgets::TableState;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
+use crate::config::{self, Feed};
 use crate::cover::{self, CoverLoader};
 use crate::library::{self, Folder, Track};
 use crate::media::{self, Command, NowPlaying};
@@ -135,6 +136,17 @@ pub struct App {
     /// Clickable strip per tab, written during render. Same reason as the others:
     /// the layout knows where things landed, the event handler does not.
     pub tab_areas: [Rect; Tab::ALL.len()],
+
+    /// The user's feed list, and where the cursor is in it.
+    pub feeds: Vec<Feed>,
+    pub feed_state: TableState,
+    /// The `+ Add feed` button, for hit-testing.
+    pub add_area: Rect,
+    /// Open input, drawn over everything else.
+    pub prompt: Option<Prompt>,
+    /// Where the feed list is written. Held rather than looked up each time so tests
+    /// can point it somewhere harmless instead of the user's real config.
+    pub feeds_file: Option<PathBuf>,
     /// Pane, row and time of the last left click, for double-click detection.
     last_click: Option<(Pane, usize, Instant)>,
 
@@ -145,6 +157,17 @@ pub struct App {
 
     pub status: String,
     pub should_quit: bool,
+}
+
+/// A floating one-line input. Opened by the Add button, closed by Enter or Escape.
+///
+/// Kept as state rather than a blocking read so the rest of the app keeps running
+/// behind it: the music plays, the cover arrives, the progress bar moves.
+pub struct Prompt {
+    pub title: &'static str,
+    pub input: String,
+    /// Shown under the field: usage, or why the last attempt was refused.
+    pub hint: String,
 }
 
 /// Two clicks on the same row within this window count as a double click.
@@ -194,6 +217,11 @@ impl App {
             track_rows: Rect::ZERO,
             tab_areas: [Rect::ZERO; Tab::ALL.len()],
             tab: Tab::Local,
+            feeds: config::load_feeds(),
+            feed_state: TableState::default().with_selected(Some(0)),
+            feeds_file: config::feeds_path(),
+            add_area: Rect::ZERO,
+            prompt: None,
             last_click: None,
             media,
             published: None,
@@ -658,6 +686,94 @@ impl App {
         self.tab = tab;
     }
 
+    pub fn open_add_feed(&mut self) {
+        self.prompt = Some(Prompt {
+            title: "Add feed",
+            input: String::new(),
+            hint: "paste an RSS URL · Enter to add · Esc to cancel".into(),
+        });
+    }
+
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+    }
+
+    /// Feed a keystroke to the open input. Returns whether it was consumed, so the
+    /// caller knows not to also treat it as a shortcut.
+    pub fn prompt_key(&mut self, key: char) -> bool {
+        match self.prompt.as_mut() {
+            Some(prompt) => {
+                prompt.input.push(key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn prompt_backspace(&mut self) {
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.input.pop();
+        }
+    }
+
+    /// Accept the typed URL. Stays open with a reason when it is not usable, since
+    /// closing on a typo would throw away what was pasted.
+    pub fn submit_prompt(&mut self) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        let url = prompt.input.trim().to_string();
+        if url.is_empty() {
+            self.prompt = None;
+            return;
+        }
+        if !config::is_url(&url) {
+            prompt.hint = "needs to start with http:// or https://".into();
+            return;
+        }
+        if self.feeds.iter().any(|feed| feed.url == url) {
+            prompt.hint = "already in the list".into();
+            return;
+        }
+
+        self.feeds.push(Feed {
+            name: config::host_of(&url),
+            url,
+        });
+        self.feed_state.select(Some(self.feeds.len() - 1));
+        self.prompt = None;
+        self.persist_feeds();
+    }
+
+    /// Drop the highlighted feed.
+    pub fn remove_selected_feed(&mut self) {
+        let Some(index) = self.feed_state.selected() else {
+            return;
+        };
+        if index >= self.feeds.len() {
+            return;
+        }
+        let gone = self.feeds.remove(index);
+        if self.feeds.is_empty() {
+            self.feed_state.select(None);
+        } else {
+            self.feed_state
+                .select(Some(index.min(self.feeds.len() - 1)));
+        }
+        self.status = format!("removed {}", gone.name);
+        self.persist_feeds();
+    }
+
+    fn persist_feeds(&mut self) {
+        let Some(path) = self.feeds_file.clone() else {
+            self.status = "no config directory: feeds not saved".into();
+            return;
+        };
+        if let Err(err) = config::save_feeds_to(&path, &self.feeds) {
+            self.status = format!("could not save feeds: {err}");
+        }
+    }
+
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
             Pane::Folders => Pane::Tracks,
@@ -696,6 +812,14 @@ impl App {
     /// Left click: focus the pane and select the row. A second click on the same
     /// row plays it, so a single click never starts audio by accident.
     pub fn click(&mut self, pos: Position, now: Instant) {
+        // An open prompt owns the screen; a stray click must not act behind it.
+        if self.prompt.is_some() {
+            return;
+        }
+        if self.add_area.contains(pos) {
+            self.open_add_feed();
+            return;
+        }
         for (tab, area) in Tab::ALL.iter().zip(self.tab_areas) {
             if area.contains(pos) {
                 self.select_tab(*tab);
@@ -1555,6 +1679,157 @@ mod tests {
 
         assert_eq!(app.folder_state.selected(), before, "selection untouched");
         assert!(!app.is_playing_something());
+    }
+
+    /// A feed list that writes somewhere harmless.
+    fn feeds_app(lib: &Library, name: &str) -> App {
+        let mut app = lib.app();
+        let file =
+            std::env::temp_dir().join(format!("tuneterm-feeds-{}-{name}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        app.feeds_file = Some(file);
+        app.feeds = vec![config::default_feed()];
+        app.feed_state.select(Some(0));
+        app.select_tab(Tab::Feeds);
+        app
+    }
+
+    /// The button opens the field, typing fills it, Enter stores it — and it lands on
+    /// disk, since a list that vanishes on exit is no list.
+    #[test]
+    fn adding_a_feed_through_the_prompt_persists_it() {
+        let lib = Library::new("feed-add");
+        let mut app = feeds_app(&lib, "add");
+        app.add_area = Rect::new(0, 4, 18, 1);
+
+        app.click(Position { x: 3, y: 4 }, Instant::now());
+        assert!(app.prompt.is_some(), "the button opens the field");
+
+        for ch in "https://example.com/p.xml".chars() {
+            assert!(app.prompt_key(ch), "keys go to the field");
+        }
+        app.submit_prompt();
+
+        assert!(app.prompt.is_none(), "closed on success");
+        assert_eq!(app.feeds.len(), 2);
+        assert_eq!(app.feeds[1].url, "https://example.com/p.xml");
+        assert_eq!(app.feeds[1].name, "example.com", "named after its host");
+        assert_eq!(
+            app.feed_state.selected(),
+            Some(1),
+            "cursor follows the new entry"
+        );
+
+        let saved = config::load_feeds_from(app.feeds_file.as_ref().unwrap());
+        assert_eq!(saved, app.feeds, "written to disk");
+    }
+
+    /// Refusing input must not throw away what was pasted.
+    #[test]
+    fn a_bad_url_keeps_the_field_open_with_a_reason() {
+        let lib = Library::new("feed-bad");
+        let mut app = feeds_app(&lib, "bad");
+        app.open_add_feed();
+        for ch in "example.com/p.xml".chars() {
+            app.prompt_key(ch);
+        }
+        app.submit_prompt();
+
+        let prompt = app.prompt.as_ref().expect("still open");
+        assert!(prompt.hint.contains("http"), "says why: {}", prompt.hint);
+        assert_eq!(prompt.input, "example.com/p.xml", "input kept");
+        assert_eq!(app.feeds.len(), 1, "nothing added");
+    }
+
+    #[test]
+    fn a_duplicate_is_refused_without_losing_the_list() {
+        let lib = Library::new("feed-dup");
+        let mut app = feeds_app(&lib, "dup");
+        app.open_add_feed();
+        for ch in config::DEFAULT_FEED.1.chars() {
+            app.prompt_key(ch);
+        }
+        app.submit_prompt();
+
+        assert!(app.prompt.as_ref().unwrap().hint.contains("already"));
+        assert_eq!(app.feeds.len(), 1);
+    }
+
+    #[test]
+    fn escape_cancels_without_adding() {
+        let lib = Library::new("feed-esc");
+        let mut app = feeds_app(&lib, "esc");
+        app.open_add_feed();
+        for ch in "https://example.com/x.xml".chars() {
+            app.prompt_key(ch);
+        }
+        app.cancel_prompt();
+        assert!(app.prompt.is_none());
+        assert_eq!(app.feeds.len(), 1);
+    }
+
+    /// An empty field on Enter just closes: nothing typed, nothing meant.
+    #[test]
+    fn submitting_nothing_closes_the_field() {
+        let lib = Library::new("feed-empty");
+        let mut app = feeds_app(&lib, "empty");
+        app.open_add_feed();
+        app.submit_prompt();
+        assert!(app.prompt.is_none());
+        assert_eq!(app.feeds.len(), 1);
+    }
+
+    #[test]
+    fn backspace_edits_the_field() {
+        let lib = Library::new("feed-bs");
+        let mut app = feeds_app(&lib, "bs");
+        app.open_add_feed();
+        for ch in "abc".chars() {
+            app.prompt_key(ch);
+        }
+        app.prompt_backspace();
+        assert_eq!(app.prompt.as_ref().unwrap().input, "ab");
+        app.prompt_backspace();
+        app.prompt_backspace();
+        app.prompt_backspace(); // one too many
+        assert_eq!(app.prompt.as_ref().unwrap().input, "");
+    }
+
+    /// While the field is open the app behind it must be inert, or a click meant for
+    /// the box would select a row underneath.
+    #[test]
+    fn an_open_field_swallows_clicks() {
+        let lib = Library::new("feed-modal");
+        let mut app = feeds_app(&lib, "modal");
+        app.tab_areas[0] = Rect::new(1, 0, 7, 1);
+        app.open_add_feed();
+
+        app.click(Position { x: 3, y: 0 }, Instant::now());
+        assert_eq!(app.tab, Tab::Feeds, "the tab click did not go through");
+        assert!(app.prompt.is_some(), "and the field is still open");
+    }
+
+    #[test]
+    fn removing_a_feed_persists_and_moves_the_cursor() {
+        let lib = Library::new("feed-del");
+        let mut app = feeds_app(&lib, "del");
+        app.feeds.push(Feed {
+            name: "example.com".into(),
+            url: "https://example.com/p.xml".into(),
+        });
+        app.feed_state.select(Some(1));
+
+        app.remove_selected_feed();
+        assert_eq!(app.feeds.len(), 1);
+        assert_eq!(app.feed_state.selected(), Some(0), "cursor stayed in range");
+        assert_eq!(
+            config::load_feeds_from(app.feeds_file.as_ref().unwrap()),
+            app.feeds
+        );
+
+        app.remove_selected_feed();
+        assert!(app.feeds.is_empty());
+        assert_eq!(app.feed_state.selected(), None, "nothing left to point at");
     }
 
     /// A click outside every pane must not select or play anything.
