@@ -2,8 +2,10 @@ mod app;
 mod cache;
 mod config;
 mod cover;
+mod feed;
 mod library;
 mod media;
+mod net;
 mod player;
 mod ui;
 mod worker;
@@ -97,13 +99,14 @@ OPTIONS
     -V, --version     Print the version.
 
 SOURCES
-    Tabs in the top border of the browsing pane. Click one or press 1 - 4;
+    Tabs in the top border of the browsing pane. Click one or press 1 - 3;
     switching never stops playback.
 
-    Local browses the filesystem. Feeds and Casts keep a list of RSS URLs:
-    the Add feed row, or `a`, opens a field; `d` removes the highlighted entry;
-    the list lives in feeds.txt in the config directory. Fetching episodes is
-    not built yet. Radio is a placeholder.
+    Local browses the filesystem. Feeds plays podcast and mixtape RSS: pick a
+    feed on the left, its episodes list on the right, Enter streams one. The Add
+    feed row, or `a`, opens a field for a URL; `d` or the x removes the
+    highlighted entry. The list lives in feeds.txt in the config directory.
+    Radio is a placeholder.
 
 BROWSING
     The left pane is a folder browser. Moving the cursor lists everything in the
@@ -115,7 +118,7 @@ KEYS
     j/k, PgUp/PgDn    Move selection         n / p         Next / previous
     Enter             Open folder / play     [ / ]         Seek -/+ 5s
     Backspace         Go up a folder         + / -         Volume
-    1 - 4             Switch source
+    1 - 3             Switch source
     q, Esc, Ctrl-C    Quit
 
     The mouse works too: click a row to select, double-click to play, click the
@@ -414,6 +417,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         }
         app.poll_cover();
         app.poll_tracks();
+        app.poll_feed();
         app.refresh_cover_for_resize();
         app.poll_media();
         app.tick();
@@ -448,6 +452,12 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Tab | KeyCode::BackTab => app.focus_next(),
         KeyCode::Left | KeyCode::Char('h') => app.focus = Pane::Folders,
         KeyCode::Right | KeyCode::Char('l') => app.focus = Pane::Tracks,
+        KeyCode::Down | KeyCode::Char('j') if app.tab == app::Tab::Feeds => {
+            app.move_feed_selection(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.tab == app::Tab::Feeds => {
+            app.move_feed_selection(-1);
+        }
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::PageDown => app.move_selection(10),
@@ -463,16 +473,11 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') => app.prev_track(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.audio.nudge_volume(0.05),
         KeyCode::Char('-') => app.audio.nudge_volume(-0.05),
-        KeyCode::Char('a') if app.tab == app::Tab::Feeds || app.tab == app::Tab::Casts => {
-            app.open_add_feed();
-        }
-        KeyCode::Char('d') if app.tab == app::Tab::Feeds || app.tab == app::Tab::Casts => {
-            app.remove_selected_feed();
-        }
+        KeyCode::Char('a') if app.tab == app::Tab::Feeds => app.open_add_feed(),
+        KeyCode::Char('d') if app.tab == app::Tab::Feeds => app.remove_selected_feed(),
         KeyCode::Char('1') => app.select_tab(app::Tab::Local),
         KeyCode::Char('2') => app.select_tab(app::Tab::Feeds),
-        KeyCode::Char('3') => app.select_tab(app::Tab::Casts),
-        KeyCode::Char('4') => app.select_tab(app::Tab::Radio),
+        KeyCode::Char('3') => app.select_tab(app::Tab::Radio),
         KeyCode::Char('[') => app.seek_by(-5),
         KeyCode::Char(']') => app.seek_by(5),
         _ => {}

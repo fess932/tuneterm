@@ -10,6 +10,8 @@ use crate::worker::Worker;
 pub struct Request {
     pub generation: u64,
     pub path: PathBuf,
+    /// Artwork to download, for tracks that carry no embedded picture.
+    pub art_url: Option<String>,
     /// The pixel box the art will occupy. The worker returns an image scaled to
     /// fill it — up or down — so the render thread never resizes anything.
     pub box_px: (u32, u32),
@@ -42,7 +44,12 @@ impl CoverLoader {
     pub fn with_cache(cache_dir: Option<PathBuf>) -> Self {
         Self {
             worker: Worker::spawn("covers", move |request: Request| {
-                prepare(&request.path, request.box_px, cache_dir.as_deref())
+                prepare(
+                    &request.path,
+                    request.art_url.as_deref(),
+                    request.box_px,
+                    cache_dir.as_deref(),
+                )
             }),
         }
     }
@@ -77,10 +84,18 @@ impl Default for CoverLoader {
 /// decode the 1400 px original plus ~400 ms to scale it.
 fn prepare(
     path: &Path,
+    art_url: Option<&str>,
     box_px: (u32, u32),
     cache_dir: Option<&Path>,
 ) -> (Option<DynamicImage>, Option<PathBuf>) {
-    let Some(picture) = library::load_cover_bytes(path) else {
+    // A remote track has no tag to read; its artwork is a URL. Downloading it is
+    // exactly as slow as decoding a large JPEG, and this is the same worker, so it
+    // costs the interface nothing either way.
+    let picture = match art_url {
+        Some(url) => crate::net::get(url).ok(),
+        None => library::load_cover_bytes(path),
+    };
+    let Some(picture) = picture else {
         return (None, None);
     };
     let key = cache::key(&picture, box_px);
@@ -193,6 +208,7 @@ mod tests {
         loader.request(Request {
             generation: 1,
             path: fixture.track(),
+            art_url: None,
             box_px: (1000, 1000),
         });
 
@@ -212,6 +228,7 @@ mod tests {
         loader.request(Request {
             generation: 1,
             path: fixture.track(),
+            art_url: None,
             box_px: (300, 300),
         });
 
@@ -232,6 +249,7 @@ mod tests {
             loader.request(Request {
                 generation,
                 path: fixture.track(),
+                art_url: None,
                 box_px: (400, 400),
             });
         }
@@ -257,6 +275,7 @@ mod tests {
         loader.request(Request {
             generation: 7,
             path: dir.join("01 song.wav"),
+            art_url: None,
             box_px: (400, 400),
         });
 
@@ -332,11 +351,11 @@ mod bench {
             let box_px = (600, 600);
             let t = Instant::now();
             let cache_dir = cache::dir_for(cache::Kind::Art);
-            let (first, _) = prepare(&dir.join("01.wav"), box_px, cache_dir.as_deref());
+            let (first, _) = prepare(&dir.join("01.wav"), None, box_px, cache_dir.as_deref());
             let cold = t.elapsed();
 
             let t = Instant::now();
-            let (second, _) = prepare(&dir.join("02.wav"), box_px, cache_dir.as_deref());
+            let (second, _) = prepare(&dir.join("02.wav"), None, box_px, cache_dir.as_deref());
             let warm = t.elapsed();
 
             println!(

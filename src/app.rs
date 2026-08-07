@@ -27,18 +27,16 @@ pub enum Pane {
 pub enum Tab {
     Local,
     Feeds,
-    Casts,
     Radio,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Local, Tab::Feeds, Tab::Casts, Tab::Radio];
+    pub const ALL: [Tab; 3] = [Tab::Local, Tab::Feeds, Tab::Radio];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Local => "Local",
             Tab::Feeds => "Feeds",
-            Tab::Casts => "Casts",
             Tab::Radio => "Radio",
         }
     }
@@ -47,22 +45,7 @@ impl Tab {
     pub fn placeholder(self) -> &'static [&'static str] {
         match self {
             Tab::Local => &[],
-            Tab::Feeds => &[
-                "not built yet",
-                "",
-                "podcast and mixtape RSS,",
-                "starting with musicforprogramming.net",
-                "",
-                "see PLAN.md",
-            ],
-            Tab::Casts => &[
-                "not built yet",
-                "",
-                "podcasts, with resume positions",
-                "and episodes cached on disk",
-                "",
-                "see PLAN.md",
-            ],
+            Tab::Feeds => &["pick a feed on the left"],
             Tab::Radio => &["not built yet", "", "see PLAN.md"],
         }
     }
@@ -140,10 +123,19 @@ pub struct App {
     /// The user's feed list, and where the cursor is in it.
     pub feeds: Vec<Feed>,
     pub feed_state: TableState,
-    /// The `+ Add feed` button, for hit-testing.
+    /// The `+ Add feed` button and the `✕` on the highlighted row, for hit-testing.
     pub add_area: Rect,
+    pub remove_area: Rect,
+    pub feed_rows: Rect,
     /// Open input, drawn over everything else.
     pub prompt: Option<Prompt>,
+    /// Fetching and parsing a feed, off the render thread for the same reason a deep
+    /// folder scan is: it is slow and it is driven by a moving cursor.
+    fetch: Worker<String, Result<crate::feed::Channel, String>>,
+    fetch_generation: u64,
+    /// The feed whose episodes are listed, and whether it is still arriving.
+    fetched_url: Option<String>,
+    pub feed_loading: bool,
     /// Where the feed list is written. Held rather than looked up each time so tests
     /// can point it somewhere harmless instead of the user's real config.
     pub feeds_file: Option<PathBuf>,
@@ -220,7 +212,16 @@ impl App {
             feeds: config::load_feeds(),
             feed_state: TableState::default().with_selected(Some(0)),
             feeds_file: config::feeds_path(),
+            fetch: Worker::spawn("feeds", |url: String| {
+                let bytes = crate::net::get(&url)?;
+                crate::feed::parse(&String::from_utf8_lossy(&bytes))
+            }),
+            fetch_generation: 0,
+            fetched_url: None,
+            feed_loading: false,
             add_area: Rect::ZERO,
+            remove_area: Rect::ZERO,
+            feed_rows: Rect::ZERO,
             prompt: None,
             last_click: None,
             media,
@@ -451,11 +452,18 @@ impl App {
             return;
         };
         let path = track.path.clone();
-        match self.audio.play_file(&path) {
+        let art_url = track.art_url.clone();
+        let title = track.title.clone();
+        // A remote track streams; the identity in `path` is its URL either way.
+        let started = match track.url.clone() {
+            Some(url) => self.audio.play_url(&url),
+            None => self.audio.play_file(&path),
+        };
+        match started {
             Ok(()) => {
                 self.queue_pos = Some(idx);
-                self.status = format!("playing {}", path.display());
-                self.request_cover(&path);
+                self.status = format!("playing {title}");
+                self.request_cover(&path, art_url);
             }
             Err(err) => {
                 self.status = format!("error: {err:#}");
@@ -465,7 +473,7 @@ impl App {
 
     /// Hand the cover off to the worker and carry on. The old cover is cleared at
     /// once so a stale image never sits under a new track's title.
-    fn request_cover(&mut self, path: &Path) {
+    fn request_cover(&mut self, path: &Path, art_url: Option<String>) {
         let box_px = self.art_box_px();
 
         // Same album, same pane: show the picture we already hold. The worker still
@@ -491,6 +499,7 @@ impl App {
         self.cover_loader.request(cover::Request {
             generation: self.cover_generation,
             path: path.to_path_buf(),
+            art_url,
             box_px: self.cover_requested_box,
         });
     }
@@ -510,10 +519,13 @@ impl App {
         if want_w.abs_diff(had_w) < SLACK && want_h.abs_diff(had_h) < SLACK {
             return;
         }
-        let Some(path) = self.now_playing().map(|t| t.path.clone()) else {
+        let Some((path, art_url)) = self
+            .now_playing()
+            .map(|t| (t.path.clone(), t.art_url.clone()))
+        else {
             return;
         };
-        self.request_cover(&path);
+        self.request_cover(&path, art_url);
     }
 
     /// The pixel box the art will occupy.
@@ -683,7 +695,82 @@ impl App {
     /// Switching sources must never interrupt playback: the queue is a snapshot, so
     /// what is playing outlives whatever the panes are showing.
     pub fn select_tab(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
+        }
         self.tab = tab;
+        // Each tab owns the track list, so entering one has to refill it.
+        match tab {
+            Tab::Local => {
+                self.tracks_dir = None;
+                self.reload_tracks();
+            }
+            Tab::Feeds => {
+                self.fetched_url = None;
+                self.reload_feed();
+            }
+            Tab::Radio => {}
+        }
+    }
+
+    pub fn selected_feed(&self) -> Option<&Feed> {
+        self.feeds.get(self.feed_state.selected()?)
+    }
+
+    /// Fetch the highlighted feed's episodes, unless they are already on screen.
+    pub fn reload_feed(&mut self) {
+        let Some(url) = self.selected_feed().map(|f| f.url.clone()) else {
+            self.tracks.clear();
+            self.fetched_url = None;
+            return;
+        };
+        if self.fetched_url.as_ref() == Some(&url) {
+            return;
+        }
+        self.fetched_url = Some(url.clone());
+        self.tracks.clear();
+        self.feed_loading = true;
+        self.fetch_generation += 1;
+        self.fetch.request(self.fetch_generation, url);
+    }
+
+    /// Pick up a finished fetch. Cheap, so it runs every loop iteration.
+    pub fn poll_feed(&mut self) {
+        let mut newest = None;
+        for (generation, result) in self.fetch.drain() {
+            if generation == self.fetch_generation {
+                newest = Some(result);
+            }
+        }
+        let Some(result) = newest else {
+            return;
+        };
+        self.feed_loading = false;
+        match result {
+            Ok(channel) => {
+                let tracks = library::tracks_from_feed(&channel);
+                self.status = format!("{}: {} episodes", channel.title, tracks.len());
+                self.show_tracks(tracks);
+            }
+            Err(err) => {
+                self.status = format!("feed failed: {err}");
+                self.show_tracks(Vec::new());
+            }
+        }
+    }
+
+    /// Move within the feed list, refetching as the cursor lands.
+    pub fn move_feed_selection(&mut self, delta: isize) {
+        if self.feeds.is_empty() {
+            return;
+        }
+        let current = self.feed_state.selected().unwrap_or(0) as isize;
+        let last = self.feeds.len() as isize - 1;
+        let next = (current + delta).clamp(0, last) as usize;
+        if self.feed_state.selected() != Some(next) {
+            self.feed_state.select(Some(next));
+            self.reload_feed();
+        }
     }
 
     pub fn open_add_feed(&mut self) {
@@ -743,6 +830,7 @@ impl App {
         self.feed_state.select(Some(self.feeds.len() - 1));
         self.prompt = None;
         self.persist_feeds();
+        self.reload_feed();
     }
 
     /// Drop the highlighted feed.
@@ -762,6 +850,7 @@ impl App {
         }
         self.status = format!("removed {}", gone.name);
         self.persist_feeds();
+        self.reload_feed();
     }
 
     fn persist_feeds(&mut self) {
@@ -818,6 +907,18 @@ impl App {
         }
         if self.add_area.contains(pos) {
             self.open_add_feed();
+            return;
+        }
+        if self.remove_area.contains(pos) {
+            self.remove_selected_feed();
+            return;
+        }
+        if self.feed_rows.contains(pos) {
+            let row = self.feed_state.offset() + (pos.y - self.feed_rows.y) as usize;
+            if row < self.feeds.len() && self.feed_state.selected() != Some(row) {
+                self.feed_state.select(Some(row));
+                self.reload_feed();
+            }
             return;
         }
         for (tab, area) in Tab::ALL.iter().zip(self.tab_areas) {
@@ -1902,5 +2003,68 @@ mod bench {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+    use ratatui_image::picker::Picker;
+
+    /// The whole path against the real feed:
+    /// `cargo test plays_a_real_episode -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn plays_a_real_episode() {
+        let mut app = App::new(
+            std::env::temp_dir().join("tuneterm-live-empty"),
+            Picker::halfblocks(),
+            media::Bridge::detached(),
+        )
+        .expect("app");
+        app.feeds_file = None; // never write the real config
+        app.feeds = vec![config::default_feed()];
+        app.feed_state.select(Some(0));
+
+        app.select_tab(Tab::Feeds);
+        for _ in 0..300 {
+            app.poll_feed();
+            if !app.feed_loading {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!("status: {}", app.status);
+        assert!(!app.tracks.is_empty(), "no episodes: {}", app.status);
+        println!("episodes: {}", app.tracks.len());
+        let first = &app.tracks[0];
+        println!(
+            "first: {} — {} [{:?}]",
+            first.artist, first.title, first.duration
+        );
+        assert!(first.url.is_some(), "episode carries no url");
+
+        let start = std::time::Instant::now();
+        app.play_index(0);
+        println!("play_index blocked {:?}", start.elapsed());
+        assert!(app.is_playing_something(), "did not start: {}", app.status);
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            app.audio.position() > Duration::ZERO,
+            "the playhead never moved"
+        );
+        println!("position: {:?}", app.audio.position());
+
+        // Artwork comes off the network for these.
+        for _ in 0..200 {
+            app.poll_cover();
+            if !app.cover_pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!("cover: {:?}", app.cover_size);
+        assert!(app.cover_size.is_some(), "no artwork");
     }
 }

@@ -26,6 +26,28 @@ impl AudioPlayer {
         })
     }
 
+    /// Replace whatever is queued with a remote file and start playing.
+    ///
+    /// The length is handed to the decoder explicitly. `Decoder::try_from` reads it
+    /// from a `File`'s metadata, which a network stream has none of, and without it
+    /// symphonia refuses to seek backwards — the same trap a `BufReader` sets for
+    /// local files. `BufReader` is still wanted here, to turn the decoder's many
+    /// small reads into few requests.
+    pub fn play_url(&self, url: &str) -> Result<()> {
+        let remote = crate::net::HttpFile::open(url).map_err(|e| anyhow::anyhow!(e))?;
+        let len = remote.len();
+        let source = rodio::Decoder::builder()
+            .with_data(std::io::BufReader::with_capacity(256 * 1024, remote))
+            .with_byte_len(len)
+            .with_seekable(true)
+            .build()
+            .with_context(|| format!("decode {url}"))?;
+        self.player.clear();
+        self.player.append(source);
+        self.player.play();
+        Ok(())
+    }
+
     /// Replace whatever is queued with `path` and start playing.
     pub fn play_file(&self, path: &Path) -> Result<()> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -102,5 +124,47 @@ mod real_file_check {
         let back = player.position();
         println!("back={back:?}");
         assert!(back < Duration::from_secs(20), "backward seek: {back:?}");
+    }
+}
+
+#[cfg(test)]
+mod stream_check {
+    use super::*;
+
+    /// Play a real remote episode, seek in it, and confirm the playhead moved.
+    /// `cargo test streams_a_real_episode -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn streams_a_real_episode() {
+        let url = "https://datashat.net/music_for_programming_78-datassette.mp3";
+        let player = AudioPlayer::new().unwrap();
+
+        let start = std::time::Instant::now();
+        player.play_url(url).expect("play");
+        println!("time to first audio: {:?}", start.elapsed());
+
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!player.is_finished(), "stream ended immediately");
+        let early = player.position();
+        println!("position after 400ms: {early:?}");
+
+        // Seeking is the part that needs the byte length and range requests.
+        let t = std::time::Instant::now();
+        player.seek(Duration::from_secs(600)).expect("seek");
+        println!("seek to 10:00 took {:?}", t.elapsed());
+        let after = player.position();
+        println!("position after seek: {after:?}");
+        assert!(
+            after >= Duration::from_secs(590),
+            "seek did not take: {after:?}"
+        );
+
+        player.seek(Duration::from_secs(30)).expect("seek back");
+        let back = player.position();
+        println!("position after seeking back: {back:?}");
+        assert!(
+            back < Duration::from_secs(120),
+            "backward seek failed: {back:?}"
+        );
     }
 }

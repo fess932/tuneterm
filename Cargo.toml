@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "multimedia::audio"]
 anyhow = "1.0.104"
 image = "0.25"
 lofty = "0.24"
+quick-xml = "0.41"
 ratatui = "0.30"
 # chafa is a C library and only improves the halfblocks fallback; the kitty /
 # sixel / iterm2 protocols work without it. Opt back in with `chafa-dyn` after
@@ -24,6 +25,7 @@ rodio = "0.22"
 # Media keys. Default features pull libdbus (a C library) on Linux; use_zbus is
 # pure Rust, so the build needs no system packages there either.
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+ureq = "3"
 
 # Pumping the AppKit run loop, which is what macOS needs to deliver media keys.
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -115,7 +115,7 @@ not `Send`.
 | `Enter` | folders: descend · tracks: play |
 | `Backspace` | go back up a folder |
 | `1`–`4` | switch source tab |
-| `a` / `d` | on a source tab: add / remove a feed |
+| `a` / `d` | on the Feeds tab: add / remove a feed |
 | `Space` | play / pause |
 | `n` / `p` | next / previous track |
 | `[` / `]` | seek ∓5 s |
@@ -128,6 +128,7 @@ not `Send`.
 | --- | --- |
 | click a tab | switch source |
 | click `+ Add feed` | open the URL field |
+| click `✕` | remove that feed |
 | click a row | focus that pane and select the row |
 | double-click a folder | descend into it |
 | double-click `..` | go back up |
@@ -152,12 +153,20 @@ playing outlives whatever the panes are showing, and `Now Playing` stays on scre
 every tab. The hidden panes also forget where their rows were, so a click in that space
 cannot select a row that is no longer visible.
 
-**Feeds** and **Casts** already hold the list: `+ Add feed` (or `a`) opens a floating
-field, paste an RSS URL, Enter. `d` removes the highlighted one. The list is written to
-`feeds.txt` in the platform config directory — plain text, one entry per line, `#`
-comments, optional `name = url` — and ships with
-[musicforprogramming.net](https://musicforprogramming.net) in it. Fetching the episodes
-is the next piece; [PLAN.md](PLAN.md) has the rest.
+**Feeds plays podcast and mixtape RSS.** Pick a feed on the left, its episodes list on
+the right, Enter streams one. `+ Add feed` (or `a`) opens a floating field for an RSS
+URL; `d` or the `✕` on the highlighted row removes it. The list lives in `feeds.txt` in
+the platform config directory — plain text, one per line, `#` comments, optional
+`name = url` — and ships with [musicforprogramming.net](https://musicforprogramming.net)
+in it.
+
+Episodes are streamed, not downloaded: an enclosure carries a `Content-Length`, so
+`HttpFile` reads it through range requests and hands the length to the decoder
+explicitly. On a 158 MB episode that is **49 ms to first audio** and ~300 ms to seek ten
+minutes in. Artwork comes from `itunes:image` and goes through the same worker and cache
+as embedded art.
+
+**Radio** is still a placeholder; [PLAN.md](PLAN.md) has the rest.
 
 ### Browsing
 
@@ -193,13 +202,18 @@ is instant.
 | `src/cache.rs` | on-disk cover cache, content-keyed, 200 MB cap, oldest-first eviction |
 | `src/library.rs` | folder/track scanning, tags and cover extraction (`lofty`) |
 | `src/config.rs` | the user's feed list: `feeds.txt`, parsing and writing |
+| `src/feed.rs` | podcast RSS: episodes, durations, artwork |
+| `src/net.rs` | blocking HTTP, and a seekable reader over range requests |
 | `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
 | `src/media.rs` | OS media keys and now-playing metadata (`souvlaki`) |
 
 Built on [ratatui](https://ratatui.rs) +
 [ratatui-image](https://github.com/benjajaja/ratatui-image) for drawing,
 [rodio](https://github.com/RustAudio/rodio)/symphonia for audio and
-[lofty](https://github.com/Serial-ATA/lofty-rs) for tags.
+[lofty](https://github.com/Serial-ATA/lofty-rs) for tags, and
+[ureq](https://github.com/algesten/ureq) + [quick-xml](https://github.com/tafia/quick-xml)
+for feeds — blocking, since fetching already runs on a worker and an async runtime would
+buy nothing.
 
 Cover art comes from the embedded picture tag first, then a sidecar file
 (`cover.jpg`, `folder.jpg`, …) next to the track. Note that Apple Music does **not**
@@ -349,7 +363,8 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 95 tests
+cargo test                                    # 109 tests
+cargo test -- --ignored --nocapture           # plus live network checks
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```

@@ -34,11 +34,18 @@ pub struct Folder {
 
 #[derive(Clone)]
 pub struct Track {
+    /// Identity, and the file to open for a local track. Remote tracks put their
+    /// URL here too, so the queue, the play marker and the cover cache all keep
+    /// working on one key.
     pub path: PathBuf,
     pub title: String,
     pub artist: String,
     pub album: String,
     pub duration: Option<Duration>,
+    /// Set for a remote track; `None` means `path` is a real file.
+    pub url: Option<String>,
+    /// Artwork to fetch, for tracks whose picture is not in a tag.
+    pub art_url: Option<String>,
 }
 
 /// Immediate subdirectories of `dir` that hold audio anywhere beneath them, with a
@@ -243,6 +250,8 @@ fn read_track(path: PathBuf) -> Track {
         album: "—".into(),
         duration: None,
         path,
+        url: None,
+        art_url: None,
     };
 
     if let Ok(tagged) = lofty::read_from_path(&track.path) {
@@ -299,6 +308,28 @@ pub fn load_cover_bytes(path: &Path) -> Option<Vec<u8>> {
 /// Cover art for a track, decoded. Convenience wrapper over [`load_cover_bytes`].
 pub fn load_cover(path: &Path) -> Option<DynamicImage> {
     image::load_from_memory(&load_cover_bytes(path)?).ok()
+}
+
+/// Turn a feed's episodes into tracks, so everything downstream — the queue, the
+/// play marker, the cover pipeline — needs no idea where they came from.
+pub fn tracks_from_feed(channel: &crate::feed::Channel) -> Vec<Track> {
+    channel
+        .episodes
+        .iter()
+        .map(|episode| Track {
+            path: PathBuf::from(&episode.url),
+            title: episode.title.clone(),
+            artist: if episode.author.is_empty() {
+                channel.title.clone()
+            } else {
+                episode.author.clone()
+            },
+            album: channel.title.clone(),
+            duration: episode.duration,
+            url: Some(episode.url.clone()),
+            art_url: episode.art_url.clone(),
+        })
+        .collect()
 }
 
 pub fn fmt_duration(d: Duration) -> String {

@@ -57,21 +57,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match app.tab {
         Tab::Local => {
+            app.add_area = Rect::ZERO;
+            app.remove_area = Rect::ZERO;
+            app.feed_rows = Rect::ZERO;
             draw_folders(frame, app, left);
             draw_tracks(frame, app, middle);
         }
-        Tab::Feeds | Tab::Casts => {
-            // Forget where the rows were, or clicks would still land on panes that
-            // are no longer on screen.
+        Tab::Feeds => {
+            // Forget where the folder rows were, or clicks would still land on a pane
+            // that is no longer on screen. Episodes reuse the track table, so the
+            // queue, the play marker and Enter all work without knowing the source.
             app.folder_rows = Rect::ZERO;
-            app.track_rows = Rect::ZERO;
             draw_feeds(frame, app, left);
-            draw_placeholder(frame, middle, app.tab);
+            draw_tracks(frame, app, middle);
         }
         Tab::Radio => {
             app.folder_rows = Rect::ZERO;
             app.track_rows = Rect::ZERO;
             app.add_area = Rect::ZERO;
+            app.remove_area = Rect::ZERO;
+            app.feed_rows = Rect::ZERO;
             draw_placeholder(frame, strip, Tab::Radio);
         }
     }
@@ -88,14 +93,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// The feed list, with the Add button as its last row so it scrolls with them and
 /// needs no extra chrome.
 fn draw_feeds(frame: &mut Frame, app: &mut App, area: Rect) {
+    let selected = app.feed_state.selected();
     let mut rows: Vec<Row> = app
         .feeds
         .iter()
-        .map(|feed| {
+        .enumerate()
+        .map(|(index, feed)| {
+            // The remove control only appears on the highlighted row: one target at a
+            // time, and no column of x's inviting a misclick.
+            let trailing = if Some(index) == selected {
+                Span::styled(
+                    "✕",
+                    Style::new().fg(ACCENT_ALT).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("", Style::new())
+            };
             Row::new(vec![
                 Cell::from(feed.name.clone()).style(Style::new().fg(TEXT)),
-                Cell::from(Line::from("RSS").alignment(Alignment::Right))
-                    .style(Style::new().fg(DIM)),
+                Cell::from(Line::from(trailing).alignment(Alignment::Right)),
             ])
         })
         .collect();
@@ -104,13 +120,10 @@ fn draw_feeds(frame: &mut Frame, app: &mut App, area: Rect) {
         Cell::from(""),
     ]));
 
-    let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(5)])
+    let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(2)])
         .header(
-            Row::new(vec![
-                Cell::from("FEED"),
-                Cell::from(Line::from("KIND").alignment(Alignment::Right)),
-            ])
-            .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
+            Row::new(vec![Cell::from("FEED"), Cell::from("")])
+                .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
         )
         .block(pane_block("", true).title_bottom(Span::styled(
             format!(" a add · d remove · {} feeds ", app.feeds.len()),
@@ -122,12 +135,26 @@ fn draw_feeds(frame: &mut Frame, app: &mut App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
 
-    let rows_area = rows_area(area);
+    let rows = rows_area(area);
+    app.feed_rows = Rect {
+        height: (app.feeds.len() as u16).min(rows.height),
+        ..rows
+    };
     // The button is the row after the last feed.
     app.add_area = Rect {
-        y: rows_area.y + app.feeds.len() as u16,
+        y: rows.y + app.feeds.len() as u16,
         height: 1,
-        ..rows_area
+        ..rows
+    };
+    // The x sits in the last two columns of the highlighted row.
+    app.remove_area = match selected {
+        Some(index) if (index as u16) < rows.height => Rect {
+            x: rows.right().saturating_sub(2),
+            y: rows.y + index as u16,
+            width: 2,
+            height: 1,
+        },
+        _ => Rect::ZERO,
     };
     frame.render_stateful_widget(table, area, &mut app.feed_state);
 }
@@ -325,8 +352,12 @@ fn rows_area(pane: Rect) -> Rect {
 fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Pane::Tracks;
     let playing = app.playing_row();
-    let title = if app.tracks_loading {
+    let title = if app.feed_loading {
+        "Episodes — fetching…".to_string()
+    } else if app.tracks_loading {
         "Tracks — scanning…".to_string()
+    } else if app.tab == Tab::Feeds {
+        format!("Episodes ({})", app.tracks.len())
     } else {
         format!("Tracks ({})", app.tracks.len())
     };
@@ -635,7 +666,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ("n/p", "track"),
         ("[/]", "seek"),
         ("+/-", "vol"),
-        ("1-4", "source"),
+        ("1-3", "source"),
         ("q", "quit"),
     ];
     let mut spans = Vec::new();
