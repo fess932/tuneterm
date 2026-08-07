@@ -101,9 +101,9 @@ SOURCES
     switching never stops playback.
 
     Local browses the filesystem. Feeds and Casts keep a list of RSS URLs:
-    "+ Add feed" or `a` opens a field, `d` removes the highlighted entry, and the
-    list lives in feeds.txt in the config directory. Fetching episodes is not
-    built yet. Radio is a placeholder.
+    the Add feed row, or `a`, opens a field; `d` removes the highlighted entry;
+    the list lives in feeds.txt in the config directory. Fetching episodes is
+    not built yet. Radio is a placeholder.
 
 BROWSING
     The left pane is a folder browser. Moving the cursor lists everything in the
