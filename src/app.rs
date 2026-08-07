@@ -155,8 +155,33 @@ impl App {
         Ok(app)
     }
 
+    /// True when row 0 of the folder pane is the `..` entry.
+    ///
+    /// It is a *row*, not a folder, so every mapping between the two goes through
+    /// [`Self::folder_at`] and [`Self::folder_row_count`] rather than doing the
+    /// off-by-one by hand.
+    pub fn shows_up_row(&self) -> bool {
+        self.can_leave()
+    }
+
+    /// Rows in the folder pane, `..` included.
+    pub fn folder_row_count(&self) -> usize {
+        self.folders.len() + usize::from(self.shows_up_row())
+    }
+
+    /// The folder a row points at. `None` for the `..` row.
+    pub fn folder_at(&self, row: usize) -> Option<&Folder> {
+        let index = row.checked_sub(usize::from(self.shows_up_row()))?;
+        self.folders.get(index)
+    }
+
+    /// True when the cursor is on `..`.
+    pub fn on_up_row(&self) -> bool {
+        self.shows_up_row() && self.folder_state.selected() == Some(0)
+    }
+
     pub fn selected_folder(&self) -> Option<&Folder> {
-        self.folders.get(self.folder_state.selected()?)
+        self.folder_at(self.folder_state.selected()?)
     }
 
     pub fn now_playing(&self) -> Option<&Track> {
@@ -248,14 +273,20 @@ impl App {
 
     /// The directory whose tracks the right pane shows: the highlighted subfolder,
     /// or the current one when it has no subfolders of its own.
+    /// On `..`, or with nothing selected, that is the current folder itself — which
+    /// still lists something useful, namely everything below it.
     pub fn listing_dir(&self) -> PathBuf {
         self.selected_folder()
             .map(|f| f.path.clone())
             .unwrap_or_else(|| self.cwd.clone())
     }
 
-    /// Descend into the highlighted folder.
+    /// Descend into the highlighted folder, or back out when `..` is highlighted.
     pub fn enter_folder(&mut self) {
+        if self.on_up_row() {
+            self.leave_folder();
+            return;
+        }
         let Some(folder) = self.selected_folder() else {
             return;
         };
@@ -266,12 +297,15 @@ impl App {
             self.focus = Pane::Tracks;
             return;
         }
+        // Remember the row, since `..` shifts them.
         self.trail
             .push((self.cwd.clone(), self.folder_state.selected().unwrap_or(0)));
         self.cwd = target;
         self.folders = subdirs;
         self.folder_state = TableState::default();
-        self.folder_state.select(Some(0));
+        // Land on the first real folder, not on `..`.
+        self.folder_state
+            .select(Some(usize::from(self.shows_up_row())));
         self.reload_tracks();
     }
 
@@ -283,9 +317,9 @@ impl App {
         self.cwd = parent;
         self.folders = library::list_subdirs(&self.cwd);
         self.folder_state = TableState::default();
-        if !self.folders.is_empty() {
-            self.folder_state
-                .select(Some(selected.min(self.folders.len() - 1)));
+        let rows = self.folder_row_count();
+        if rows > 0 {
+            self.folder_state.select(Some(selected.min(rows - 1)));
         }
         self.reload_tracks();
     }
@@ -547,8 +581,9 @@ impl App {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        let folder_rows = self.folder_row_count();
         let (len, state) = match self.focus {
-            Pane::Folders => (self.folders.len(), &mut self.folder_state),
+            Pane::Folders => (folder_rows, &mut self.folder_state),
             Pane::Tracks => (self.tracks.len(), &mut self.track_state),
         };
         if len == 0 {
@@ -584,7 +619,11 @@ impl App {
     /// Absolute row index under `pos`, accounting for the table's scroll offset.
     fn row_at(&self, pane: Pane, pos: Position) -> Option<usize> {
         let (area, state, len) = match pane {
-            Pane::Folders => (self.folder_rows, &self.folder_state, self.folders.len()),
+            Pane::Folders => (
+                self.folder_rows,
+                &self.folder_state,
+                self.folder_row_count(),
+            ),
             Pane::Tracks => (self.track_rows, &self.track_state, self.tracks.len()),
         };
         if !area.contains(pos) {
@@ -630,7 +669,13 @@ impl App {
         self.focus = pane;
 
         match pane {
-            Pane::Folders => self.select_folder(index),
+            Pane::Folders => {
+                self.select_folder(index);
+                // Same gesture as a file manager: one click selects, two descends.
+                if repeat {
+                    self.enter_folder();
+                }
+            }
             Pane::Tracks => {
                 self.track_state.select(Some(index));
                 if repeat {
@@ -646,7 +691,7 @@ impl App {
             Some(Pane::Folders) => {
                 let next = self.folder_state.selected().unwrap_or(0) as isize + delta;
                 self.select_folder(
-                    next.clamp(0, self.folders.len().saturating_sub(1) as isize) as usize
+                    next.clamp(0, self.folder_row_count().saturating_sub(1) as isize) as usize,
                 );
             }
             Some(Pane::Tracks) => {
@@ -711,11 +756,11 @@ impl App {
     }
 
     /// Selecting a folder rescans it, so skip the work when nothing changed.
-    fn select_folder(&mut self, index: usize) {
-        if index >= self.folders.len() || self.folder_state.selected() == Some(index) {
+    fn select_folder(&mut self, row: usize) {
+        if row >= self.folder_row_count() || self.folder_state.selected() == Some(row) {
             return;
         }
-        self.folder_state.select(Some(index));
+        self.folder_state.select(Some(row));
         self.reload_tracks();
     }
 }
@@ -848,6 +893,128 @@ mod tests {
         assert_eq!(app.cwd, lib.0);
         assert_eq!(app.folder_state.selected(), Some(1), "row restored");
         assert!(!app.can_leave(), "the root is the floor");
+    }
+
+    /// `..` is a row of the table, so every index between a click and a folder has to
+    /// account for it. This is the mapping, checked at both levels.
+    #[test]
+    fn the_up_row_shifts_folder_indices() {
+        let lib = Library::new("up-row");
+        let mut app = lib.app();
+
+        // At the root there is nowhere to go up to, so no `..`.
+        assert!(!app.shows_up_row());
+        assert_eq!(app.folder_row_count(), app.folders.len());
+        assert_eq!(app.folder_at(0).map(|f| f.label.as_str()), Some("Alpha"));
+        assert!(!app.on_up_row());
+
+        app.folder_state.select(Some(1)); // Artist/
+        app.reload_tracks();
+        app.wait_for_tracks();
+        app.enter_folder();
+        app.wait_for_tracks();
+
+        assert!(app.shows_up_row());
+        assert_eq!(app.folder_row_count(), app.folders.len() + 1);
+        assert!(app.folder_at(0).is_none(), "row 0 is `..`, not a folder");
+        assert_eq!(app.folder_at(1).map(|f| f.label.as_str()), Some("Early"));
+        assert_eq!(
+            app.folder_state.selected(),
+            Some(1),
+            "landed on the first folder, not on `..`"
+        );
+        assert!(!app.on_up_row());
+    }
+
+    /// Enter on `..` climbs, the same as Backspace.
+    #[test]
+    fn enter_on_the_up_row_climbs() {
+        let lib = Library::new("enter-up");
+        let mut app = lib.app();
+        app.folder_state.select(Some(1));
+        app.reload_tracks();
+        app.wait_for_tracks();
+        app.enter_folder();
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0.join("Artist"));
+
+        app.folder_state.select(Some(0)); // `..`
+        assert!(app.on_up_row());
+        app.enter_folder();
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0, "Enter on `..` went up");
+    }
+
+    /// Highlighting `..` still lists something useful: everything under the folder
+    /// you are standing in.
+    #[test]
+    fn the_up_row_lists_the_current_folder() {
+        let lib = Library::new("up-listing");
+        let mut app = lib.app();
+        app.folder_state.select(Some(1)); // Artist/
+        app.reload_tracks();
+        app.wait_for_tracks();
+        app.enter_folder();
+        app.wait_for_tracks();
+
+        app.select_folder(0); // `..`
+        app.wait_for_tracks();
+        assert_eq!(app.listing_dir(), lib.0.join("Artist"));
+        assert_eq!(app.tracks.len(), 6, "both albums of the artist");
+    }
+
+    /// Two clicks on a folder descend, the way a file manager behaves. One must not.
+    #[test]
+    fn double_clicking_a_folder_descends() {
+        let lib = Library::new("dbl-folder");
+        let mut app = lib.app();
+        app.folder_rows = rows(0, 1, 10);
+
+        let at = Position { x: 2, y: 2 }; // row 1 == Artist/
+        let now = Instant::now();
+        app.click(at, now);
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0, "one click must not descend");
+
+        app.click(at, now + Duration::from_millis(100));
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0.join("Artist"), "two clicks descend");
+    }
+
+    /// Slow clicks are two separate selections, not a descent.
+    #[test]
+    fn two_slow_clicks_do_not_descend() {
+        let lib = Library::new("slow-folder");
+        let mut app = lib.app();
+        app.folder_rows = rows(0, 1, 10);
+
+        let at = Position { x: 2, y: 2 };
+        let now = Instant::now();
+        app.click(at, now);
+        app.click(at, now + Duration::from_secs(2));
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0);
+    }
+
+    /// The `..` row must be clickable, since that is the point of showing it.
+    #[test]
+    fn double_clicking_the_up_row_climbs() {
+        let lib = Library::new("dbl-up");
+        let mut app = lib.app();
+        app.folder_rows = rows(0, 1, 10);
+        app.folder_state.select(Some(1));
+        app.reload_tracks();
+        app.wait_for_tracks();
+        app.enter_folder();
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0.join("Artist"));
+
+        let up = Position { x: 2, y: 1 }; // row 0 == `..`
+        let now = Instant::now();
+        app.click(up, now);
+        app.click(up, now + Duration::from_millis(100));
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0);
     }
 
     /// A leaf album has nothing below it, so Enter moves to the tracks instead of

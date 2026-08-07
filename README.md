@@ -125,6 +125,8 @@ not `Send`.
 | Action | Effect |
 | --- | --- |
 | click a row | focus that pane and select the row |
+| double-click a folder | descend into it |
+| double-click `..` | go back up |
 | double-click a track | play it |
 | click `⏮` / `⏭` | previous / next track |
 | click `▶ Play` | toggle playback |
@@ -139,8 +141,13 @@ A single click never starts audio — that is what the second click is for.
 The left pane is a **folder browser**, one level at a time. Moving the cursor lists
 everything in the highlighted folder **and all of its subfolders** on the right, so
 highlighting an artist shows their whole discography rather than an empty directory.
-`Enter` descends, `Backspace` comes back up to the row you left. Folders with nothing
-playable beneath them are not shown at all.
+`Enter` descends, `Backspace` comes back up to the row you left, and a standard `..`
+row at the top does the same for the mouse — double-click descends, exactly like a
+file manager. Folders with nothing playable beneath them are not shown at all.
+
+`..` is a real row of the table rather than a decoration, so a click on it goes through
+the same arithmetic as any folder; `App::folder_at` owns the offset so nothing else has
+to remember it. Highlighting `..` lists everything under the folder you are standing in.
 
 Playback takes a **snapshot** of the list when you start a track. Browsing elsewhere
 afterwards changes what you see, never what plays next — `n` and `p` keep walking the
@@ -308,7 +315,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 66 tests
+cargo test                                    # 75 tests
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```

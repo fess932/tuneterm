@@ -13,6 +13,10 @@ const ACCENT_ALT: Color = Color::Rgb(203, 166, 247);
 const DIM: Color = Color::Rgb(88, 91, 112);
 const TEXT: Color = Color::Rgb(205, 214, 244);
 
+/// Marks the recursive track count in the folder pane. A BMP glyph on purpose:
+/// emoji are double-width and would shift the column.
+const COUNT_MARK: &str = "♪";
+
 fn pane_block(title: &str, focused: bool) -> Block<'_> {
     let border = if focused { ACCENT } else { DIM };
     let title_style = if focused {
@@ -45,16 +49,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Pane::Folders;
-    let rows: Vec<Row> = app
-        .folders
-        .iter()
-        .map(|f| {
-            Row::new(vec![
-                Cell::from(format!("{}/", f.label)).style(Style::new().fg(TEXT)),
-                Cell::from(f.count.to_string()).style(Style::new().fg(DIM)),
-            ])
-        })
-        .collect();
+    // The `..` row is part of the table, not a decoration, so a click on it hits the
+    // same row arithmetic as any folder. `App::folder_at` owns the offset.
+    let mut rows: Vec<Row> = Vec::with_capacity(app.folder_row_count());
+    if app.shows_up_row() {
+        rows.push(Row::new(vec![
+            Cell::from("..").style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Cell::from(""),
+        ]));
+    }
+    rows.extend(app.folders.iter().map(|f| {
+        Row::new(vec![
+            Cell::from(format!("{}/", f.label)).style(Style::new().fg(TEXT)),
+            // Right-aligned so the note sits in a column whatever the digit count.
+            Cell::from(Line::from(format!("{} {COUNT_MARK}", f.count)).alignment(Alignment::Right))
+                .style(Style::new().fg(DIM)),
+        ])
+    }));
 
     // Title doubles as a breadcrumb, so it is clear where Enter has taken you, and
     // says when there is somewhere to go back to.
@@ -63,9 +74,13 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.here()
     };
-    let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(5)])
+    let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(7)])
         .header(
-            Row::new(vec!["FOLDER", "№"]).style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
+            Row::new(vec![
+                Cell::from("FOLDER"),
+                Cell::from(Line::from("TRACKS").alignment(Alignment::Right)),
+            ])
+            .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
         )
         .block(pane_block(&here, focused))
         .row_highlight_style(
@@ -715,6 +730,44 @@ mod bench {
                 render,
                 decode + render
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use crate::app::App;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui_image::picker::Picker;
+
+    /// `TUNETERM_ROOT=... cargo test preview_panes -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn preview_panes() {
+        let root = std::env::var("TUNETERM_ROOT").expect("set TUNETERM_ROOT");
+        let mut app = App::new(
+            std::path::PathBuf::from(root),
+            Picker::halfblocks(),
+            crate::media::Bridge::detached(),
+        )
+        .unwrap();
+        app.wait_for_tracks();
+
+        for (label, descend) in [("at the root", false), ("inside a folder", true)] {
+            if descend {
+                app.enter_folder();
+                app.wait_for_tracks();
+            }
+            let mut terminal = Terminal::new(TestBackend::new(78, 14)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            println!("\n--- {label} ---");
+            for line in format!("{}", terminal.backend()).lines() {
+                let chars: Vec<char> = line.chars().collect();
+                let cut: String = chars[..chars.len().min(58)].iter().collect();
+                println!("{cut}");
+            }
         }
     }
 }
