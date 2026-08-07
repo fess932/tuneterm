@@ -114,7 +114,7 @@ not `Send`.
 | `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn` | move selection |
 | `Enter` | folders: descend · tracks: play |
 | `Backspace` | go back up a folder |
-| `1` / `2` | switch source tab |
+| `1`–`4` | switch source tab |
 | `Space` | play / pause |
 | `n` / `p` | next / previous track |
 | `[` / `]` | seek ∓5 s |
@@ -140,8 +140,10 @@ A single click never starts audio — that is what the second click is for.
 
 ### Sources
 
-Tabs sit in the top border of the browsing pane: **Local** works, **Radio** is a
-placeholder for now. Click one, or press `1` / `2`.
+Tabs sit in the top border of the browsing pane: **Local** works; **Feeds**, **Casts**
+and **Radio** are placeholders. Click one, or press `1`–`4`. On a pane too narrow for
+the whole strip only the active tab is shown, rather than leaving tabs that look
+present but take no clicks.
 
 Switching sources never interrupts playback — the queue is a snapshot, so what is
 playing outlives whatever the panes are showing, and `Now Playing` stays on screen on
@@ -240,8 +242,18 @@ entry per album, shared across runs. Scaling to a 600 px pane, debug build:
 | 1400 px | 1.6 s | **24 ms** |
 
 Entries live in the platform cache directory (`~/Library/Caches/tuneterm`,
-`$XDG_CACHE_HOME/tuneterm`, `%LOCALAPPDATA%\tuneterm`), capped at **200 MB** and
-evicted oldest-first after each write. `TUNETERM_CACHE_DIR` overrides the location.
+`$XDG_CACHE_HOME/tuneterm`, `%LOCALAPPDATA%\tuneterm`), one subfolder and one budget
+per kind:
+
+| Kind | Directory | Budget |
+| --- | --- | --- |
+| Art | `<cache>/art` | 200 MB |
+| Audio (for streamed sources) | `<cache>/audio` | 2000 MB |
+
+Separate on purpose: a podcast episode is 50–375 MB against ~200 KB for a cover, so a
+shared cap would let one episode evict the entire art cache. Both sweep oldest-first,
+and a read touches the file, so what you actually listen to survives.
+`TUNETERM_CACHE_DIR` overrides the location; `make clean-cache` empties it.
 
 ### Who scales the cover, and why it matters
 
@@ -329,7 +341,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 78 tests
+cargo test                                    # 80 tests
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```

@@ -25,16 +25,44 @@ pub enum Pane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Local,
+    Feeds,
+    Casts,
     Radio,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 2] = [Tab::Local, Tab::Radio];
+    pub const ALL: [Tab; 4] = [Tab::Local, Tab::Feeds, Tab::Casts, Tab::Radio];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Local => "Local",
+            Tab::Feeds => "Feeds",
+            Tab::Casts => "Casts",
             Tab::Radio => "Radio",
+        }
+    }
+
+    /// Shown in place of the pane while a source is still a plan.
+    pub fn placeholder(self) -> &'static [&'static str] {
+        match self {
+            Tab::Local => &[],
+            Tab::Feeds => &[
+                "not built yet",
+                "",
+                "podcast and mixtape RSS,",
+                "starting with musicforprogramming.net",
+                "",
+                "see PLAN.md",
+            ],
+            Tab::Casts => &[
+                "not built yet",
+                "",
+                "podcasts, with resume positions",
+                "and episodes cached on disk",
+                "",
+                "see PLAN.md",
+            ],
+            Tab::Radio => &["not built yet", "", "see PLAN.md"],
         }
     }
 }
@@ -1467,13 +1495,26 @@ mod tests {
     fn clicking_a_tab_switches_source() {
         let lib = Library::new("tabs");
         let mut app = lib.app();
-        app.tab_areas = [Rect::new(1, 0, 7, 1), Rect::new(9, 0, 7, 1)];
+        // One strip per tab, laid out as the renderer would.
+        let mut x = 1;
+        for (index, tab) in Tab::ALL.iter().enumerate() {
+            let width = tab.label().chars().count() as u16 + 2;
+            app.tab_areas[index] = Rect::new(x, 0, width, 1);
+            x += width + 1;
+        }
 
         assert_eq!(app.tab, Tab::Local, "local by default");
-        app.click(Position { x: 11, y: 0 }, Instant::now());
-        assert_eq!(app.tab, Tab::Radio);
-        app.click(Position { x: 3, y: 0 }, Instant::now());
-        assert_eq!(app.tab, Tab::Local);
+        for (index, tab) in Tab::ALL.iter().enumerate() {
+            let area = app.tab_areas[index];
+            app.click(
+                Position {
+                    x: area.x + 1,
+                    y: 0,
+                },
+                Instant::now(),
+            );
+            assert_eq!(app.tab, *tab, "clicking {:?}", tab);
+        }
     }
 
     /// Switching source must not interrupt playback: the queue outlives the panes.
@@ -1485,12 +1526,15 @@ mod tests {
         let playing = app.now_playing().map(|t| t.path.clone());
         assert!(playing.is_some(), "playback failed: {}", app.status);
 
-        app.select_tab(Tab::Radio);
-        assert_eq!(app.now_playing().map(|t| t.path.clone()), playing);
-        assert!(app.is_playing_something());
-
-        app.select_tab(Tab::Local);
-        assert_eq!(app.now_playing().map(|t| t.path.clone()), playing);
+        for tab in Tab::ALL {
+            app.select_tab(tab);
+            assert_eq!(
+                app.now_playing().map(|t| t.path.clone()),
+                playing,
+                "playback survives {tab:?}"
+            );
+            assert!(app.is_playing_something(), "{tab:?}");
+        }
     }
 
     /// The panes are gone on another tab, so their recorded rects must be too —

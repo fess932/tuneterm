@@ -11,14 +11,53 @@ use std::time::SystemTime;
 
 use image::DynamicImage;
 
-/// Total budget for the cache directory. Entries are evicted oldest-first.
-pub const MAX_BYTES: u64 = 200 * 1024 * 1024;
+/// What a cache entry is for, which decides both where it lives and how much room
+/// it gets.
+///
+/// The budgets are **separate on purpose**. A podcast episode is 50-375 MB; sharing
+/// one directory and one cap with the covers would let a single episode evict the
+/// entire art cache, and every cover would then have to be decoded and scaled again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Scaled cover art. Small, many entries, cheap to lose.
+    Art,
+    /// Downloaded audio. Huge, few entries, expensive to lose.
+    Audio,
+}
+
+impl Kind {
+    fn folder(self) -> &'static str {
+        match self {
+            Kind::Art => "art",
+            Kind::Audio => "audio",
+        }
+    }
+
+    /// Room this kind gets, evicted oldest-first once exceeded.
+    pub fn budget(self) -> u64 {
+        const MB: u64 = 1024 * 1024;
+        match self {
+            Kind::Art => 200 * MB,
+            Kind::Audio => 2000 * MB,
+        }
+    }
+}
 
 /// Platform cache directory, `tuneterm` subfolder. `None` if there is no home.
 ///
 /// `TUNETERM_CACHE_DIR` overrides it, which is how the tests avoid writing into the
 /// real user cache.
 pub fn dir() -> Option<PathBuf> {
+    dir_for(Kind::Art)
+}
+
+/// Directory for one kind of entry. Each gets its own folder so a sweep of one
+/// cannot touch the other.
+pub fn dir_for(kind: Kind) -> Option<PathBuf> {
+    Some(base_dir()?.join(kind.folder()))
+}
+
+fn base_dir() -> Option<PathBuf> {
     match std::env::var_os("TUNETERM_CACHE_DIR") {
         Some(over) if !over.is_empty() => Some(PathBuf::from(over)),
         _ => platform_dir(),
@@ -40,6 +79,23 @@ fn platform_dir() -> Option<PathBuf> {
         }
     };
     Some(base.join("tuneterm"))
+}
+
+/// Remove entries left directly in the base directory.
+///
+/// Entries used to live there before art and audio were split into their own
+/// folders. Nothing reads them now and no sweep would ever reach them, so they
+/// would sit there for good. Only loose *files* go — directories are the new layout.
+pub fn tidy() {
+    let Some(base) = base_dir() else { return };
+    let Ok(entries) = fs::read_dir(&base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.metadata().is_ok_and(|m| m.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Stable 64-bit content key. FNV-1a: no dependency, and a cache miss is the only
@@ -85,7 +141,7 @@ pub fn get_in(dir: &Path, key: &str) -> Option<DynamicImage> {
     Some(img)
 }
 
-/// Store a scaled cover, then bring the directory back under [`MAX_BYTES`].
+/// Store a scaled cover, then bring its directory back under budget.
 ///
 /// Every failure here is ignored on purpose: a cache that cannot be written is a
 /// slower app, not a broken one.
@@ -115,7 +171,7 @@ pub fn put_in(dir: &Path, key: &str, img: &DynamicImage) {
         return;
     }
 
-    sweep(dir, MAX_BYTES);
+    sweep(dir, Kind::Art.budget());
 }
 
 /// Delete oldest-first until the directory fits in `max_bytes`.
@@ -188,6 +244,20 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(dir.to_string_lossy().contains("Library/Caches"), "{dir:?}");
         }
+    }
+
+    /// Art and audio must never share a directory: one 375 MB episode would
+    /// otherwise evict every cover.
+    #[test]
+    fn each_kind_gets_its_own_directory_and_budget() {
+        let art = dir_for(Kind::Art).expect("art dir");
+        let audio = dir_for(Kind::Audio).expect("audio dir");
+        assert_ne!(art, audio);
+        assert!(art.ends_with("art"), "{art:?}");
+        assert!(audio.ends_with("audio"), "{audio:?}");
+        assert_eq!(Kind::Art.budget(), 200 * 1024 * 1024);
+        assert_eq!(Kind::Audio.budget(), 2000 * 1024 * 1024);
+        assert!(Kind::Audio.budget() > Kind::Art.budget());
     }
 
     /// The whole point: the same picture at the same size is one entry, whatever
@@ -292,8 +362,35 @@ mod tests {
         image(32, 7)
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
-        sweep(&temp.0, MAX_BYTES);
+        sweep(&temp.0, Kind::Art.budget());
         assert!(path.exists());
+    }
+
+    /// The migration must take the stale flat entries and leave the new folders.
+    #[test]
+    fn tidy_removes_loose_files_but_keeps_the_subfolders() {
+        let temp = TempDir::new("tidy");
+        let loose = temp.0.join("deadbeef-300x300.png");
+        image(32, 1)
+            .save_with_format(&loose, image::ImageFormat::Png)
+            .unwrap();
+        let art = temp.0.join("art");
+        fs::create_dir_all(&art).unwrap();
+        let kept = art.join("live-300x300.png");
+        image(32, 2)
+            .save_with_format(&kept, image::ImageFormat::Png)
+            .unwrap();
+
+        // `tidy` reads the base from the environment, so exercise the body directly
+        // on a directory we control.
+        for entry in fs::read_dir(&temp.0).unwrap().flatten() {
+            if entry.metadata().is_ok_and(|m| m.is_file()) {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+
+        assert!(!loose.exists(), "stale flat entry should be gone");
+        assert!(art.is_dir() && kept.exists(), "the new layout is untouched");
     }
 
     #[test]

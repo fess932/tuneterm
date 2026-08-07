@@ -49,7 +49,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_folders(frame, app, left);
             draw_tracks(frame, app, middle);
         }
-        Tab::Radio => {
+        unbuilt => {
             // Forget where the rows were, or clicks would still land on panes that
             // are no longer on screen.
             app.folder_rows = Rect::ZERO;
@@ -58,7 +58,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 width: left.width + middle.width,
                 ..left
             };
-            draw_placeholder(frame, app, span);
+            draw_placeholder(frame, app, span, unbuilt);
         }
     }
     draw_help(frame, app, help);
@@ -72,7 +72,21 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, pane: Rect) {
     let mut x = pane.x.saturating_add(1);
     let limit = pane.right().saturating_sub(1);
 
+    // Width of the whole strip, separators included.
+    let full: u16 = Tab::ALL
+        .iter()
+        .map(|t| t.label().chars().count() as u16 + 2)
+        .sum::<u16>()
+        + Tab::ALL.len().saturating_sub(1) as u16;
+    // A narrow pane cannot hold them all. Showing just the active one is honest;
+    // dropping the tail would leave tabs that look present but take no clicks.
+    let only_active = x + full > limit;
+
     for (index, tab) in Tab::ALL.iter().enumerate() {
+        if only_active && app.tab != *tab {
+            app.tab_areas[index] = Rect::ZERO;
+            continue;
+        }
         let active = app.tab == *tab;
         let text = format!(" {} ", tab.label());
         let width = text.chars().count() as u16;
@@ -93,7 +107,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, pane: Rect) {
         app.tab_areas[index] = area;
         x += width;
 
-        if index + 1 < Tab::ALL.len() && x < limit {
+        if !only_active && index + 1 < Tab::ALL.len() && x < limit {
             frame.render_widget(
                 Paragraph::new(Span::styled("│", Style::new().fg(DIM))),
                 Rect::new(x, pane.y, 1, 1),
@@ -104,27 +118,25 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, pane: Rect) {
 }
 
 /// A source that exists as a tab but not yet as code.
-fn draw_placeholder(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_placeholder(frame: &mut Frame, app: &mut App, area: Rect, tab: Tab) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(DIM));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines = vec![Line::from(""); (inner.height / 2).saturating_sub(2) as usize];
+    let body = tab.placeholder();
+    let top = (inner.height as usize).saturating_sub(body.len() + 2) / 2;
+    let mut lines = vec![Line::from(""); top];
     lines.push(Line::from(Span::styled(
-        "Radio",
+        tab.label(),
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "not built yet",
-        Style::new().fg(DIM),
-    )));
-    lines.push(Line::from(Span::styled(
-        "see PLAN.md",
-        Style::new().fg(DIM),
-    )));
+    lines.extend(
+        body.iter()
+            .map(|text| Line::from(Span::styled(*text, Style::new().fg(DIM)))),
+    );
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
     draw_tabs(frame, app, area);
 }
@@ -506,7 +518,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ("n/p", "track"),
         ("[/]", "seek"),
         ("+/-", "vol"),
-        ("1/2", "source"),
+        ("1-4", "source"),
         ("q", "quit"),
     ];
     let mut spans = Vec::new();

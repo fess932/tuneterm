@@ -198,12 +198,104 @@ Independent of which source lands first:
 
 ---
 
+## Feeds and podcasts: the tabs that are nearly free
+
+`musicforprogramming.net` prompted this section, and the useful discovery is that it
+is **not a special case**. Its feed is an ordinary podcast RSS:
+
+```
+<enclosure url="https://datashat.net/music_for_programming_78-datassette.mp3"
+           type="audio/mpeg" length="…"/>
+<itunes:duration>…</itunes:duration>  <dc:creator>…</dc:creator>
+<itunes:image href="…1024×1024…"/>
+```
+
+Every field the interface needs is already there, and the enclosure carries a
+**length** — which is exactly the precondition for the `Read + Seek` reader, since
+symphonia will not seek backwards without one. 78 episodes, plain MP3s, artwork that
+the existing cover pipeline scales and content-hashes without changes.
+
+So one RSS source covers musicforprogramming, every podcast, and any mix blog that
+attaches enclosures. That is why `Feeds` and `Casts` are separate tabs but will share
+almost all their code: the difference is presentation and *resume position*, which
+podcasts need and a 90-minute mix does not.
+
+### Where the list lives
+
+A plain text file in the platform config directory, next to nothing else:
+
+```
+~/Library/Application Support/tuneterm/feeds.txt     # macOS
+$XDG_CONFIG_HOME/tuneterm/feeds.txt                  # Linux
+%APPDATA%\tuneterm\feeds.txt                        # Windows
+```
+
+One URL per line, `#` for comments, optional `name = url` when the feed's own title
+is unhelpful. Shipped with `musicforprogramming.net/rss.xml` already in it.
+
+Text, not TOML or JSON, for the same reason the cache directory is hand-rolled: it
+needs no dependency, it is obvious in an editor, and a syntax error can only ever cost
+one line rather than the whole file. Resume positions are *state*, not config, so they
+belong in the cache directory instead — a second file keyed by episode URL.
+
+### Adding one without breaking the design
+
+The interface has no text input anywhere, which is the actual constraint. The answer
+that fits is a **`:` command line** on the bottom row, where the help hints already
+live — one row, appears only while typing, vanishes on Enter or Escape:
+
+```
+:add https://example.com/feed.xml
+```
+
+It earns its keep twice over, because [search](#4-search-stops-being-optional) needs
+exactly the same affordance and would otherwise need inventing separately. `d` on a
+selected feed removes it. No modal, no popup, nothing that has to be dismissed.
+
+### Worth adding besides musicforprogramming
+
+Ranked by whether there is something to build against, not by taste.
+
+| Source | Interface | Notes |
+| --- | --- | --- |
+| [SomaFM](https://somafm.com/linktous/api.html) | `api.somafm.com/channels.json` | ~30 curated channels, documented for third-party clients. Their terms reserve logos, artwork and channel text, so use the API for streams and names |
+| [Internet Archive](https://archive.org/advancedsearch.php) | JSON search + `metadata/<id>` | The widest legal catalogue here: Live Music Archive, netlabels, 78rpm digitisations. Ranged GET works |
+| [radio-browser.org](https://www.radio-browser.info/) | free JSON API | Thousands of stations, no key |
+| [Jamendo](https://developer.jamendo.com/) | REST, needs a key | Creative Commons catalogue with real streaming |
+| [Musopen](https://musopen.org/) | small API | Public-domain classical |
+| ccMixter, Free Music Archive | APIs of varying liveliness | CC catalogues; check the API still answers before relying on it |
+| [ModArchive](https://modarchive.org/) | API | Tracker modules — but MOD/XM/IT need `libopenmpt`, so it is another playback path, not another source |
+
+The ambient mix blogs in the same spirit as musicforprogramming — Ambient Blog,
+Headphone Commute, Disquiet, A Strangely Isolated Place — mostly publish *article*
+feeds, and only some attach enclosures. That is an argument for the generic feed
+source rather than for hardcoding any of them: paste a URL, and it either has
+enclosures and works or it does not and shows nothing.
+
+### Cache
+
+Episodes are 50–375 MB each, against ~200 KB for a cover, so the budgets are separate
+and so are the directories:
+
+| Kind | Directory | Budget |
+| --- | --- | --- |
+| Art | `<cache>/art` | 200 MB |
+| Audio | `<cache>/audio` | 2000 MB |
+
+Sharing one cap would let a single episode evict the entire art cache, and every cover
+would then have to be decoded and scaled again. Both sweep oldest-first, and reads
+touch the file, so what you actually listen to survives.
+
+---
+
 ## Suggested order
 
 1. **`Source` trait + async browse + HTTP seekable reader.** No new features, all the
    value. Local files become one implementation of the trait, which keeps it honest.
 2. **Subsonic.** Highest payoff, and it validates the abstraction against a real API.
-3. **WebDAV and podcasts.** Nearly free once the HTTP reader exists.
+3. **Feeds and podcasts.** Nearly free once the HTTP reader exists, and
+   musicforprogramming.net is the first entry. Brings the `:` command line, which
+   search needs anyway.
 4. **Radio.** Forces the unknown-duration work, which everything else benefits from.
 5. **YouTube Music**, behind a feature flag. Cheap on the playback side once step 1
    exists; budget the time for browsing and for keeping extraction alive.

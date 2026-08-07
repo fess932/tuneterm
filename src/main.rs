@@ -96,8 +96,9 @@ OPTIONS
     -V, --version     Print the version.
 
 SOURCES
-    Tabs in the top border of the browsing pane: Local works, Radio is a
-    placeholder. Click one or press 1 / 2. Switching never stops playback.
+    Tabs in the top border of the browsing pane: Local works, Feeds, Casts and
+    Radio are placeholders. Click one or press 1 - 4. Switching never stops
+    playback.
 
 BROWSING
     The left pane is a folder browser. Moving the cursor lists everything in the
@@ -109,7 +110,7 @@ KEYS
     j/k, PgUp/PgDn    Move selection         n / p         Next / previous
     Enter             Open folder / play     [ / ]         Seek -/+ 5s
     Backspace         Go up a folder         + / -         Volume
-    1 / 2             Switch source
+    1 - 4             Switch source
     q, Esc, Ctrl-C    Quit
 
     The mouse works too: click a row to select, double-click to play, click the
@@ -281,6 +282,9 @@ fn main() -> Result<()> {
         }
     };
 
+    // One-off: entries predate the art/audio split and are now unreachable.
+    cache::tidy();
+
     let root = args.root.unwrap_or_else(default_root);
     if args.scan {
         // A closed pipe (`| head`) is not a failure worth reporting.
@@ -438,7 +442,9 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('+') | KeyCode::Char('=') => app.audio.nudge_volume(0.05),
         KeyCode::Char('-') => app.audio.nudge_volume(-0.05),
         KeyCode::Char('1') => app.select_tab(app::Tab::Local),
-        KeyCode::Char('2') => app.select_tab(app::Tab::Radio),
+        KeyCode::Char('2') => app.select_tab(app::Tab::Feeds),
+        KeyCode::Char('3') => app.select_tab(app::Tab::Casts),
+        KeyCode::Char('4') => app.select_tab(app::Tab::Radio),
         KeyCode::Char('[') => app.seek_by(-5),
         KeyCode::Char(']') => app.seek_by(5),
         _ => {}

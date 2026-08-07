@@ -34,9 +34,15 @@ pub struct CoverLoader {
 
 impl CoverLoader {
     pub fn new() -> Self {
+        Self::with_cache(cache::dir_for(cache::Kind::Art))
+    }
+
+    /// Explicit cache directory. Tests use it to stay out of the real one, which
+    /// also stops them from depending on whatever is already in it.
+    pub fn with_cache(cache_dir: Option<PathBuf>) -> Self {
         Self {
-            worker: Worker::spawn("covers", |request: Request| {
-                prepare(&request.path, request.box_px)
+            worker: Worker::spawn("covers", move |request: Request| {
+                prepare(&request.path, request.box_px, cache_dir.as_deref())
             }),
         }
     }
@@ -69,22 +75,28 @@ impl Default for CoverLoader {
 /// Ordered so the cheap steps come first: reading the tag is ~15 ms, hashing the
 /// picture ~0.2 ms, and decoding a cached 300 px PNG ~13 ms — against ~190 ms to
 /// decode the 1400 px original plus ~400 ms to scale it.
-fn prepare(path: &Path, box_px: (u32, u32)) -> (Option<DynamicImage>, Option<PathBuf>) {
+fn prepare(
+    path: &Path,
+    box_px: (u32, u32),
+    cache_dir: Option<&Path>,
+) -> (Option<DynamicImage>, Option<PathBuf>) {
     let Some(picture) = library::load_cover_bytes(path) else {
         return (None, None);
     };
     let key = cache::key(&picture, box_px);
-    let file = cache::path(&key);
+    let file = cache_dir.map(|dir| dir.join(&key));
 
-    if let Some(cached) = cache::get(&key) {
+    if let Some(cached) = cache_dir.and_then(|dir| cache::get_in(dir, &key)) {
         return (Some(cached), file);
     }
 
-    let Some(decoded) = image::load_from_memory(&picture).ok() else {
+    let Ok(decoded) = image::load_from_memory(&picture) else {
         return (None, None);
     };
     let scaled = fill(decoded, box_px);
-    cache::put(&key, &scaled);
+    if let Some(dir) = cache_dir {
+        cache::put_in(dir, &key, &scaled);
+    }
     // Only advertise the file if it really landed.
     let file = file.filter(|path| path.is_file());
     (Some(scaled), file)
@@ -144,6 +156,11 @@ mod tests {
         fn track(&self) -> PathBuf {
             self.0.join("01 song.wav")
         }
+
+        /// A loader whose cache lives inside this fixture, so nothing is shared.
+        fn loader(&self) -> CoverLoader {
+            CoverLoader::with_cache(Some(self.0.join("cache")))
+        }
     }
 
     impl Drop for Fixture {
@@ -154,7 +171,7 @@ mod tests {
 
     /// Block until the worker answers, so the test does not race it.
     fn wait_for(loader: &CoverLoader, generation: u64) -> Option<Loaded> {
-        for _ in 0..200 {
+        for _ in 0..800 {
             let mut found = None;
             for reply in loader.drain() {
                 found = Some(reply);
@@ -172,7 +189,7 @@ mod tests {
     #[test]
     fn loads_a_cover_off_thread() {
         let fixture = Fixture::new("load", 400);
-        let loader = CoverLoader::new();
+        let loader = fixture.loader();
         loader.request(Request {
             generation: 1,
             path: fixture.track(),
@@ -191,7 +208,7 @@ mod tests {
     #[test]
     fn shrinks_oversized_covers_before_handing_them_over() {
         let fixture = Fixture::new("shrink", 1200);
-        let loader = CoverLoader::new();
+        let loader = fixture.loader();
         loader.request(Request {
             generation: 1,
             path: fixture.track(),
@@ -210,7 +227,7 @@ mod tests {
     #[test]
     fn rapid_requests_collapse_to_the_last_one() {
         let fixture = Fixture::new("collapse", 900);
-        let loader = CoverLoader::new();
+        let loader = fixture.loader();
         for generation in 1..=25 {
             loader.request(Request {
                 generation,
@@ -314,11 +331,12 @@ mod bench {
 
             let box_px = (600, 600);
             let t = Instant::now();
-            let (first, _) = prepare(&dir.join("01.wav"), box_px);
+            let cache_dir = cache::dir_for(cache::Kind::Art);
+            let (first, _) = prepare(&dir.join("01.wav"), box_px, cache_dir.as_deref());
             let cold = t.elapsed();
 
             let t = Instant::now();
-            let (second, _) = prepare(&dir.join("02.wav"), box_px);
+            let (second, _) = prepare(&dir.join("02.wav"), box_px, cache_dir.as_deref());
             let warm = t.elapsed();
 
             println!(
