@@ -313,9 +313,12 @@ pub fn load_cover(path: &Path) -> Option<DynamicImage> {
 /// Turn a feed's episodes into tracks, so everything downstream — the queue, the
 /// play marker, the cover pipeline — needs no idea where they came from.
 pub fn tracks_from_feed(channel: &crate::feed::Channel) -> Vec<Track> {
+    // A feed lists newest first. A numbered archive reads better the other way, so
+    // episode 1 is row 1 and `n` walks forwards through the series.
     channel
         .episodes
         .iter()
+        .rev()
         .map(|episode| Track {
             path: PathBuf::from(&episode.url),
             title: episode.title.clone(),

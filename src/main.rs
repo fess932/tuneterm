@@ -452,19 +452,13 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Tab | KeyCode::BackTab => app.focus_next(),
         KeyCode::Left | KeyCode::Char('h') => app.focus = Pane::Folders,
         KeyCode::Right | KeyCode::Char('l') => app.focus = Pane::Tracks,
-        KeyCode::Down | KeyCode::Char('j') if app.tab == app::Tab::Feeds => {
-            app.move_feed_selection(1);
-        }
-        KeyCode::Up | KeyCode::Char('k') if app.tab == app::Tab::Feeds => {
-            app.move_feed_selection(-1);
-        }
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::PageDown => app.move_selection(10),
         KeyCode::PageUp => app.move_selection(-10),
         KeyCode::Enter => match app.focus {
             // The track list already follows the cursor, so Enter is for descending.
-            Pane::Folders => app.enter_folder(),
+            Pane::Folders => app.enter_selected(),
             Pane::Tracks => app.play_selected_track(),
         },
         KeyCode::Backspace => app.leave_folder(),

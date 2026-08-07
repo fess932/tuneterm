@@ -364,6 +364,15 @@ impl App {
             .unwrap_or_else(|| self.cwd.clone())
     }
 
+    /// What Enter does in the left pane, whichever tab is showing.
+    pub fn enter_selected(&mut self) {
+        match self.tab {
+            // A feed has nothing to descend into; its episodes are already listed.
+            Tab::Feeds => self.focus = Pane::Tracks,
+            _ => self.enter_folder(),
+        }
+    }
+
     /// Descend into the highlighted folder, or back out when `..` is highlighted.
     pub fn enter_folder(&mut self) {
         if self.on_up_row() {
@@ -674,7 +683,17 @@ impl App {
         }
     }
 
+    /// Move within the focused pane.
+    ///
+    /// `Pane::Folders` is "the left pane", whatever the tab puts there — folders on
+    /// Local, feeds on Feeds. Routing keys by tab instead of by focus was what left
+    /// the episode list unreachable.
     pub fn move_selection(&mut self, delta: isize) {
+        if self.tab == Tab::Feeds && self.focus == Pane::Folders {
+            self.move_feed_selection(delta);
+            return;
+        }
+
         let folder_rows = self.folder_row_count();
         let (len, state) = match self.focus {
             Pane::Folders => (folder_rows, &mut self.folder_state),
@@ -750,6 +769,7 @@ impl App {
             Ok(channel) => {
                 let tracks = library::tracks_from_feed(&channel);
                 self.status = format!("{}: {} episodes", channel.title, tracks.len());
+                self.adopt_channel_title(&channel.title);
                 self.show_tracks(tracks);
             }
             Err(err) => {
@@ -757,6 +777,27 @@ impl App {
                 self.show_tracks(Vec::new());
             }
         }
+    }
+
+    /// Name a feed after its channel, now that we know it.
+    ///
+    /// Only when the current name was derived from the host — a name the user typed
+    /// into `feeds.txt` is theirs to keep, which is what `name = url` is for.
+    fn adopt_channel_title(&mut self, title: &str) {
+        if title.is_empty() {
+            return;
+        }
+        let Some(index) = self.feed_state.selected() else {
+            return;
+        };
+        let Some(feed) = self.feeds.get_mut(index) else {
+            return;
+        };
+        if feed.name != config::host_of(&feed.url) || feed.name == title {
+            return;
+        }
+        feed.name = title.to_string();
+        self.persist_feeds();
     }
 
     /// Move within the feed list, refetching as the cursor lands.
@@ -914,6 +955,7 @@ impl App {
             return;
         }
         if self.feed_rows.contains(pos) {
+            self.focus = Pane::Folders;
             let row = self.feed_state.offset() + (pos.y - self.feed_rows.y) as usize;
             if row < self.feeds.len() && self.feed_state.selected() != Some(row) {
                 self.feed_state.select(Some(row));
@@ -978,6 +1020,10 @@ impl App {
 
     /// Scroll the pane under the cursor, which need not be the focused one.
     pub fn scroll(&mut self, pos: Position, delta: isize) {
+        if self.feed_rows.contains(pos) {
+            self.move_feed_selection(delta);
+            return;
+        }
         match self.pane_at(pos) {
             Some(Pane::Folders) => {
                 let next = self.folder_state.selected().unwrap_or(0) as isize + delta;
@@ -1782,14 +1828,21 @@ mod tests {
         assert!(!app.is_playing_something());
     }
 
-    /// A feed list that writes somewhere harmless.
+    /// Unroutable on purpose: these tests are about the list and the input, not about
+    /// fetching, and they must not depend on a network or on someone else's server.
+    const TEST_FEED: &str = "https://tuneterm.invalid/feed.xml";
+
+    /// A feed list that writes somewhere harmless and fetches nothing real.
     fn feeds_app(lib: &Library, name: &str) -> App {
         let mut app = lib.app();
         let file =
             std::env::temp_dir().join(format!("tuneterm-feeds-{}-{name}.txt", std::process::id()));
         let _ = std::fs::remove_file(&file);
         app.feeds_file = Some(file);
-        app.feeds = vec![config::default_feed()];
+        app.feeds = vec![Feed {
+            name: "test".into(),
+            url: TEST_FEED.into(),
+        }];
         app.feed_state.select(Some(0));
         app.select_tab(Tab::Feeds);
         app
@@ -1847,7 +1900,7 @@ mod tests {
         let lib = Library::new("feed-dup");
         let mut app = feeds_app(&lib, "dup");
         app.open_add_feed();
-        for ch in config::DEFAULT_FEED.1.chars() {
+        for ch in TEST_FEED.chars() {
             app.prompt_key(ch);
         }
         app.submit_prompt();
@@ -1931,6 +1984,117 @@ mod tests {
         app.remove_selected_feed();
         assert!(app.feeds.is_empty());
         assert_eq!(app.feed_state.selected(), None, "nothing left to point at");
+    }
+
+    /// Regression: keys were routed by tab rather than by focus, so the arrows always
+    /// moved the feed list and the episodes were unreachable.
+    #[test]
+    fn focus_decides_which_list_the_arrows_move() {
+        let lib = Library::new("feed-focus");
+        let mut app = feeds_app(&lib, "focus");
+        // Two feeds and a stand-in episode list.
+        app.feeds.push(Feed {
+            name: "example.com".into(),
+            url: "https://example.com/p.xml".into(),
+        });
+        app.feed_state.select(Some(0));
+
+        app.focus = Pane::Folders;
+        app.move_selection(1);
+        assert_eq!(app.feed_state.selected(), Some(1), "feed list moved");
+
+        // Changing feed clears the episode list, so stand one in afterwards.
+        app.tracks = lib.app().tracks;
+        assert!(app.tracks.len() >= 3, "need episodes to move through");
+        app.track_state.select(Some(0));
+
+        app.focus = Pane::Tracks;
+        app.move_selection(1);
+        assert_eq!(app.track_state.selected(), Some(1), "episodes moved");
+        assert_eq!(app.feed_state.selected(), Some(1), "feed list untouched");
+
+        // And back: the arrows follow focus, not the tab.
+        app.focus = Pane::Folders;
+        app.move_selection(-1);
+        assert_eq!(app.feed_state.selected(), Some(0));
+    }
+
+    /// Enter in the left pane of Feeds hands over to the episodes.
+    #[test]
+    fn enter_moves_from_the_feed_to_its_episodes() {
+        let lib = Library::new("feed-enter");
+        let mut app = feeds_app(&lib, "enter");
+        app.focus = Pane::Folders;
+        app.enter_selected();
+        assert_eq!(app.focus, Pane::Tracks);
+    }
+
+    /// A click in either pane takes focus, so the arrows follow the mouse.
+    #[test]
+    fn clicking_a_feed_row_takes_focus() {
+        let lib = Library::new("feed-click");
+        let mut app = feeds_app(&lib, "click");
+        app.feed_rows = rows(0, 1, 10);
+        app.track_rows = rows(30, 1, 10);
+        app.focus = Pane::Tracks;
+
+        app.click(Position { x: 2, y: 1 }, Instant::now());
+        assert_eq!(app.focus, Pane::Folders);
+    }
+
+    /// A feed lists newest first; the interface shows the archive in reading order.
+    #[test]
+    fn episodes_are_listed_oldest_first() {
+        let channel = crate::feed::Channel {
+            title: "Archive".into(),
+            episodes: vec![
+                crate::feed::Episode {
+                    title: "Episode 3".into(),
+                    url: "https://example.com/3.mp3".into(),
+                    ..Default::default()
+                },
+                crate::feed::Episode {
+                    title: "Episode 2".into(),
+                    url: "https://example.com/2.mp3".into(),
+                    ..Default::default()
+                },
+                crate::feed::Episode {
+                    title: "Episode 1".into(),
+                    url: "https://example.com/1.mp3".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let tracks = library::tracks_from_feed(&channel);
+        let titles: Vec<&str> = tracks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["Episode 1", "Episode 2", "Episode 3"]);
+    }
+
+    /// A feed added by URL should end up labelled by its channel, not its host.
+    #[test]
+    fn a_fetched_feed_takes_its_channel_name() {
+        let lib = Library::new("feed-name");
+        let mut app = feeds_app(&lib, "name");
+        app.feeds[0].name = config::host_of(TEST_FEED); // as `+ Add feed` leaves it
+
+        app.adopt_channel_title("Music For Programming");
+        assert_eq!(app.feeds[0].name, "Music For Programming");
+        assert_eq!(
+            config::load_feeds_from(app.feeds_file.as_ref().unwrap())[0].name,
+            "Music For Programming",
+            "and it is remembered"
+        );
+    }
+
+    /// A name from `feeds.txt` is the user's, and a feed must not rename itself over it.
+    #[test]
+    fn a_chosen_name_is_not_overwritten() {
+        let lib = Library::new("feed-keep");
+        let mut app = feeds_app(&lib, "keep");
+        app.feeds[0].name = "My Mixes".into();
+
+        app.adopt_channel_title("Something Else");
+        assert_eq!(app.feeds[0].name, "My Mixes");
     }
 
     /// A click outside every pane must not select or play anything.

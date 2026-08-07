@@ -17,6 +17,18 @@ const TEXT: Color = Color::Rgb(205, 214, 244);
 /// emoji are double-width and would shift the column.
 const COUNT_MARK: &str = "♪";
 
+/// A lit row in the focused pane, a muted one elsewhere. Without the distinction
+/// both panes look active and it is not clear which one the arrow keys move.
+fn row_highlight(focused: bool) -> Style {
+    if focused {
+        Style::new()
+            .bg(Color::Rgb(69, 71, 90))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().bg(Color::Rgb(40, 41, 56))
+    }
+}
+
 fn pane_block(title: &str, focused: bool) -> Block<'_> {
     let border = if focused { ACCENT } else { DIM };
     let title_style = if focused {
@@ -93,15 +105,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// The feed list, with the Add button as its last row so it scrolls with them and
 /// needs no extra chrome.
 fn draw_feeds(frame: &mut Frame, app: &mut App, area: Rect) {
+    // The left pane, whichever tab it belongs to, is `Pane::Folders`.
+    let focused = app.focus == Pane::Folders;
     let selected = app.feed_state.selected();
     let mut rows: Vec<Row> = app
         .feeds
         .iter()
         .enumerate()
         .map(|(index, feed)| {
-            // The remove control only appears on the highlighted row: one target at a
-            // time, and no column of x's inviting a misclick.
-            let trailing = if Some(index) == selected {
+            // The remove control only appears on the highlighted row of the focused
+            // pane: one target at a time, and no column of x's inviting a misclick.
+            let trailing = if Some(index) == selected && focused {
                 Span::styled(
                     "✕",
                     Style::new().fg(ACCENT_ALT).add_modifier(Modifier::BOLD),
@@ -125,15 +139,11 @@ fn draw_feeds(frame: &mut Frame, app: &mut App, area: Rect) {
             Row::new(vec![Cell::from("FEED"), Cell::from("")])
                 .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
         )
-        .block(pane_block("", true).title_bottom(Span::styled(
+        .block(pane_block("", focused).title_bottom(Span::styled(
             format!(" a add · d remove · {} feeds ", app.feeds.len()),
             Style::new().fg(DIM),
         )))
-        .row_highlight_style(
-            Style::new()
-                .bg(Color::Rgb(49, 50, 68))
-                .add_modifier(Modifier::BOLD),
-        );
+        .row_highlight_style(row_highlight(focused));
 
     let rows = rows_area(area);
     app.feed_rows = Rect {
@@ -326,12 +336,14 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
         )
         .block(block)
-        .row_highlight_style(
+        .row_highlight_style(if focused {
             Style::new()
                 .bg(ACCENT)
                 .fg(Color::Rgb(30, 30, 46))
-                .add_modifier(Modifier::BOLD),
-        )
+                .add_modifier(Modifier::BOLD)
+        } else {
+            row_highlight(false)
+        })
         .highlight_symbol("");
 
     app.folder_rows = rows_area(area);
@@ -403,11 +415,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
     )
     .block(pane_block(&title, focused))
-    .row_highlight_style(
-        Style::new()
-            .bg(Color::Rgb(49, 50, 68))
-            .add_modifier(Modifier::BOLD),
-    );
+    .row_highlight_style(row_highlight(focused));
 
     app.track_rows = rows_area(area);
     frame.render_stateful_widget(table, area, &mut app.track_state);
