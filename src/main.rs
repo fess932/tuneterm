@@ -5,6 +5,7 @@ mod library;
 mod media;
 mod player;
 mod ui;
+mod worker;
 
 use std::io::{self, Write, stdout};
 use std::path::{Path, PathBuf};
@@ -94,11 +95,17 @@ OPTIONS
     -h, --help        Print this help.
     -V, --version     Print the version.
 
+BROWSING
+    The left pane is a folder browser. Moving the cursor lists everything in the
+    highlighted folder *and its subfolders* on the right, so an artist shows their
+    whole discography. Enter descends, Backspace goes back up.
+
 KEYS
     Tab, h/l, arrows  Switch pane            Space         Play / pause
     j/k, PgUp/PgDn    Move selection         n / p         Next / previous
-    Enter             Play the track         [ / ]         Seek -/+ 5s
-    q, Esc, Ctrl-C    Quit                   + / -         Volume
+    Enter             Open folder / play     [ / ]         Seek -/+ 5s
+    Backspace         Go up a folder         + / -         Volume
+    q, Esc, Ctrl-C    Quit
 
     The mouse works too: click a row to select, double-click to play, click the
     transport buttons, and click or drag the progress bar to seek.
@@ -213,18 +220,20 @@ fn scan_report(root: &Path) -> io::Result<()> {
     let stdout = io::stdout();
     let out = &mut stdout.lock();
 
-    let folders = library::scan_folders(root, 5);
+    let folders = library::list_subdirs(root);
     writeln!(out, "root: {}", root.display())?;
-    writeln!(out, "folders: {}", folders.len())?;
+    writeln!(out, "subfolders: {}", folders.len())?;
     for folder in folders.iter().take(10) {
         writeln!(out, "  {} ({} files)", folder.label, folder.count)?;
     }
 
-    let Some(first) = folders.first() else {
-        return Ok(());
+    // Everything below the first subfolder, or the root itself when it has none.
+    let (label, dir) = match folders.first() {
+        Some(folder) => (folder.label.clone(), folder.path.clone()),
+        None => (root.display().to_string(), root.to_path_buf()),
     };
-    let tracks = library::scan_tracks(&first.path);
-    writeln!(out, "\ntracks in \"{}\": {}", first.label, tracks.len())?;
+    let tracks = library::scan_tracks_deep(&dir);
+    writeln!(out, "\ntracks under \"{label}\": {}", tracks.len())?;
     for track in tracks.iter().take(5) {
         writeln!(
             out,
@@ -359,6 +368,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             }
         }
         app.poll_cover();
+        app.poll_tracks();
         app.refresh_cover_for_resize();
         app.poll_media();
         app.tick();
@@ -383,10 +393,11 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageDown => app.move_selection(10),
         KeyCode::PageUp => app.move_selection(-10),
         KeyCode::Enter => match app.focus {
-            // Folder contents already load on selection; Enter jumps to them.
-            Pane::Folders => app.focus = Pane::Tracks,
+            // The track list already follows the cursor, so Enter is for descending.
+            Pane::Folders => app.enter_folder(),
             Pane::Tracks => app.play_selected_track(),
         },
+        KeyCode::Backspace => app.leave_folder(),
         KeyCode::Char(' ') => app.toggle_play(),
         KeyCode::Char('n') => app.next_track(),
         KeyCode::Char('p') => app.prev_track(),

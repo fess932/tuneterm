@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use crate::cover::{self, CoverLoader};
 use crate::library::{self, Folder, Track};
 use crate::media::{self, Command, NowPlaying};
 use crate::player::AudioPlayer;
+use crate::worker::Worker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -20,14 +22,32 @@ pub enum Pane {
 
 pub struct App {
     pub root: PathBuf,
+    /// Directory the left pane is listing. Never climbs above `root`.
+    pub cwd: PathBuf,
+    /// Subdirectories of `cwd`. A cursor here drives the track list.
     pub folders: Vec<Folder>,
+    /// Selection to restore when stepping back up, per directory left behind.
+    trail: Vec<(PathBuf, usize)>,
     pub tracks: Vec<Track>,
     pub folder_state: TableState,
     pub track_state: TableState,
     pub focus: Pane,
 
-    /// Index into `tracks` of the track currently loaded into the player.
-    pub playing: Option<usize>,
+    /// Snapshot of the listing taken when playback started, plus where in it we are.
+    ///
+    /// Playback used to be an index into `tracks`, which broke the moment browsing
+    /// started rebuilding that list under the cursor: next and previous would walk
+    /// whatever folder you happened to be hovering.
+    queue: Vec<Track>,
+    queue_pos: Option<usize>,
+    /// Directory whose tracks are listed, and whether the worker is still on it.
+    tracks_dir: Option<PathBuf>,
+    pub tracks_loading: bool,
+    scan: Worker<PathBuf, Vec<Track>>,
+    scan_generation: u64,
+    /// Recently listed directories, so moving back over a folder is instant.
+    memo: HashMap<PathBuf, Vec<Track>>,
+    memo_order: VecDeque<PathBuf>,
     pub cover: Option<StatefulProtocol>,
     /// Pixel size of the cover as it will be drawn. Needed in full, not just as a
     /// ratio: a cover is never enlarged, so the drawn size — and therefore the
@@ -80,20 +100,29 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl App {
     pub fn new(root: PathBuf, picker: Picker, media: media::Bridge) -> Result<Self> {
-        let folders = library::scan_folders(&root, 5);
+        let folders = library::list_subdirs(&root);
         let mut folder_state = TableState::default();
         if !folders.is_empty() {
             folder_state.select(Some(0));
         }
 
         let mut app = Self {
+            cwd: root.clone(),
+            trail: Vec::new(),
             root,
             folders,
             tracks: Vec::new(),
             folder_state,
             track_state: TableState::default(),
             focus: Pane::Folders,
-            playing: None,
+            queue: Vec::new(),
+            queue_pos: None,
+            tracks_dir: None,
+            tracks_loading: false,
+            scan: Worker::spawn("scan", |dir: PathBuf| library::scan_tracks_deep(&dir)),
+            scan_generation: 0,
+            memo: HashMap::new(),
+            memo_order: VecDeque::new(),
             cover: None,
             picker,
             audio: AudioPlayer::new()?,
@@ -117,12 +146,12 @@ impl App {
             status: String::new(),
             should_quit: false,
         };
-        app.status = if app.folders.is_empty() {
+        app.status = if app.folders.is_empty() && library::scan_tracks(&app.root).is_empty() {
             format!("no audio found under {}", app.root.display())
         } else {
             format!("{} folders", app.folders.len())
         };
-        app.open_selected_folder();
+        app.reload_tracks();
         Ok(app)
     }
 
@@ -131,20 +160,157 @@ impl App {
     }
 
     pub fn now_playing(&self) -> Option<&Track> {
-        self.tracks.get(self.playing?)
+        self.queue.get(self.queue_pos?)
     }
 
-    pub fn open_selected_folder(&mut self) {
-        let Some(folder) = self.selected_folder() else {
+    /// Index in the *visible* list of the playing track, for the ▶ marker. Absent
+    /// when you have browsed away from it.
+    pub fn playing_row(&self) -> Option<usize> {
+        let playing = &self.now_playing()?.path;
+        self.tracks.iter().position(|t| &t.path == playing)
+    }
+
+    pub fn is_playing_something(&self) -> bool {
+        self.queue_pos.is_some()
+    }
+
+    /// Ask for the tracks of whatever the cursor points at. Served from the memo
+    /// when possible, otherwise handed to the worker: a deep scan reads tags, which
+    /// is milliseconds per file and cannot sit on a cursor move.
+    fn reload_tracks(&mut self) {
+        let dir = self.listing_dir();
+        if self.tracks_dir.as_ref() == Some(&dir) {
+            return;
+        }
+        self.tracks_dir = Some(dir.clone());
+
+        if let Some(cached) = self.memo.get(&dir) {
+            let tracks = cached.clone();
+            self.show_tracks(tracks);
+            return;
+        }
+        self.tracks_loading = true;
+        self.scan_generation += 1;
+        self.scan.request(self.scan_generation, dir);
+    }
+
+    /// Block until the pending scan lands. Tests only: the real loop polls.
+    #[cfg(test)]
+    pub(crate) fn wait_for_tracks(&mut self) {
+        for _ in 0..400 {
+            self.poll_tracks();
+            if !self.tracks_loading {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the scan never finished");
+    }
+
+    /// Pick up a finished scan. Cheap, so it can run every loop iteration.
+    pub fn poll_tracks(&mut self) {
+        let mut newest = None;
+        for (generation, tracks) in self.scan.drain() {
+            if generation == self.scan_generation {
+                newest = Some(tracks);
+            }
+        }
+        let Some(tracks) = newest else {
             return;
         };
-        self.tracks = library::scan_tracks(&folder.path.clone());
+        self.tracks_loading = false;
+        if let Some(dir) = self.tracks_dir.clone() {
+            self.remember(dir, tracks.clone());
+        }
+        self.show_tracks(tracks);
+    }
+
+    fn show_tracks(&mut self, tracks: Vec<Track>) {
+        self.tracks = tracks;
         self.track_state = TableState::default();
         if !self.tracks.is_empty() {
             self.track_state.select(Some(0));
         }
-        // Track indices refer to the old folder; they are meaningless now.
-        self.playing = None;
+    }
+
+    /// Bounded so browsing a large tree cannot grow without limit.
+    fn remember(&mut self, dir: PathBuf, tracks: Vec<Track>) {
+        const KEEP: usize = 64;
+        if self.memo.insert(dir.clone(), tracks).is_none() {
+            self.memo_order.push_back(dir);
+        }
+        while self.memo_order.len() > KEEP {
+            if let Some(old) = self.memo_order.pop_front() {
+                self.memo.remove(&old);
+            }
+        }
+    }
+
+    /// The directory whose tracks the right pane shows: the highlighted subfolder,
+    /// or the current one when it has no subfolders of its own.
+    pub fn listing_dir(&self) -> PathBuf {
+        self.selected_folder()
+            .map(|f| f.path.clone())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// Descend into the highlighted folder.
+    pub fn enter_folder(&mut self) {
+        let Some(folder) = self.selected_folder() else {
+            return;
+        };
+        let target = folder.path.clone();
+        let subdirs = library::list_subdirs(&target);
+        // A leaf album has nothing to descend into; the right pane already shows it.
+        if subdirs.is_empty() {
+            self.focus = Pane::Tracks;
+            return;
+        }
+        self.trail
+            .push((self.cwd.clone(), self.folder_state.selected().unwrap_or(0)));
+        self.cwd = target;
+        self.folders = subdirs;
+        self.folder_state = TableState::default();
+        self.folder_state.select(Some(0));
+        self.reload_tracks();
+    }
+
+    /// Step back up, restoring the row we came from. Stops at the root.
+    pub fn leave_folder(&mut self) {
+        let Some((parent, selected)) = self.trail.pop() else {
+            return;
+        };
+        self.cwd = parent;
+        self.folders = library::list_subdirs(&self.cwd);
+        self.folder_state = TableState::default();
+        if !self.folders.is_empty() {
+            self.folder_state
+                .select(Some(selected.min(self.folders.len() - 1)));
+        }
+        self.reload_tracks();
+    }
+
+    pub fn can_leave(&self) -> bool {
+        !self.trail.is_empty()
+    }
+
+    /// Breadcrumb for the pane title: the root's name plus the way down.
+    pub fn here(&self) -> String {
+        let root_name = self
+            .root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string());
+        match self.cwd.strip_prefix(&self.root) {
+            Ok(rest) if rest.as_os_str().is_empty() => root_name,
+            Ok(rest) => {
+                let path = rest
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, " / ");
+                format!("{root_name} / {path}")
+            }
+            Err(_) => self.cwd.display().to_string(),
+        }
     }
 
     pub fn play_selected_track(&mut self) {
@@ -154,14 +320,24 @@ impl App {
         self.play_index(idx);
     }
 
+    /// Start `idx` of the visible list, and adopt that list as the queue so
+    /// browsing elsewhere afterwards cannot derail next and previous.
     pub fn play_index(&mut self, idx: usize) {
-        let Some(track) = self.tracks.get(idx) else {
+        if self.tracks.get(idx).is_none() {
+            return;
+        }
+        self.queue = self.tracks.clone();
+        self.play_queue_index(idx);
+    }
+
+    fn play_queue_index(&mut self, idx: usize) {
+        let Some(track) = self.queue.get(idx) else {
             return;
         };
         let path = track.path.clone();
         match self.audio.play_file(&path) {
             Ok(()) => {
-                self.playing = Some(idx);
+                self.queue_pos = Some(idx);
                 self.status = format!("playing {}", path.display());
                 self.request_cover(&path);
             }
@@ -278,7 +454,7 @@ impl App {
     }
 
     pub fn toggle_play(&mut self) {
-        if self.playing.is_none() {
+        if self.queue_pos.is_none() {
             self.play_selected_track();
         } else {
             self.audio.toggle();
@@ -286,19 +462,23 @@ impl App {
     }
 
     pub fn next_track(&mut self) {
-        let next = self.playing.map(|i| i + 1).unwrap_or(0);
-        if next < self.tracks.len() {
-            self.play_index(next);
-        } else {
-            self.audio.stop();
-            self.playing = None;
-            self.status = "end of folder".into();
+        match self.queue_pos {
+            Some(current) if current + 1 < self.queue.len() => {
+                self.play_queue_index(current + 1);
+            }
+            Some(_) => {
+                self.audio.stop();
+                self.queue_pos = None;
+                self.status = "end of queue".into();
+            }
+            // Nothing queued yet: start from whatever is on screen.
+            None => self.play_selected_track(),
         }
     }
 
     pub fn prev_track(&mut self) {
-        if let Some(i) = self.playing.filter(|i| *i > 0) {
-            self.play_index(i - 1);
+        if let Some(i) = self.queue_pos.filter(|i| *i > 0) {
+            self.play_queue_index(i - 1);
         }
     }
 
@@ -308,7 +488,7 @@ impl App {
         for command in commands {
             match command {
                 Command::Toggle => self.toggle_play(),
-                Command::Play if self.playing.is_none() => self.play_selected_track(),
+                Command::Play if self.queue_pos.is_none() => self.play_selected_track(),
                 Command::Play => {
                     if self.audio.is_paused() {
                         self.audio.toggle();
@@ -321,7 +501,7 @@ impl App {
                 }
                 Command::Stop => {
                     self.audio.stop();
-                    self.playing = None;
+                    self.queue_pos = None;
                 }
                 Command::Next => self.next_track(),
                 Command::Previous => self.prev_track(),
@@ -361,7 +541,7 @@ impl App {
 
     /// Advance automatically when the current source has drained.
     pub fn tick(&mut self) {
-        if self.playing.is_some() && self.audio.is_finished() && !self.audio.is_paused() {
+        if self.queue_pos.is_some() && self.audio.is_finished() && !self.audio.is_paused() {
             self.next_track();
         }
     }
@@ -379,7 +559,7 @@ impl App {
         state.select(Some(next));
 
         if self.focus == Pane::Folders {
-            self.open_selected_folder();
+            self.reload_tracks();
         }
     }
 
@@ -536,7 +716,7 @@ impl App {
             return;
         }
         self.folder_state.select(Some(index));
-        self.open_selected_folder();
+        self.reload_tracks();
     }
 }
 
@@ -568,10 +748,10 @@ mod tests {
     }
 
     /// Two albums of short silent tracks.
-    struct Library(PathBuf);
+    pub(super) struct Library(pub(super) PathBuf);
 
     impl Library {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             let root = std::env::temp_dir().join(format!("tuneterm-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             let wav = silent_wav(2);
@@ -582,16 +762,27 @@ mod tests {
                     std::fs::write(dir.join(format!("{i:02} song.wav")), &wav).unwrap();
                 }
             }
+            // An artist folder holding two albums, for descending into.
+            for (album, tracks) in [("Early", 2), ("Late", 4)] {
+                let dir = root.join("Artist").join(album);
+                std::fs::create_dir_all(&dir).unwrap();
+                for i in 1..=tracks {
+                    std::fs::write(dir.join(format!("{i:02} song.wav")), &wav).unwrap();
+                }
+            }
             Self(root)
         }
 
+        /// Ready to assert on: the first listing has already landed.
         fn app(&self) -> App {
-            App::new(
+            let mut app = App::new(
                 self.0.clone(),
                 Picker::halfblocks(),
                 media::Bridge::detached(),
             )
-            .expect("app init")
+            .expect("app init");
+            app.wait_for_tracks();
+            app
         }
     }
 
@@ -606,12 +797,125 @@ mod tests {
         Rect::new(x, y, 10, height)
     }
 
+    /// The left pane lists one level, and empty branches never appear.
     #[test]
-    fn scans_the_fixture() {
+    fn lists_one_level_with_recursive_counts() {
         let lib = Library::new("scan");
         let app = lib.app();
-        assert_eq!(app.folders.len(), 2, "two albums");
-        assert_eq!(app.tracks.len(), 3, "first album opened");
+        let seen: Vec<(&str, usize)> = app
+            .folders
+            .iter()
+            .map(|f| (f.label.as_str(), f.count))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("Alpha", 3), ("Artist", 6), ("Beta", 2)],
+            "counts must include subfolders"
+        );
+        assert_eq!(app.tracks.len(), 3, "the highlighted folder is listed");
+    }
+
+    /// The point of the change: highlighting a folder lists everything beneath it,
+    /// not just its own files.
+    #[test]
+    fn the_listing_is_recursive() {
+        let lib = Library::new("recursive");
+        let mut app = lib.app();
+        app.folder_state.select(Some(1)); // Artist/, which holds no files itself
+        app.reload_tracks();
+        app.wait_for_tracks();
+        assert_eq!(app.tracks.len(), 6, "both albums of the artist");
+    }
+
+    #[test]
+    fn enter_descends_and_backspace_returns_to_the_same_row() {
+        let lib = Library::new("descend");
+        let mut app = lib.app();
+        app.folder_state.select(Some(1)); // Artist/
+        app.reload_tracks();
+        app.wait_for_tracks();
+
+        app.enter_folder();
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0.join("Artist"));
+        let inside: Vec<&str> = app.folders.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(inside, vec!["Early", "Late"]);
+        assert_eq!(app.tracks.len(), 2, "Early is highlighted");
+        assert!(app.can_leave());
+
+        app.leave_folder();
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0);
+        assert_eq!(app.folder_state.selected(), Some(1), "row restored");
+        assert!(!app.can_leave(), "the root is the floor");
+    }
+
+    /// A leaf album has nothing below it, so Enter moves to the tracks instead of
+    /// leaving the pane empty.
+    #[test]
+    fn entering_a_leaf_moves_focus_instead() {
+        let lib = Library::new("leaf");
+        let mut app = lib.app();
+        app.folder_state.select(Some(0)); // Alpha/, files only
+        app.reload_tracks();
+        app.wait_for_tracks();
+
+        app.enter_folder();
+        assert_eq!(app.cwd, lib.0, "did not descend");
+        assert_eq!(app.focus, Pane::Tracks);
+    }
+
+    #[test]
+    fn leaving_the_root_does_nothing() {
+        let lib = Library::new("floor");
+        let mut app = lib.app();
+        app.leave_folder();
+        assert_eq!(app.cwd, lib.0);
+    }
+
+    /// Browsing must not derail playback: the queue is a snapshot, so next and
+    /// previous keep walking the album you started, not the folder under the cursor.
+    #[test]
+    fn browsing_does_not_hijack_the_queue() {
+        let lib = Library::new("queue");
+        let mut app = lib.app();
+        app.play_index(0);
+        let started = app.now_playing().map(|t| t.path.clone());
+        assert!(started.is_some(), "playback failed: {}", app.status);
+
+        // Wander off to a different folder entirely.
+        app.folder_state.select(Some(1));
+        app.reload_tracks();
+        app.wait_for_tracks();
+        assert_eq!(app.tracks.len(), 6, "now listing the artist");
+        assert_eq!(
+            app.now_playing().map(|t| t.path.clone()),
+            started,
+            "still the same track"
+        );
+        assert_eq!(app.playing_row(), None, "not visible in this listing");
+
+        app.next_track();
+        let next = app.now_playing().expect("next failed").path.clone();
+        assert!(
+            next.starts_with(lib.0.join("Alpha")),
+            "next left the queue: {next:?}"
+        );
+    }
+
+    /// A second visit to a folder must come from the memo, not another scan.
+    #[test]
+    fn revisiting_a_folder_is_served_from_memory() {
+        let lib = Library::new("memo");
+        let mut app = lib.app();
+        app.folder_state.select(Some(1));
+        app.reload_tracks();
+        app.wait_for_tracks();
+
+        app.folder_state.select(Some(0));
+        app.reload_tracks();
+        assert!(!app.tracks_loading, "Alpha should have been remembered");
+        assert_eq!(app.tracks.len(), 3);
     }
 
     #[test]
@@ -624,7 +928,10 @@ mod tests {
 
         assert_eq!(app.focus, Pane::Tracks, "focus follows the click");
         assert_eq!(app.track_state.selected(), Some(2), "third row");
-        assert!(app.playing.is_none(), "one click must not start audio");
+        assert!(
+            !app.is_playing_something(),
+            "one click must not start audio"
+        );
     }
 
     #[test]
@@ -634,10 +941,12 @@ mod tests {
         app.folder_rows = rows(0, 1, 10);
 
         app.click(Position { x: 2, y: 2 }, Instant::now());
+        app.wait_for_tracks();
 
         assert_eq!(app.focus, Pane::Folders);
-        assert_eq!(app.folder_state.selected(), Some(1), "second album");
-        assert_eq!(app.tracks.len(), 2, "its tracks got loaded");
+        assert_eq!(app.folder_state.selected(), Some(1), "second row");
+        // Row 1 is Artist/, whose six tracks live in two subfolders.
+        assert_eq!(app.tracks.len(), 6, "listed recursively");
     }
 
     /// Clicking past the last row should move focus but not change the selection.
@@ -664,6 +973,7 @@ mod tests {
 
         // Cursor over the tracks pane while folders has focus.
         app.scroll(Position { x: 32, y: 2 }, 1);
+        app.wait_for_tracks();
 
         assert_eq!(app.track_state.selected(), Some(1), "tracks scrolled");
         assert_eq!(
@@ -713,7 +1023,11 @@ mod tests {
         let lib = Library::new("seek-live");
         let mut app = lib.app();
         app.play_index(0);
-        assert!(app.playing.is_some(), "playback failed: {}", app.status);
+        assert!(
+            app.is_playing_something(),
+            "playback failed: {}",
+            app.status
+        );
 
         app.seek_bar = Rect::new(0, 30, 11, 1);
         // Middle of the bar on a 2 s track.
@@ -734,7 +1048,11 @@ mod tests {
         let lib = Library::new("seek-by");
         let mut app = lib.app();
         app.play_index(0);
-        assert!(app.playing.is_some(), "playback failed: {}", app.status);
+        assert!(
+            app.is_playing_something(),
+            "playback failed: {}",
+            app.status
+        );
 
         // Backwards first: rodio accepts a seek only while a source is queued, and
         // jumping to the very end drains it (`Player::try_seek` returns Ok without
@@ -766,7 +1084,7 @@ mod tests {
         app.seek_bar = Rect::new(0, 30, 11, 1);
         app.click(Position { x: 5, y: 30 }, Instant::now());
         app.seek_by(10);
-        assert!(app.playing.is_none());
+        assert!(!app.is_playing_something());
     }
 
     /// The transport buttons must be distinguishable by position alone.
@@ -781,13 +1099,13 @@ mod tests {
 
         // Next with nothing playing starts at the top of the folder.
         app.click(Position { x: 20, y: 21 }, Instant::now());
-        assert_eq!(app.playing, Some(0), "next started playback");
+        assert_eq!(app.playing_row(), Some(0), "next started playback");
 
         app.click(Position { x: 20, y: 21 }, Instant::now());
-        assert_eq!(app.playing, Some(1), "next advanced");
+        assert_eq!(app.playing_row(), Some(1), "next advanced");
 
         app.click(Position { x: 3, y: 21 }, Instant::now());
-        assert_eq!(app.playing, Some(0), "prev went back");
+        assert_eq!(app.playing_row(), Some(0), "prev went back");
 
         // Clicking a transport button must never touch the selection.
         assert_eq!(app.focus, Pane::Folders, "focus unchanged by transport");
@@ -803,7 +1121,11 @@ mod tests {
 
         app.play_index(0);
 
-        assert!(app.playing.is_some(), "playback started: {}", app.status);
+        assert!(
+            app.is_playing_something(),
+            "playback started: {}",
+            app.status
+        );
         assert!(app.cover_pending, "cover handed to the worker, not awaited");
         assert!(app.cover.is_none(), "nothing drawn yet");
     }
@@ -819,7 +1141,7 @@ mod tests {
         for _ in 0..12 {
             app.next_track();
         }
-        let landed_on = app.playing;
+        let landed_on = app.playing_row();
 
         // Let the worker settle, then take whatever it produced.
         for _ in 0..200 {
@@ -830,7 +1152,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        assert_eq!(app.playing, landed_on, "playback did not move on its own");
+        assert_eq!(
+            app.playing_row(),
+            landed_on,
+            "playback did not move on its own"
+        );
         assert!(!app.cover_pending, "worker never answered");
         // The fixture has no artwork, so `None` is the correct answer — the point is
         // that we got exactly one settled answer rather than a backlog.
@@ -883,7 +1209,7 @@ mod tests {
         app.click(Position { x: 200, y: 200 }, Instant::now());
 
         assert_eq!(app.focus, Pane::Folders, "unchanged");
-        assert!(app.playing.is_none());
+        assert!(!app.is_playing_something());
     }
 }
 

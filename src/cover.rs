@@ -1,14 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, TryIter};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 
 use image::DynamicImage;
 use image::imageops::FilterType;
 
 use crate::cache;
 use crate::library;
+use crate::worker::Worker;
 
 pub struct Request {
     pub generation: u64,
@@ -26,83 +23,38 @@ pub struct Loaded {
     pub file: Option<PathBuf>,
 }
 
-/// Loads and pre-shrinks cover art on a worker thread.
+/// Loads and scales cover art off the render thread.
 ///
-/// Decoding a 1400 px JPEG costs ~190 ms and shrinking it ~400 ms in a debug
-/// build, which would stall the UI on every track change.
-///
-/// Requests are **replaced** rather than queued: the slot holds at most one, so
-/// holding `n` down cannot pile up work. A job is dropped, before and after the
-/// expensive part, if a newer generation has been requested meanwhile — that is
-/// the cancellation. Only one thread ever exists, no matter how fast tracks change.
+/// Decoding a 1400 px JPEG costs ~190 ms and scaling it ~400 ms in a debug build,
+/// which would stall the UI on every track change. Cancellation and the guarantee
+/// of a single thread come from [`Worker`].
 pub struct CoverLoader {
-    slot: Arc<(Mutex<Option<Request>>, Condvar)>,
-    latest: Arc<AtomicU64>,
-    results: Receiver<Loaded>,
+    worker: Worker<Request, (Option<DynamicImage>, Option<PathBuf>)>,
 }
 
 impl CoverLoader {
     pub fn new() -> Self {
-        let slot = Arc::new((Mutex::new(None), Condvar::new()));
-        let latest = Arc::new(AtomicU64::new(0));
-        let (tx, results) = mpsc::channel();
-
-        let worker_slot = Arc::clone(&slot);
-        let worker_latest = Arc::clone(&latest);
-        thread::spawn(move || {
-            let (lock, cvar) = &*worker_slot;
-            loop {
-                let request: Request = {
-                    let mut guard = lock.lock().expect("cover slot poisoned");
-                    loop {
-                        if let Some(request) = guard.take() {
-                            break request;
-                        }
-                        guard = cvar.wait(guard).expect("cover slot poisoned");
-                    }
-                };
-
-                // Superseded while it sat in the slot.
-                if request.generation < worker_latest.load(Ordering::Acquire) {
-                    continue;
-                }
-
-                let (image, file) = prepare(&request.path, request.box_px);
-
-                // Superseded while we were decoding; do not bother the UI with it.
-                if request.generation < worker_latest.load(Ordering::Acquire) {
-                    continue;
-                }
-                let reply = Loaded {
-                    generation: request.generation,
-                    image,
-                    file,
-                };
-                if tx.send(reply).is_err() {
-                    return; // the app is gone
-                }
-            }
-        });
-
         Self {
-            slot,
-            latest,
-            results,
+            worker: Worker::spawn("covers", |request: Request| {
+                prepare(&request.path, request.box_px)
+            }),
         }
     }
 
-    /// Queue `request`, discarding any request that has not started yet.
+    /// Queue `request`, discarding one that has not started yet.
     pub fn request(&self, request: Request) {
-        // Publish the generation first, so a worker mid-job sees it and bails.
-        self.latest.store(request.generation, Ordering::Release);
-        let (lock, cvar) = &*self.slot;
-        *lock.lock().expect("cover slot poisoned") = Some(request);
-        cvar.notify_one();
+        self.worker.request(request.generation, request);
     }
 
     /// Non-blocking: whatever the worker has finished since the last call.
-    pub fn drain(&self) -> TryIter<'_, Loaded> {
-        self.results.try_iter()
+    pub fn drain(&self) -> impl Iterator<Item = Loaded> + '_ {
+        self.worker
+            .drain()
+            .map(|(generation, (image, file))| Loaded {
+                generation,
+                image,
+                file,
+            })
     }
 }
 
@@ -212,7 +164,7 @@ mod tests {
             {
                 return Some(reply);
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         None
     }

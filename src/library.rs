@@ -32,6 +32,7 @@ pub struct Folder {
     pub count: usize,
 }
 
+#[derive(Clone)]
 pub struct Track {
     pub path: PathBuf,
     pub title: String,
@@ -40,75 +41,112 @@ pub struct Track {
     pub duration: Option<Duration>,
 }
 
-/// Walk `root` and collect every directory that directly holds audio files.
-pub fn scan_folders(root: &Path, max_depth: usize) -> Vec<Folder> {
-    let mut out = Vec::new();
-    walk(root, root, 0, max_depth, &mut out);
-    // Sort on the path, not the label: labels are abbreviated and would scatter
-    // sibling folders.
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+/// Immediate subdirectories of `dir` that hold audio anywhere beneath them, with a
+/// recursive track count.
+///
+/// Only one level: the left pane is a directory browser now, not a flat index. Empty
+/// branches are left out — a folder you cannot play anything from is only noise.
+///
+/// Deliberately does **not** read tags. This runs on every cursor move, and counting
+/// files is a `read_dir` walk while reading tags is milliseconds per file.
+pub fn list_subdirs(dir: &Path) -> Vec<Folder> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut subdirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && !is_hidden(p))
+        .collect();
+    subdirs.sort();
+
+    subdirs
+        .into_iter()
+        .filter_map(|path| {
+            let count = count_audio(&path, MAX_DEPTH);
+            (count > 0).then(|| Folder {
+                label: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+                path,
+                count,
+            })
+        })
+        .collect()
 }
 
-fn walk(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<Folder>) {
-    if depth > max_depth {
+/// How deep to look for audio. Deep enough for artist/album/disc, shallow enough
+/// that a stray symlink into the filesystem cannot cost minutes.
+pub const MAX_DEPTH: usize = 6;
+
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with('.') || name == "$RECYCLE.BIN"
+        })
+        .unwrap_or(false)
+}
+
+/// Audio files at or below `dir`. No tags are read.
+fn count_audio(dir: &Path, depth: usize) -> usize {
+    if depth == 0 {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if is_hidden(&path) {
+                0
+            } else if path.is_dir() {
+                count_audio(&path, depth - 1)
+            } else {
+                usize::from(is_audio(&path))
+            }
+        })
+        .sum()
+}
+
+/// Every audio file at or below `dir`, tags resolved, ordered by path.
+///
+/// This is what the right pane shows, so selecting an artist lists their whole
+/// discography rather than an empty folder. Reading tags costs milliseconds per
+/// file, which is why it runs on a worker rather than during a cursor move.
+pub fn scan_tracks_deep(dir: &Path) -> Vec<Track> {
+    let mut paths = Vec::new();
+    collect_audio(dir, MAX_DEPTH, &mut paths);
+    paths.sort();
+    paths.into_iter().map(read_track).collect()
+}
+
+fn collect_audio(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-
-    let mut audio_here = 0usize;
     let mut subdirs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = entry.file_name();
-        // skip dotfiles and Windows/macOS junk
-        if name.to_string_lossy().starts_with('.') || name == "$RECYCLE.BIN" {
+        if is_hidden(&path) {
             continue;
         }
         if path.is_dir() {
             subdirs.push(path);
         } else if is_audio(&path) {
-            audio_here += 1;
+            out.push(path);
         }
     }
-
-    if audio_here > 0 {
-        let label = dir
-            .strip_prefix(root)
-            .ok()
-            .filter(|rel| !rel.as_os_str().is_empty())
-            .map(|rel| {
-                // Deep trees would blow past the pane width, and the useful part is
-                // the tail (…/artist/album), so keep only the last two components.
-                let parts: Vec<String> = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect();
-                let tail = parts[parts.len().saturating_sub(2)..].join(" / ");
-                if parts.len() > 2 {
-                    format!("… / {tail}")
-                } else {
-                    tail
-                }
-            })
-            // The root itself has an empty relative path; use its own name.
-            .unwrap_or_else(|| {
-                dir.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| dir.to_string_lossy().into_owned())
-            });
-        out.push(Folder {
-            label,
-            path: dir.to_path_buf(),
-            count: audio_here,
-        });
-    }
-
     subdirs.sort();
     for sub in subdirs {
-        walk(root, &sub, depth + 1, max_depth, out);
+        collect_audio(&sub, depth - 1, out);
     }
 }
 

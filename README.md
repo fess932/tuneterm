@@ -112,7 +112,8 @@ not `Send`.
 | --- | --- |
 | `Tab`, `h`/`l`, `←`/`→` | switch pane |
 | `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn` | move selection |
-| `Enter` | folders: jump to tracks · tracks: play |
+| `Enter` | folders: descend · tracks: play |
+| `Backspace` | go back up a folder |
 | `Space` | play / pause |
 | `n` / `p` | next / previous track |
 | `[` / `]` | seek ∓5 s |
@@ -133,8 +134,22 @@ not `Send`.
 
 A single click never starts audio — that is what the second click is for.
 
-Selecting a folder loads its tracks immediately, and playback advances to the next
-track at the end of a file.
+### Browsing
+
+The left pane is a **folder browser**, one level at a time. Moving the cursor lists
+everything in the highlighted folder **and all of its subfolders** on the right, so
+highlighting an artist shows their whole discography rather than an empty directory.
+`Enter` descends, `Backspace` comes back up to the row you left. Folders with nothing
+playable beneath them are not shown at all.
+
+Playback takes a **snapshot** of the list when you start a track. Browsing elsewhere
+afterwards changes what you see, never what plays next — `n` and `p` keep walking the
+album you actually started.
+
+A deep listing reads tags, which is milliseconds per file, so it runs on a worker with
+the same replaceable-slot cancellation the cover loader uses: scrolling the folder list
+cannot pile up work. Recently visited folders are remembered, so moving back over one
+is instant.
 
 ## How it works
 
@@ -143,7 +158,8 @@ track at the end of a file.
 | `src/main.rs` | entry point, graphics-protocol detection, event loop, input |
 | `src/app.rs` | all mutable state; no rendering |
 | `src/ui.rs` | rendering only; writes back just the hit-test rects |
-| `src/cover.rs` | cover-art worker thread: decode + scale, cached, with cancellation |
+| `src/cover.rs` | cover-art worker: decode + scale, cached |
+| `src/worker.rs` | one thread with a replaceable request slot; used by both workers |
 | `src/cache.rs` | on-disk cover cache, content-keyed, 200 MB cap, oldest-first eviction |
 | `src/library.rs` | folder/track scanning, tags and cover extraction (`lofty`) |
 | `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
@@ -292,7 +308,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 56 tests
+cargo test                                    # 66 tests
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```

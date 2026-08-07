@@ -50,17 +50,24 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|f| {
             Row::new(vec![
-                Cell::from(f.label.clone()).style(Style::new().fg(TEXT)),
+                Cell::from(format!("{}/", f.label)).style(Style::new().fg(TEXT)),
                 Cell::from(f.count.to_string()).style(Style::new().fg(DIM)),
             ])
         })
         .collect();
 
-    let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(4)])
+    // Title doubles as a breadcrumb, so it is clear where Enter has taken you, and
+    // says when there is somewhere to go back to.
+    let here = if app.can_leave() {
+        format!("⌫ {}", app.here())
+    } else {
+        app.here()
+    };
+    let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(5)])
         .header(
             Row::new(vec!["FOLDER", "№"]).style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
         )
-        .block(pane_block("Library", focused))
+        .block(pane_block(&here, focused))
         .row_highlight_style(
             Style::new()
                 .bg(ACCENT)
@@ -86,7 +93,12 @@ fn rows_area(pane: Rect) -> Rect {
 
 fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Pane::Tracks;
-    let playing = app.playing;
+    let playing = app.playing_row();
+    let title = if app.tracks_loading {
+        "Tracks — scanning…".to_string()
+    } else {
+        format!("Tracks ({})", app.tracks.len())
+    };
 
     let rows: Vec<Row> = app
         .tracks
@@ -128,7 +140,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
         Row::new(vec!["", "#", "TITLE", "ARTIST", "TIME"])
             .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
     )
-    .block(pane_block("Tracks", focused))
+    .block(pane_block(&title, focused))
     .row_highlight_style(
         Style::new()
             .bg(Color::Rgb(49, 50, 68))
@@ -308,7 +320,7 @@ fn draw_progress(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Keep the label in its own rect so `seek_bar` is exactly the clickable bar;
     // LineGauge's own label would eat into it by an amount we cannot measure.
-    let label = match (app.playing.is_some(), total) {
+    let label = match (app.is_playing_something(), total) {
         (true, Some(total)) => format!("{} / {} ", fmt_duration(pos), fmt_duration(total)),
         (true, None) => format!("{} ", fmt_duration(pos)),
         _ => "--:-- / --:-- ".into(),
@@ -325,7 +337,7 @@ fn draw_progress(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 
     let ratio = match total {
-        Some(total) if total.as_secs_f64() > 0.0 && app.playing.is_some() => {
+        Some(total) if total.as_secs_f64() > 0.0 && app.is_playing_something() => {
             (pos.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0)
         }
         _ => 0.0,
@@ -350,7 +362,7 @@ fn draw_transport(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .areas(area);
 
-    let playing = app.playing.is_some() && !app.audio.is_paused();
+    let playing = app.is_playing_something() && !app.audio.is_paused();
     let (glyph, text, color) = if playing {
         ("⏸", "Pause", ACCENT_ALT)
     } else {
@@ -386,7 +398,8 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let keys = [
         ("Tab", "pane"),
         ("↑↓", "move"),
-        ("⏎", "play"),
+        ("⏎", "open"),
+        ("⌫", "up"),
         ("Space", "pause"),
         ("n/p", "track"),
         ("[/]", "seek"),
@@ -441,7 +454,16 @@ mod tests {
         terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
 
         let rendered = format!("{}", terminal.backend());
-        for expected in ["Library", "Tracks", "Now Playing", "Play", "TITLE", "quit"] {
+        // The left pane title is a breadcrumb now, so it carries the folder name.
+        for expected in [
+            &app.here(),
+            "Tracks",
+            "Now Playing",
+            "Play",
+            "TITLE",
+            "quit",
+            "open",
+        ] {
             assert!(rendered.contains(expected), "missing {expected:?}");
         }
     }
