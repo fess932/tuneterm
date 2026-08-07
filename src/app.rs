@@ -20,8 +20,29 @@ pub enum Pane {
     Tracks,
 }
 
+/// Where music comes from. Only [`Tab::Local`] does anything yet; see PLAN.md for
+/// what the others would take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Local,
+    Radio,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 2] = [Tab::Local, Tab::Radio];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Local => "Local",
+            Tab::Radio => "Radio",
+        }
+    }
+}
+
 pub struct App {
     pub root: PathBuf,
+    /// Which source is on screen.
+    pub tab: Tab,
     /// Directory the left pane is listing. Never climbs above `root`.
     pub cwd: PathBuf,
     /// Subdirectories of `cwd`. A cursor here drives the track list.
@@ -83,6 +104,9 @@ pub struct App {
     pub seek_bar: Rect,
     pub folder_rows: Rect,
     pub track_rows: Rect,
+    /// Clickable strip per tab, written during render. Same reason as the others:
+    /// the layout knows where things landed, the event handler does not.
+    pub tab_areas: [Rect; Tab::ALL.len()],
     /// Pane, row and time of the last left click, for double-click detection.
     last_click: Option<(Pane, usize, Instant)>,
 
@@ -140,6 +164,8 @@ impl App {
             seek_bar: Rect::ZERO,
             folder_rows: Rect::ZERO,
             track_rows: Rect::ZERO,
+            tab_areas: [Rect::ZERO; Tab::ALL.len()],
+            tab: Tab::Local,
             last_click: None,
             media,
             published: None,
@@ -598,6 +624,12 @@ impl App {
         }
     }
 
+    /// Switching sources must never interrupt playback: the queue is a snapshot, so
+    /// what is playing outlives whatever the panes are showing.
+    pub fn select_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+    }
+
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
             Pane::Folders => Pane::Tracks,
@@ -636,6 +668,12 @@ impl App {
     /// Left click: focus the pane and select the row. A second click on the same
     /// row plays it, so a single click never starts audio by accident.
     pub fn click(&mut self, pos: Position, now: Instant) {
+        for (tab, area) in Tab::ALL.iter().zip(self.tab_areas) {
+            if area.contains(pos) {
+                self.select_tab(*tab);
+                return;
+            }
+        }
         if self.play_area.contains(pos) {
             self.toggle_play();
             return;
@@ -1422,6 +1460,57 @@ mod tests {
         app.scroll(Position { x: 32, y: 2 }, -1);
         assert!(app.folders.is_empty() && app.tracks.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clicking a tab switches source and nothing else.
+    #[test]
+    fn clicking_a_tab_switches_source() {
+        let lib = Library::new("tabs");
+        let mut app = lib.app();
+        app.tab_areas = [Rect::new(1, 0, 7, 1), Rect::new(9, 0, 7, 1)];
+
+        assert_eq!(app.tab, Tab::Local, "local by default");
+        app.click(Position { x: 11, y: 0 }, Instant::now());
+        assert_eq!(app.tab, Tab::Radio);
+        app.click(Position { x: 3, y: 0 }, Instant::now());
+        assert_eq!(app.tab, Tab::Local);
+    }
+
+    /// Switching source must not interrupt playback: the queue outlives the panes.
+    #[test]
+    fn switching_tabs_keeps_playing() {
+        let lib = Library::new("tab-play");
+        let mut app = lib.app();
+        app.play_index(0);
+        let playing = app.now_playing().map(|t| t.path.clone());
+        assert!(playing.is_some(), "playback failed: {}", app.status);
+
+        app.select_tab(Tab::Radio);
+        assert_eq!(app.now_playing().map(|t| t.path.clone()), playing);
+        assert!(app.is_playing_something());
+
+        app.select_tab(Tab::Local);
+        assert_eq!(app.now_playing().map(|t| t.path.clone()), playing);
+    }
+
+    /// The panes are gone on another tab, so their recorded rects must be too —
+    /// otherwise a click in that space would still select a hidden row.
+    #[test]
+    fn a_hidden_pane_takes_no_clicks() {
+        let lib = Library::new("tab-hidden");
+        let mut app = lib.app();
+        app.folder_rows = rows(0, 1, 10);
+        app.track_rows = rows(30, 1, 10);
+        let before = app.folder_state.selected();
+
+        // What `draw` does when the local panes are not on screen.
+        app.folder_rows = Rect::ZERO;
+        app.track_rows = Rect::ZERO;
+        app.click(Position { x: 2, y: 3 }, Instant::now());
+        app.click(Position { x: 32, y: 3 }, Instant::now());
+
+        assert_eq!(app.folder_state.selected(), before, "selection untouched");
+        assert!(!app.is_playing_something());
     }
 
     /// A click outside every pane must not select or play anything.

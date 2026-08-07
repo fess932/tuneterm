@@ -114,6 +114,7 @@ not `Send`.
 | `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn` | move selection |
 | `Enter` | folders: descend · tracks: play |
 | `Backspace` | go back up a folder |
+| `1` / `2` | switch source tab |
 | `Space` | play / pause |
 | `n` / `p` | next / previous track |
 | `[` / `]` | seek ∓5 s |
@@ -124,6 +125,7 @@ not `Send`.
 
 | Action | Effect |
 | --- | --- |
+| click a tab | switch source |
 | click a row | focus that pane and select the row |
 | double-click a folder | descend into it |
 | double-click `..` | go back up |
@@ -135,6 +137,18 @@ not `Send`.
 | scroll wheel | moves **the pane under the cursor**, focused or not |
 
 A single click never starts audio — that is what the second click is for.
+
+### Sources
+
+Tabs sit in the top border of the browsing pane: **Local** works, **Radio** is a
+placeholder for now. Click one, or press `1` / `2`.
+
+Switching sources never interrupts playback — the queue is a snapshot, so what is
+playing outlives whatever the panes are showing, and `Now Playing` stays on screen on
+every tab. The hidden panes also forget where their rows were, so a click in that space
+cannot select a row that is no longer visible.
+
+[PLAN.md](PLAN.md) is what the other tabs would take.
 
 ### Browsing
 
@@ -315,7 +329,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 75 tests
+cargo test                                    # 78 tests
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
 ```

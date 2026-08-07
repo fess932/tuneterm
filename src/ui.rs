@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, LineGauge, Paragraph, Row, Table, Wrap};
 use ratatui_image::{FilterType, Resize, StatefulImage};
 
-use crate::app::{App, Pane};
+use crate::app::{App, Pane, Tab};
 use crate::library::fmt_duration;
 
 const ACCENT: Color = Color::Rgb(137, 180, 250);
@@ -41,10 +41,92 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(main);
 
-    draw_folders(frame, app, left);
-    draw_tracks(frame, app, middle);
+    // Always drawn: switching sources must not look like playback stopped.
     draw_now_playing(frame, app, right);
+
+    match app.tab {
+        Tab::Local => {
+            draw_folders(frame, app, left);
+            draw_tracks(frame, app, middle);
+        }
+        Tab::Radio => {
+            // Forget where the rows were, or clicks would still land on panes that
+            // are no longer on screen.
+            app.folder_rows = Rect::ZERO;
+            app.track_rows = Rect::ZERO;
+            let span = Rect {
+                width: left.width + middle.width,
+                ..left
+            };
+            draw_placeholder(frame, app, span);
+        }
+    }
     draw_help(frame, app, help);
+}
+
+/// Tabs live in the top border of the browsing pane, and their rects are recorded so
+/// a click can hit them. Drawn over the border rather than as a `Block` title,
+/// because a title's position is not something the caller gets told.
+fn draw_tabs(frame: &mut Frame, app: &mut App, pane: Rect) {
+    // One cell for the rounded corner; each label carries its own padding.
+    let mut x = pane.x.saturating_add(1);
+    let limit = pane.right().saturating_sub(1);
+
+    for (index, tab) in Tab::ALL.iter().enumerate() {
+        let active = app.tab == *tab;
+        let text = format!(" {} ", tab.label());
+        let width = text.chars().count() as u16;
+        if x + width > limit {
+            app.tab_areas[index] = Rect::ZERO;
+            continue;
+        }
+        let area = Rect::new(x, pane.y, width, 1);
+        let style = if active {
+            Style::new()
+                .fg(Color::Rgb(30, 30, 46))
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(DIM)
+        };
+        frame.render_widget(Paragraph::new(Span::styled(text, style)), area);
+        app.tab_areas[index] = area;
+        x += width;
+
+        if index + 1 < Tab::ALL.len() && x < limit {
+            frame.render_widget(
+                Paragraph::new(Span::styled("│", Style::new().fg(DIM))),
+                Rect::new(x, pane.y, 1, 1),
+            );
+            x += 1;
+        }
+    }
+}
+
+/// A source that exists as a tab but not yet as code.
+fn draw_placeholder(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(DIM));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(""); (inner.height / 2).saturating_sub(2) as usize];
+    lines.push(Line::from(Span::styled(
+        "Radio",
+        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "not built yet",
+        Style::new().fg(DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        "see PLAN.md",
+        Style::new().fg(DIM),
+    )));
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+    draw_tabs(frame, app, area);
 }
 
 fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -67,13 +149,17 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
         ])
     }));
 
-    // Title doubles as a breadcrumb, so it is clear where Enter has taken you, and
-    // says when there is somewhere to go back to.
+    // The top border carries the tabs, so the breadcrumb goes along the bottom —
+    // where a long path has the full width and cannot collide with them.
     let here = if app.can_leave() {
-        format!("⌫ {}", app.here())
+        format!(" ⌫ {} ", app.here())
     } else {
-        app.here()
+        format!(" {} ", app.here())
     };
+    let block = pane_block("", focused).title_bottom(Span::styled(
+        here,
+        Style::new().fg(if focused { ACCENT } else { DIM }),
+    ));
     let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(7)])
         .header(
             Row::new(vec![
@@ -82,7 +168,7 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
             ])
             .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
         )
-        .block(pane_block(&here, focused))
+        .block(block)
         .row_highlight_style(
             Style::new()
                 .bg(ACCENT)
@@ -93,6 +179,7 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
 
     app.folder_rows = rows_area(area);
     frame.render_stateful_widget(table, area, &mut app.folder_state);
+    draw_tabs(frame, app, area);
 }
 
 /// The data rows of a bordered table with a one-line header — what a click on a
@@ -419,6 +506,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ("n/p", "track"),
         ("[/]", "seek"),
         ("+/-", "vol"),
+        ("1/2", "source"),
         ("q", "quit"),
     ];
     let mut spans = Vec::new();
@@ -755,10 +843,18 @@ mod preview {
         .unwrap();
         app.wait_for_tracks();
 
-        for (label, descend) in [("at the root", false), ("inside a folder", true)] {
-            if descend {
-                app.enter_folder();
-                app.wait_for_tracks();
+        for (label, step) in [
+            ("at the root", 0),
+            ("inside a folder", 1),
+            ("the radio tab", 2),
+        ] {
+            match step {
+                1 => {
+                    app.enter_folder();
+                    app.wait_for_tracks();
+                }
+                2 => app.select_tab(crate::app::Tab::Radio),
+                _ => {}
             }
             let mut terminal = Terminal::new(TestBackend::new(78, 14)).unwrap();
             terminal.draw(|f| draw(f, &mut app)).unwrap();
