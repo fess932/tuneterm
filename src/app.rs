@@ -1198,6 +1198,65 @@ mod tests {
         assert!(app.cover_pending, "growing must refetch");
     }
 
+    /// The reported symptom: after spinning the wheel hard, reversing had to work
+    /// off a backlog before it moved. Clamping must leave nothing owed, so three
+    /// events back is exactly three rows back — no matter how far past the end the
+    /// burst went.
+    #[test]
+    fn a_scroll_burst_leaves_nothing_owed() {
+        let lib = Library::new("scroll-burst");
+        let mut app = lib.app();
+        app.folder_rows = rows(0, 1, 10);
+        let last = app.folders.len() - 1;
+
+        for _ in 0..200 {
+            app.scroll(Position { x: 2, y: 2 }, 1);
+        }
+        assert_eq!(app.folder_state.selected(), Some(last), "pinned to the end");
+
+        app.scroll(Position { x: 2, y: 2 }, -1);
+        assert_eq!(
+            app.folder_state.selected(),
+            Some(last - 1),
+            "one event back must be one row back"
+        );
+    }
+
+    #[test]
+    fn a_track_scroll_burst_leaves_nothing_owed() {
+        let lib = Library::new("scroll-tracks");
+        let mut app = lib.app();
+        app.track_rows = rows(30, 1, 10);
+        let last = app.tracks.len() - 1;
+
+        for _ in 0..200 {
+            app.scroll(Position { x: 32, y: 2 }, 1);
+        }
+        assert_eq!(app.track_state.selected(), Some(last));
+
+        for _ in 0..2 {
+            app.scroll(Position { x: 32, y: 2 }, -1);
+        }
+        assert_eq!(app.track_state.selected(), Some(last - 2));
+    }
+
+    /// Scrolling an empty list must not panic on `clamp(0, -1)`.
+    #[test]
+    fn scrolling_an_empty_list_is_harmless() {
+        let dir = std::env::temp_dir().join(format!("tuneterm-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(dir.clone(), Picker::halfblocks(), media::Bridge::detached())
+            .expect("app init");
+        app.folder_rows = rows(0, 1, 10);
+        app.track_rows = rows(30, 1, 10);
+
+        app.scroll(Position { x: 2, y: 2 }, 1);
+        app.scroll(Position { x: 32, y: 2 }, -1);
+        assert!(app.folders.is_empty() && app.tracks.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A click outside every pane must not select or play anything.
     #[test]
     fn click_outside_panes_is_ignored() {

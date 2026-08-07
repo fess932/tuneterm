@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
-use ratatui::crossterm::{execute, terminal};
+use ratatui::crossterm::terminal;
 use ratatui::layout::Position;
 use ratatui_image::FontSize;
 use ratatui_image::picker::{Picker, ProtocolType};
@@ -326,6 +326,22 @@ fn main() -> Result<()> {
     }
 }
 
+/// Ask for clicks and drags, but **not** bare pointer motion.
+///
+/// `crossterm::event::EnableMouseCapture` also turns on mode 1003, "report every
+/// mouse movement", which this app never uses — `on_mouse` ignores `Moved`. It is
+/// not free, though: moving the mouse while spinning the wheel floods the queue,
+/// and the scroll events land behind the motion. Mode 1002 still reports motion
+/// while a button is held, which is what scrubbing the seek bar needs.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+fn set_mouse(sequence: &str) -> io::Result<()> {
+    let mut out = stdout();
+    out.write_all(sequence.as_bytes())?;
+    out.flush()
+}
+
 /// Everything that touches the terminal, on one thread.
 fn tui_main(
     root: PathBuf,
@@ -339,11 +355,11 @@ fn tui_main(
     }
 
     let mut terminal = ratatui::init();
-    execute!(stdout(), EnableMouseCapture)?;
+    set_mouse(MOUSE_ON)?;
 
     let result = run(&mut terminal, &mut app);
 
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = set_mouse(MOUSE_OFF);
     ratatui::restore();
     result
 }
@@ -359,12 +375,25 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         } else {
             Duration::from_millis(120)
         };
-        let ready = event::poll(timeout)?;
-        if ready {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => on_key(app, key),
-                Event::Mouse(mouse) => on_mouse(app, mouse),
-                _ => {}
+        // Wait for the first event, then take everything already queued.
+        //
+        // Reading a single event per iteration capped input at the frame rate. A
+        // fast scroll wheel outruns that easily, so events piled up in the
+        // terminal's buffer and kept moving the cursor the old way for a while
+        // after you had already reversed direction — the reversal was simply
+        // queued behind the backlog. Draining collapses a flick into one frame.
+        if event::poll(timeout)? {
+            // Bounded so a stream of events cannot starve the redraw entirely.
+            const MAX_PER_FRAME: usize = 256;
+            for _ in 0..MAX_PER_FRAME {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => on_key(app, key),
+                    Event::Mouse(mouse) => on_mouse(app, mouse),
+                    _ => {}
+                }
+                if app.should_quit || !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
         app.poll_cover();
