@@ -5,6 +5,31 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink};
 
+/// A remote track, decoded far enough to play.
+pub type RemoteSource = Decoder<std::io::BufReader<crate::net::HttpFile>>;
+
+/// Open `url` and get it ready for [`AudioPlayer::play_remote`].
+///
+/// **Blocking, and not for the thread that draws.** Opening a stream is a length
+/// probe, a range request and a header read: a second or two on a slow link, and
+/// up to the 20s timeout in `net` against a host that never answers.
+///
+/// The length is handed to the decoder explicitly. `Decoder::try_from` reads it
+/// from a `File`'s metadata, which a network stream has none of, and without it
+/// symphonia refuses to seek backwards — the same trap a `BufReader` sets for
+/// local files. `BufReader` is still wanted here, to turn the decoder's many
+/// small reads into few requests.
+pub fn open_url(url: &str) -> Result<RemoteSource> {
+    let remote = crate::net::HttpFile::open(url).map_err(|e| anyhow::anyhow!(e))?;
+    let len = remote.len();
+    rodio::Decoder::builder()
+        .with_data(std::io::BufReader::with_capacity(256 * 1024, remote))
+        .with_byte_len(len)
+        .with_seekable(true)
+        .build()
+        .with_context(|| format!("decode {url}"))
+}
+
 /// Thin wrapper over rodio. Keeps the device sink alive for the process lifetime.
 pub struct AudioPlayer {
     // Dropping this stops all audio, so it must be held.
@@ -26,26 +51,13 @@ impl AudioPlayer {
         })
     }
 
-    /// Replace whatever is queued with a remote file and start playing.
+    /// Replace whatever is queued with a stream [`open_url`] has already opened.
     ///
-    /// The length is handed to the decoder explicitly. `Decoder::try_from` reads it
-    /// from a `File`'s metadata, which a network stream has none of, and without it
-    /// symphonia refuses to seek backwards — the same trap a `BufReader` sets for
-    /// local files. `BufReader` is still wanted here, to turn the decoder's many
-    /// small reads into few requests.
-    pub fn play_url(&self, url: &str) -> Result<()> {
-        let remote = crate::net::HttpFile::open(url).map_err(|e| anyhow::anyhow!(e))?;
-        let len = remote.len();
-        let source = rodio::Decoder::builder()
-            .with_data(std::io::BufReader::with_capacity(256 * 1024, remote))
-            .with_byte_len(len)
-            .with_seekable(true)
-            .build()
-            .with_context(|| format!("decode {url}"))?;
+    /// Everything slow happened there; this is just handing it to rodio.
+    pub fn play_remote(&self, source: RemoteSource) {
         self.player.clear();
         self.player.append(source);
         self.player.play();
-        Ok(())
     }
 
     /// Replace whatever is queued with `path` and start playing.
@@ -140,8 +152,9 @@ mod stream_check {
         let player = AudioPlayer::new().unwrap();
 
         let start = std::time::Instant::now();
-        player.play_url(url).expect("play");
-        println!("time to first audio: {:?}", start.elapsed());
+        let source = open_url(url).expect("open");
+        println!("time to open: {:?}", start.elapsed());
+        player.play_remote(source);
 
         std::thread::sleep(Duration::from_millis(400));
         assert!(!player.is_finished(), "stream ended immediately");

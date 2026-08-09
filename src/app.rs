@@ -12,7 +12,7 @@ use crate::config::{self, Feed};
 use crate::cover::{self, CoverLoader};
 use crate::library::{self, Folder, Track};
 use crate::media::{self, Command, NowPlaying};
-use crate::player::AudioPlayer;
+use crate::player::{self, AudioPlayer};
 use crate::worker::{Cancel, Worker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +79,12 @@ pub struct App {
     /// Hands back the directory it scanned, so a result can never be filed under
     /// whatever the cursor has moved to meanwhile.
     scan: Worker<PathBuf, (PathBuf, Vec<Track>)>,
+    /// Opens remote streams, which blocks for as long as the server takes. Hands
+    /// back the URL for the same reason the scan hands back its directory.
+    open: Worker<String, (String, Result<player::RemoteSource, String>)>,
+    open_generation: u64,
+    /// The URL being opened, if any.
+    opening: Option<String>,
     scan_generation: u64,
     /// Recently listed directories, so moving back over a folder is instant.
     memo: HashMap<PathBuf, Vec<Track>>,
@@ -217,6 +223,12 @@ impl App {
             feeds: config::load_feeds(),
             feed_state: TableState::default().with_selected(Some(0)),
             feeds_file: config::feeds_path(),
+            open: Worker::spawn("open", |url: String, _: &Cancel| {
+                let opened = player::open_url(&url).map_err(|err| format!("{err:#}"));
+                (url, opened)
+            }),
+            open_generation: 0,
+            opening: None,
             // One request and one parse: nothing worth interrupting halfway.
             fetch: Worker::spawn("feeds", |url: String, _: &Cancel| {
                 let bytes = crate::net::get(&url)?;
@@ -476,19 +488,69 @@ impl App {
         let path = track.path.clone();
         let art_url = track.art_url.clone();
         let title = track.title.clone();
+
         // A remote track streams; the identity in `path` is its URL either way.
-        let started = match track.url.clone() {
-            Some(url) => self.audio.play_url(&url),
-            None => self.audio.play_file(&path),
+        let Some(url) = track.url.clone() else {
+            match self.audio.play_file(&path) {
+                Ok(()) => {
+                    self.opening = None;
+                    self.queue_pos = Some(idx);
+                    self.status = format!("playing {title}");
+                    self.request_cover(&path, art_url);
+                }
+                Err(err) => self.status = format!("error: {err:#}"),
+            }
+            return;
         };
-        match started {
-            Ok(()) => {
-                self.queue_pos = Some(idx);
+
+        // Opening a stream blocks for as long as the server takes, so it goes to a
+        // worker and the answer is picked up in `poll_open`. The old track stops
+        // now rather than playing on under the new title.
+        self.audio.stop();
+        self.queue_pos = Some(idx);
+        self.opening = Some(url.clone());
+        self.open_generation += 1;
+        self.open.request(self.open_generation, url);
+        self.status = format!("opening {title}");
+        self.request_cover(&path, art_url);
+    }
+
+    /// True while a stream is being opened, so nothing takes the silence for the
+    /// end of a track.
+    pub fn is_opening(&self) -> bool {
+        self.opening.is_some()
+    }
+
+    /// Pick up a stream that finished opening. Cheap, so it runs every loop.
+    pub fn poll_open(&mut self) {
+        let mut newest = None;
+        for (generation, opened) in self.open.drain() {
+            if generation == self.open_generation {
+                newest = Some(opened);
+            }
+        }
+        let Some((url, opened)) = newest else {
+            return;
+        };
+        // Same rule as the scan: the generation alone cannot say whether this is
+        // still the track we are waiting for. Only the URL can.
+        if self.opening.as_deref() != Some(url.as_str()) {
+            return;
+        }
+        self.opening = None;
+
+        match opened {
+            Ok(source) => {
+                self.audio.play_remote(source);
+                let title = self
+                    .now_playing()
+                    .map(|track| track.title.clone())
+                    .unwrap_or_default();
                 self.status = format!("playing {title}");
-                self.request_cover(&path, art_url);
             }
             Err(err) => {
-                self.status = format!("error: {err:#}");
+                self.queue_pos = None;
+                self.status = format!("error: {err}");
             }
         }
     }
@@ -611,14 +673,21 @@ impl App {
         }
     }
 
+    /// Stop, and let go of a stream still opening: it would otherwise land later
+    /// and start playing on its own.
+    fn stop_playback(&mut self) {
+        self.audio.stop();
+        self.opening = None;
+        self.queue_pos = None;
+    }
+
     pub fn next_track(&mut self) {
         match self.queue_pos {
             Some(current) if current + 1 < self.queue.len() => {
                 self.play_queue_index(current + 1);
             }
             Some(_) => {
-                self.audio.stop();
-                self.queue_pos = None;
+                self.stop_playback();
                 self.status = "end of queue".into();
             }
             // Nothing queued yet: start from whatever is on screen.
@@ -649,10 +718,7 @@ impl App {
                         self.audio.toggle();
                     }
                 }
-                Command::Stop => {
-                    self.audio.stop();
-                    self.queue_pos = None;
-                }
+                Command::Stop => self.stop_playback(),
                 Command::Next => self.next_track(),
                 Command::Previous => self.prev_track(),
                 Command::SeekBy(delta) => self.seek_by(delta),
@@ -690,8 +756,15 @@ impl App {
     }
 
     /// Advance automatically when the current source has drained.
+    ///
+    /// A stream still opening has nothing queued either, and that silence must not
+    /// read as a track that finished — it would skip the whole queue in a blur.
     pub fn tick(&mut self) {
-        if self.queue_pos.is_some() && self.audio.is_finished() && !self.audio.is_paused() {
+        if self.queue_pos.is_some()
+            && !self.is_opening()
+            && self.audio.is_finished()
+            && !self.audio.is_paused()
+        {
             self.next_track();
         }
     }
@@ -1461,6 +1534,79 @@ mod tests {
         app.select_folder(0);
         app.wait_for_tracks();
         assert_eq!(app.tracks.len(), 3, "Alpha, remembered as Artist's tracks");
+    }
+
+    /// A track that streams, pointed at a port nothing is listening on.
+    fn remote_track(url: &str) -> Track {
+        Track {
+            path: PathBuf::from(url),
+            title: "episode".into(),
+            artist: "feed".into(),
+            album: "feed".into(),
+            duration: None,
+            url: Some(url.to_string()),
+            art_url: None,
+        }
+    }
+
+    /// Enter on an episode used to open the stream on this thread: a length probe,
+    /// a range request and a header read, up to `net::TIMEOUT` of them against a
+    /// host that never answers, with the interface frozen throughout.
+    #[test]
+    fn starting_a_remote_track_returns_at_once() {
+        let lib = Library::new("remote-open");
+        let mut app = lib.app();
+        app.queue = vec![remote_track("http://127.0.0.1:9/never.mp3")];
+
+        let started = Instant::now();
+        app.play_queue_index(0);
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_millis(250),
+            "play_queue_index blocked for {waited:?}"
+        );
+        assert!(app.is_opening(), "the open should still be in flight");
+        assert!(app.status.starts_with("opening"), "{}", app.status);
+    }
+
+    /// Nothing is queued while a stream opens, and that silence is not a track
+    /// that ended — reading it as one would race through the whole queue.
+    #[test]
+    fn a_stream_still_opening_is_not_a_finished_track() {
+        let lib = Library::new("opening-tick");
+        let mut app = lib.app();
+        app.queue = vec![
+            remote_track("http://127.0.0.1:9/one.mp3"),
+            remote_track("http://127.0.0.1:9/two.mp3"),
+        ];
+
+        app.play_queue_index(0);
+        assert!(app.audio.is_finished(), "nothing is playing yet");
+        for _ in 0..5 {
+            app.tick();
+        }
+        assert_eq!(
+            app.queue_pos,
+            Some(0),
+            "tick walked off a track still opening"
+        );
+    }
+
+    /// Stopping has to let go of a pending open, or it would land afterwards and
+    /// start playing on its own.
+    #[test]
+    fn stopping_abandons_a_stream_that_is_still_opening() {
+        let lib = Library::new("stop-opening");
+        let mut app = lib.app();
+        app.queue = vec![remote_track("http://127.0.0.1:9/one.mp3")];
+
+        app.play_queue_index(0);
+        assert!(app.is_opening());
+        app.stop_playback();
+
+        assert!(!app.is_opening(), "the open outlived the stop");
+        assert_eq!(app.queue_pos, None);
     }
 
     #[test]

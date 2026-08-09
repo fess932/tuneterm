@@ -418,6 +418,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         app.poll_cover();
         app.poll_tracks();
         app.poll_feed();
+        app.poll_open();
         app.refresh_cover_for_resize();
         app.poll_media();
         app.tick();
