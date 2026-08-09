@@ -215,11 +215,7 @@ pub fn start() -> (Bridge, Option<Host>, Option<String>) {
 #[cfg(windows)]
 fn console_hwnd() -> Option<*mut std::ffi::c_void> {
     let hwnd = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
-    if hwnd.is_null() {
-        None
-    } else {
-        Some(hwnd as *mut std::ffi::c_void)
-    }
+    if hwnd.is_null() { None } else { Some(hwnd) }
 }
 
 #[cfg(not(windows))]

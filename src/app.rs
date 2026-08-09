@@ -76,7 +76,9 @@ pub struct App {
     /// Directory whose tracks are listed, and whether the worker is still on it.
     tracks_dir: Option<PathBuf>,
     pub tracks_loading: bool,
-    scan: Worker<PathBuf, Vec<Track>>,
+    /// Hands back the directory it scanned, so a result can never be filed under
+    /// whatever the cursor has moved to meanwhile.
+    scan: Worker<PathBuf, (PathBuf, Vec<Track>)>,
     scan_generation: u64,
     /// Recently listed directories, so moving back over a folder is instant.
     memo: HashMap<PathBuf, Vec<Track>>,
@@ -186,7 +188,10 @@ impl App {
             queue_pos: None,
             tracks_dir: None,
             tracks_loading: false,
-            scan: Worker::spawn("scan", |dir: PathBuf| library::scan_tracks_deep(&dir)),
+            scan: Worker::spawn("scan", |dir: PathBuf| {
+                let tracks = library::scan_tracks_deep(&dir);
+                (dir, tracks)
+            }),
             scan_generation: 0,
             memo: HashMap::new(),
             memo_order: VecDeque::new(),
@@ -294,6 +299,9 @@ impl App {
 
         if let Some(cached) = self.memo.get(&dir) {
             let tracks = cached.clone();
+            // Whatever scan was running is for the folder we just left, and nothing
+            // will clear the flag for it: this listing is already complete.
+            self.tracks_loading = false;
             self.show_tracks(tracks);
             return;
         }
@@ -318,18 +326,22 @@ impl App {
     /// Pick up a finished scan. Cheap, so it can run every loop iteration.
     pub fn poll_tracks(&mut self) {
         let mut newest = None;
-        for (generation, tracks) in self.scan.drain() {
+        for (generation, scanned) in self.scan.drain() {
             if generation == self.scan_generation {
-                newest = Some(tracks);
+                newest = Some(scanned);
             }
         }
-        let Some(tracks) = newest else {
+        let Some((dir, tracks)) = newest else {
             return;
         };
-        self.tracks_loading = false;
-        if let Some(dir) = self.tracks_dir.clone() {
-            self.remember(dir, tracks.clone());
+        // The generation can still match a folder we have left: the memo path serves a
+        // listing without asking for a scan, so it bumps nothing. Only the directory
+        // says whose tracks these are.
+        if self.tracks_dir.as_ref() != Some(&dir) {
+            return;
         }
+        self.tracks_loading = false;
+        self.remember(dir, tracks.clone());
         self.show_tracks(tracks);
     }
 
@@ -1420,6 +1432,34 @@ mod tests {
         app.reload_tracks();
         assert!(!app.tracks_loading, "Alpha should have been remembered");
         assert_eq!(app.tracks.len(), 3);
+    }
+
+    /// Moving onto a remembered folder while a scan of the previous one is still
+    /// running must not let that scan land here — neither on screen nor, worse, in
+    /// the memo, where it would answer for the wrong folder from then on.
+    #[test]
+    fn a_scan_in_flight_cannot_land_on_the_folder_moved_to() {
+        let lib = Library::new("stale-scan");
+        let mut app = lib.app(); // Alpha is listed, and now remembered
+
+        app.select_folder(1); // Artist/, 6 tracks — the scan is in flight
+        app.select_folder(0); // straight back to Alpha, served from the memo
+        assert_eq!(app.tracks.len(), 3, "Alpha, from the memo");
+
+        // Every chance for the Artist scan to finish and be picked up.
+        for _ in 0..20 {
+            app.poll_tracks();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.tracks.len(), 3, "Artist's scan landed on Alpha");
+
+        // And the memo still has to answer for the right folders.
+        app.select_folder(1);
+        app.wait_for_tracks();
+        assert_eq!(app.tracks.len(), 6, "Artist");
+        app.select_folder(0);
+        app.wait_for_tracks();
+        assert_eq!(app.tracks.len(), 3, "Alpha, remembered as Artist's tracks");
     }
 
     #[test]
