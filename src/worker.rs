@@ -22,6 +22,37 @@ use std::thread;
 /// The one pending request, and the condvar the thread waits on.
 type Slot<Req> = Arc<(Mutex<Option<(u64, Req)>>, Condvar)>;
 
+/// Tells the interface loop that there is something to pick up.
+///
+/// A worker's own result channel cannot wake the loop — the loop is waiting
+/// somewhere else — so without this the only way to notice a finished job is to
+/// come back and ask, which is a delay on every cover and every listing. Each
+/// worker rings this after sending, and the loop waits on the other end.
+#[derive(Clone)]
+pub struct Wake(Option<mpsc::Sender<()>>);
+
+impl Wake {
+    /// The handle to hand out, and the end for the loop to wait on.
+    pub fn channel() -> (Self, Receiver<()>) {
+        let (tx, rx) = mpsc::channel();
+        (Self(Some(tx)), rx)
+    }
+
+    /// Rings nothing. Tests drive the polling themselves, so there is no loop for
+    /// a worker to wake.
+    #[cfg(test)]
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// A missed nudge only costs a late redraw, so a closed channel is no error.
+    pub fn nudge(&self) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.send(());
+        }
+    }
+}
+
 /// Handed to a running job so it can give up on work nobody wants any more.
 ///
 /// Cheap enough to ask between files: one atomic load.
@@ -70,7 +101,8 @@ where
 {
     /// Start the thread. `run` is called for each request that is still wanted, and
     /// should consult its [`Cancel`] if it takes long enough to be worth abandoning.
-    pub fn spawn<F>(name: &str, run: F) -> Self
+    /// `wake` is rung whenever a result is ready.
+    pub fn spawn<F>(name: &str, wake: Wake, run: F) -> Self
     where
         F: Fn(Req, &Cancel) -> Out + Send + 'static,
     {
@@ -113,6 +145,7 @@ where
                 if tx.send((generation, out)).is_err() {
                     return; // the caller is gone
                 }
+                wake.nudge();
             }
         });
         // A thread that will not start is not worth aborting the app over; the
@@ -166,7 +199,7 @@ mod tests {
 
     #[test]
     fn runs_a_request_and_returns_its_generation() {
-        let worker = Worker::spawn("test-run", |n: u32, _: &Cancel| n * 2);
+        let worker = Worker::spawn("test-run", Wake::none(), |n: u32, _: &Cancel| n * 2);
         worker.request(1, 21);
         assert_eq!(wait_for(&worker, 1), Some(42));
     }
@@ -176,7 +209,7 @@ mod tests {
     fn a_burst_collapses_to_the_last_request() {
         let ran = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&ran);
-        let worker = Worker::spawn("test-burst", move |n: u32, _: &Cancel| {
+        let worker = Worker::spawn("test-burst", Wake::none(), move |n: u32, _: &Cancel| {
             counter.fetch_add(1, Ordering::SeqCst);
             // Slow enough that the burst lands while the first job is running.
             thread::sleep(Duration::from_millis(40));
@@ -196,7 +229,7 @@ mod tests {
     /// Superseded work must not surface, or a stale result would overwrite a fresh one.
     #[test]
     fn stale_results_are_dropped() {
-        let worker = Worker::spawn("test-stale", |n: u32, _: &Cancel| {
+        let worker = Worker::spawn("test-stale", Wake::none(), |n: u32, _: &Cancel| {
             thread::sleep(Duration::from_millis(20));
             n
         });
@@ -217,20 +250,24 @@ mod tests {
         const STEPS: usize = 200;
         let steps = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&steps);
-        let worker = Worker::spawn("test-cancel", move |n: u32, cancel: &Cancel| {
-            for _ in 0..STEPS {
-                if cancel.superseded() {
-                    return 0;
+        let worker = Worker::spawn(
+            "test-cancel",
+            Wake::none(),
+            move |n: u32, cancel: &Cancel| {
+                for _ in 0..STEPS {
+                    if cancel.superseded() {
+                        return 0;
+                    }
+                    // Only the job that gets cancelled is counted; the one that
+                    // replaces it is expected to run all the way through.
+                    if n == 1 {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    thread::sleep(Duration::from_millis(2));
                 }
-                // Only the job that gets cancelled is counted; the one that
-                // replaces it is expected to run all the way through.
-                if n == 1 {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                }
-                thread::sleep(Duration::from_millis(2));
-            }
-            n
-        });
+                n
+            },
+        );
 
         worker.request(1, 1);
         // Let it get properly under way before pulling the rug.
@@ -245,9 +282,24 @@ mod tests {
         );
     }
 
+    /// The loop waits on the wake channel rather than coming back to ask, so a
+    /// result that rings nothing is a result nobody looks at until the next tick.
+    #[test]
+    fn a_finished_job_rings_the_wake() {
+        let (wake, wakes) = Wake::channel();
+        let worker = Worker::spawn("test-wake", wake, |n: u32, _: &Cancel| n);
+        worker.request(1, 7);
+
+        assert_eq!(wait_for(&worker, 1), Some(7));
+        assert!(
+            wakes.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "the result never rang the wake"
+        );
+    }
+
     #[test]
     fn the_thread_exits_when_the_worker_is_dropped() {
-        let worker = Worker::spawn("test-drop", |n: u32, _: &Cancel| n);
+        let worker = Worker::spawn("test-drop", Wake::none(), |n: u32, _: &Cancel| n);
         worker.request(1, 1);
         assert_eq!(wait_for(&worker, 1), Some(1));
         drop(worker); // the send in the thread now fails and it returns

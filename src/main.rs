@@ -14,6 +14,8 @@ use std::io::{self, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -27,6 +29,7 @@ use ratatui_image::FontSize;
 use ratatui_image::picker::{Picker, ProtocolType};
 
 use app::{App, Pane};
+use worker::Wake;
 
 /// Parsed command line. Hand-rolled: three flags do not justify a dependency.
 struct Args {
@@ -307,9 +310,13 @@ fn main() -> Result<()> {
     // Must query the terminal before we switch to the alternate screen.
     let picker = build_picker();
 
+    // Everything that can give the loop something to do rings this: the workers,
+    // the terminal, and the OS media keys.
+    let (wake, wakes) = Wake::channel();
+
     // An escape hatch: if registering with the OS misbehaves, the player still works.
     let (bridge, host, media_warning) = if args.media {
-        media::start()
+        media::start(wake.clone())
     } else {
         (media::Bridge::detached(), None, None)
     };
@@ -323,7 +330,7 @@ fn main() -> Result<()> {
         std::thread::Builder::new()
             .name("tui".into())
             .spawn(move || {
-                let result = tui_main(root, picker, bridge, media_warning);
+                let result = tui_main(root, picker, bridge, media_warning, wake, wakes);
                 finished.store(true, Ordering::Release);
                 // Cut the host's current wait short so quitting is immediate.
                 media::wake();
@@ -367,54 +374,87 @@ fn tui_main(
     picker: Picker,
     bridge: media::Bridge,
     media_warning: Option<String>,
+    wake: Wake,
+    wakes: Receiver<()>,
 ) -> Result<()> {
-    let mut app = App::new(root, picker, bridge)?;
+    let mut app = App::new(root, picker, bridge, wake.clone())?;
     if let Some(warning) = media_warning {
         app.status = warning;
     }
 
     let mut terminal = ratatui::init();
     set_mouse(MOUSE_ON)?;
+    // After raw mode is on, or the first reads would be line buffered.
+    let events = spawn_input(wake);
 
-    let result = run(&mut terminal, &mut app);
+    let result = run(&mut terminal, &mut app, &wakes, &events);
 
     let _ = set_mouse(MOUSE_OFF);
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+/// Read the terminal on a thread of its own.
+///
+/// The loop used to poll the terminal on a timeout, which made that timeout the
+/// latency of everything else too: a finished cover or listing could not announce
+/// itself, so it waited to be asked. With input arriving as messages, the loop can
+/// wait on one channel that every source rings.
+///
+/// The thread outlives the loop, blocked in `read`. That is fine: it is `main`
+/// returning that ends the process, and by then the terminal is already restored.
+fn spawn_input(wake: Wake) -> Receiver<Event> {
+    let (tx, rx) = mpsc::channel();
+    let spawned = thread::Builder::new().name("input".into()).spawn(move || {
+        while let Ok(event) = event::read() {
+            if tx.send(event).is_err() {
+                return; // the loop is gone
+            }
+            wake.nudge();
+        }
+    });
+    debug_assert!(spawned.is_ok(), "could not spawn input");
+    rx
+}
+
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    wakes: &Receiver<()>,
+    events: &Receiver<Event>,
+) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        // Idle at a lazy 120ms, but poll briskly while a cover is in flight: the
-        // worker cannot wake this loop, so the timeout is what delays the artwork.
-        let timeout = if app.cover_pending {
-            Duration::from_millis(15)
-        } else {
+        // Nothing here is a poll interval any more: a keystroke, a media key or a
+        // finished job rings `wakes` and this returns at once. The timeout is only
+        // how often a screen that nobody is touching still needs a look-in — for
+        // the clock, the progress bar, and noticing that a track has ended.
+        let idle = if app.is_playing_something() {
             Duration::from_millis(120)
+        } else {
+            Duration::from_millis(500)
         };
-        // Wait for the first event, then take everything already queued.
-        //
-        // Reading a single event per iteration capped input at the frame rate. A
-        // fast scroll wheel outruns that easily, so events piled up in the
-        // terminal's buffer and kept moving the cursor the old way for a while
-        // after you had already reversed direction — the reversal was simply
-        // queued behind the backlog. Draining collapses a flick into one frame.
-        if event::poll(timeout)? {
-            // Bounded so a stream of events cannot starve the redraw entirely.
-            const MAX_PER_FRAME: usize = 256;
-            for _ in 0..MAX_PER_FRAME {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => on_key(app, key),
-                    Event::Mouse(mouse) => on_mouse(app, mouse),
-                    _ => {}
-                }
-                if app.should_quit || !event::poll(Duration::ZERO)? {
-                    break;
-                }
+        let _ = wakes.recv_timeout(idle);
+        // Everything that rang while we were busy is served by this one pass.
+        while wakes.try_recv().is_ok() {}
+
+        // Draining matters: reading one event per frame capped input at the frame
+        // rate, so a fast scroll wheel piled up and kept moving the cursor the old
+        // way after you had already reversed direction. Bounded, so a stream of
+        // events cannot starve the redraw.
+        const MAX_PER_FRAME: usize = 256;
+        for event in events.try_iter().take(MAX_PER_FRAME) {
+            match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => on_key(app, key),
+                Event::Mouse(mouse) => on_mouse(app, mouse),
+                _ => {}
+            }
+            if app.should_quit {
+                break;
             }
         }
+
         app.poll_cover();
         app.poll_tracks();
         app.poll_feed();

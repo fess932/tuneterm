@@ -5,7 +5,7 @@ use image::imageops::FilterType;
 
 use crate::cache;
 use crate::library;
-use crate::worker::{Cancel, Worker};
+use crate::worker::{Cancel, Wake, Worker};
 
 pub struct Request {
     pub generation: u64,
@@ -35,15 +35,15 @@ pub struct CoverLoader {
 }
 
 impl CoverLoader {
-    pub fn new() -> Self {
-        Self::with_cache(cache::dir_for(cache::Kind::Art))
+    pub fn new(wake: Wake) -> Self {
+        Self::with_cache(cache::dir_for(cache::Kind::Art), wake)
     }
 
     /// Explicit cache directory. Tests use it to stay out of the real one, which
     /// also stops them from depending on whatever is already in it.
-    pub fn with_cache(cache_dir: Option<PathBuf>) -> Self {
+    pub fn with_cache(cache_dir: Option<PathBuf>, wake: Wake) -> Self {
         Self {
-            worker: Worker::spawn("covers", move |request: Request, cancel: &Cancel| {
+            worker: Worker::spawn("covers", wake, move |request: Request, cancel: &Cancel| {
                 prepare(
                     &request.path,
                     request.art_url.as_deref(),
@@ -69,12 +69,6 @@ impl CoverLoader {
                 image,
                 file,
             })
-    }
-}
-
-impl Default for CoverLoader {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -184,7 +178,7 @@ mod tests {
 
         /// A loader whose cache lives inside this fixture, so nothing is shared.
         fn loader(&self) -> CoverLoader {
-            CoverLoader::with_cache(Some(self.0.join("cache")))
+            CoverLoader::with_cache(Some(self.0.join("cache")), Wake::none())
         }
     }
 
@@ -281,7 +275,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("01 song.wav"), []).unwrap();
 
-        let loader = CoverLoader::new();
+        let loader = CoverLoader::new(Wake::none());
         loader.request(Request {
             generation: 7,
             path: dir.join("01 song.wav"),

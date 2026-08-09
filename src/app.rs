@@ -13,7 +13,7 @@ use crate::cover::{self, CoverLoader};
 use crate::library::{self, Folder, Track};
 use crate::media::{self, Command, NowPlaying};
 use crate::player::{self, AudioPlayer};
-use crate::worker::{Cancel, Worker};
+use crate::worker::{Cancel, Wake, Worker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -174,7 +174,9 @@ pub struct Prompt {
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl App {
-    pub fn new(root: PathBuf, picker: Picker, media: media::Bridge) -> Result<Self> {
+    /// `wake` is what every worker rings when it has something, so the loop can
+    /// wait instead of asking.
+    pub fn new(root: PathBuf, picker: Picker, media: media::Bridge, wake: Wake) -> Result<Self> {
         let folders = library::list_subdirs(&root);
         let mut folder_state = TableState::default();
         if !folders.is_empty() {
@@ -194,7 +196,7 @@ impl App {
             queue_pos: None,
             tracks_dir: None,
             tracks_loading: false,
-            scan: Worker::spawn("scan", |dir: PathBuf, cancel: &Cancel| {
+            scan: Worker::spawn("scan", wake.clone(), |dir: PathBuf, cancel: &Cancel| {
                 let tracks = library::scan_tracks_deep(&dir, cancel);
                 (dir, tracks)
             }),
@@ -208,7 +210,7 @@ impl App {
             cover_pending: false,
             cover_file: None,
             cover_memo: None,
-            cover_loader: CoverLoader::new(),
+            cover_loader: CoverLoader::new(wake.clone()),
             cover_generation: 0,
             cover_requested_box: (0, 0),
             art_budget: Rect::ZERO,
@@ -223,14 +225,14 @@ impl App {
             feeds: config::load_feeds(),
             feed_state: TableState::default().with_selected(Some(0)),
             feeds_file: config::feeds_path(),
-            open: Worker::spawn("open", |url: String, _: &Cancel| {
+            open: Worker::spawn("open", wake.clone(), |url: String, _: &Cancel| {
                 let opened = player::open_url(&url).map_err(|err| format!("{err:#}"));
                 (url, opened)
             }),
             open_generation: 0,
             opening: None,
             // One request and one parse: nothing worth interrupting halfway.
-            fetch: Worker::spawn("feeds", |url: String, _: &Cancel| {
+            fetch: Worker::spawn("feeds", wake.clone(), |url: String, _: &Cancel| {
                 let bytes = crate::net::get(&url)?;
                 crate::feed::parse(&String::from_utf8_lossy(&bytes))
             }),
@@ -1247,6 +1249,7 @@ mod tests {
                 self.0.clone(),
                 Picker::halfblocks(),
                 media::Bridge::detached(),
+                Wake::none(),
             )
             .expect("app init");
             app.wait_for_tracks();
@@ -1937,8 +1940,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tuneterm-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut app = App::new(dir.clone(), Picker::halfblocks(), media::Bridge::detached())
-            .expect("app init");
+        let mut app = App::new(
+            dir.clone(),
+            Picker::halfblocks(),
+            media::Bridge::detached(),
+            Wake::none(),
+        )
+        .expect("app init");
         app.folder_rows = rows(0, 1, 10);
         app.track_rows = rows(30, 1, 10);
 
@@ -2330,6 +2338,7 @@ mod bench {
             root.clone(),
             Picker::halfblocks(),
             media::Bridge::detached(),
+            Wake::none(),
         )
         .unwrap();
         app.art_budget = Rect::new(0, 0, 30, 15);
@@ -2371,6 +2380,7 @@ mod live {
             std::env::temp_dir().join("tuneterm-live-empty"),
             Picker::halfblocks(),
             media::Bridge::detached(),
+            Wake::none(),
         )
         .expect("app");
         app.feeds_file = None; // never write the real config

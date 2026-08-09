@@ -24,6 +24,8 @@ use souvlaki::{
     SeekDirection,
 };
 
+use crate::worker::Wake;
+
 /// How long the host blocks per pump. Short enough that quitting feels immediate.
 const PUMP: Duration = Duration::from_millis(100);
 
@@ -168,7 +170,7 @@ impl Drop for Host {
 /// The [`Bridge`] is always returned so the app needs no conditional paths. The
 /// [`Host`] is `None` when the OS declined — a missing feature, not an error, so
 /// the reason is handed back for the status line rather than being fatal.
-pub fn start() -> (Bridge, Option<Host>, Option<String>) {
+pub fn start(wake: Wake) -> (Bridge, Option<Host>, Option<String>) {
     let (command_tx, commands) = mpsc::channel();
     let (updates_tx, updates) = mpsc::channel();
     let bridge = Bridge {
@@ -202,6 +204,9 @@ pub fn start() -> (Bridge, Option<Host>, Option<String>) {
             && let Ok(sink) = sink.lock()
         {
             let _ = sink.send(command);
+            // A media key is a keypress like any other; the interface should not
+            // sit on it until the next look-in.
+            wake.nudge();
         }
     });
     if let Err(err) = attached {
@@ -474,7 +479,7 @@ mod tests {
     #[test]
     #[ignore]
     fn media_keys_reach_the_bridge() {
-        let (bridge, host, warning) = start();
+        let (bridge, host, warning) = start(Wake::none());
         let mut host = host.unwrap_or_else(|| panic!("no media host: {warning:?}"));
         // Windows routes the keys to a session that claims to be playing.
         bridge.publish(NowPlaying {

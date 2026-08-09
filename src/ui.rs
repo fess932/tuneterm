@@ -703,12 +703,14 @@ mod tests {
     use ratatui_image::picker::Picker;
 
     use crate::app::App;
+    use crate::worker::Wake;
 
     fn app() -> App {
         App::new(
             PathBuf::from("."),
             Picker::halfblocks(),
             crate::media::Bridge::detached(),
+            Wake::none(),
         )
         .expect("app init")
     }
@@ -720,6 +722,7 @@ mod tests {
             PathBuf::from(std::env::var("TUNETERM_ROOT").unwrap_or_else(|_| ".".into())),
             Picker::halfblocks(),
             crate::media::Bridge::detached(),
+            Wake::none(),
         )
         .expect("app init");
         terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
@@ -867,6 +870,7 @@ mod tests {
 mod bench {
     use super::*;
     use crate::app::App;
+    use crate::worker::Wake;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui_image::picker::{Picker, ProtocolType};
@@ -905,6 +909,7 @@ mod bench {
                 std::path::PathBuf::from("."),
                 picker,
                 crate::media::Bridge::detached(),
+                Wake::none(),
             )
             .expect("app");
             app.cover_size = Some((img.width(), img.height()));
@@ -972,6 +977,7 @@ mod bench {
                 std::path::PathBuf::from("."),
                 picker,
                 crate::media::Bridge::detached(),
+                Wake::none(),
             )
             .expect("app");
             app.cover_size = Some((side, side));
@@ -999,6 +1005,7 @@ mod bench {
 mod preview {
     use super::*;
     use crate::app::App;
+    use crate::worker::Wake;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui_image::picker::Picker;
@@ -1012,6 +1019,7 @@ mod preview {
             std::path::PathBuf::from(root),
             Picker::halfblocks(),
             crate::media::Bridge::detached(),
+            Wake::none(),
         )
         .unwrap();
         app.wait_for_tracks();
