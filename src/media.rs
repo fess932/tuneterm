@@ -176,10 +176,17 @@ pub fn start() -> (Bridge, Option<Host>, Option<String>) {
         updates: updates_tx,
     };
 
+    let hwnd = media_window();
+    // souvlaki panics on a missing HWND rather than returning an error, and on
+    // Windows there is nothing to register without one.
+    if cfg!(windows) && hwnd.is_none() {
+        return (bridge, None, Some("media keys off: no window".into()));
+    }
+
     let config = PlatformConfig {
         display_name: "tuneterm",
         dbus_name: "tuneterm",
-        hwnd: console_hwnd(),
+        hwnd,
     };
 
     let mut controls = match MediaControls::new(config) {
@@ -209,18 +216,127 @@ pub fn start() -> (Bridge, Option<Host>, Option<String>) {
     (bridge, Some(host), None)
 }
 
-/// An HWND for souvlaki. A console application has a window even under a pseudo
-/// console, though it may be hidden — whether Windows accepts a ConPTY host window
-/// for a media session is unverified.
+/// The window a Windows media session binds to. `None` everywhere else, where the
+/// APIs are process-wide and know nothing about windows.
 #[cfg(windows)]
-fn console_hwnd() -> Option<*mut std::ffi::c_void> {
-    let hwnd = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
-    if hwnd.is_null() { None } else { Some(hwnd) }
+fn media_window() -> Option<*mut std::ffi::c_void> {
+    win::hidden_window()
 }
 
 #[cfg(not(windows))]
-fn console_hwnd() -> Option<*mut std::ffi::c_void> {
+fn media_window() -> Option<*mut std::ffi::c_void> {
     None
+}
+
+/// A window of our own, and the message pump that goes with it.
+///
+/// `SystemMediaTransportControls` binds a session to a window and refuses one this
+/// process does not own: handing it `GetConsoleWindow` fails with `E_ACCESSDENIED`,
+/// because under a pseudo console that window belongs to conhost. A message-only
+/// window is refused too, with `E_INVALIDARG`. So it has to be a real top-level
+/// window — which is only an inbox for messages here. It is never shown, never
+/// drawn, and `WS_EX_TOOLWINDOW` keeps it out of the taskbar and out of Alt-Tab.
+///
+/// A window belongs to the thread that created it, so both calls below have to
+/// happen on the main thread — the one that services the OS.
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, MSG, MWMO_INPUTAVAILABLE,
+        MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
+        RegisterClassW, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    };
+
+    /// Where [`wake`] posts, once there is a window to post to.
+    static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    /// Set by [`wake`], because the posted message alone only ends the *wait*.
+    static WOKEN: AtomicBool = AtomicBool::new(false);
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// `None` when Windows refuses, which costs the media keys and nothing else.
+    pub fn hidden_window() -> Option<*mut c_void> {
+        let class = wide("tuneterm_media");
+        let title = wide("tuneterm");
+        let hwnd = unsafe {
+            let instance = GetModuleHandleW(ptr::null());
+            let mut spec: WNDCLASSW = std::mem::zeroed();
+            spec.lpfnWndProc = Some(DefWindowProcW);
+            spec.hInstance = instance as _;
+            spec.lpszClassName = class.as_ptr();
+            // Zero means it is registered already, which serves just as well.
+            RegisterClassW(&spec);
+
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                class.as_ptr(),
+                title.as_ptr(),
+                // No WS_VISIBLE, and ShowWindow is never called.
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                instance as _,
+                ptr::null_mut(),
+            )
+        };
+        if hwnd.is_null() {
+            return None;
+        }
+        WINDOW.store(hwnd, Ordering::Release);
+        Some(hwnd)
+    }
+
+    /// Deliver whatever the OS has queued, for up to `slice`.
+    pub fn pump(slice: Duration) {
+        let deadline = Instant::now() + slice;
+        loop {
+            unsafe {
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    DispatchMessageW(&msg);
+                }
+            }
+            if WOKEN.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            // Sleep on the queue rather than spinning through the slice.
+            unsafe {
+                MsgWaitForMultipleObjectsEx(
+                    0,
+                    ptr::null(),
+                    left.as_millis() as u32,
+                    QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE,
+                );
+            }
+        }
+    }
+
+    /// End the current [`pump`] early. The flag is what it reads; the message is
+    /// only there to end the wait it may be sitting in.
+    pub fn wake() {
+        WOKEN.store(true, Ordering::Release);
+        let hwnd = WINDOW.load(Ordering::Acquire);
+        if !hwnd.is_null() {
+            unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
+        }
+    }
 }
 
 /// Give the OS a slice of the main thread.
@@ -232,8 +348,15 @@ fn run_loop_for(duration: Duration) {
     }
 }
 
+/// Windows delivers the session's events through our window's message queue, so
+/// the slice goes to pumping it.
+#[cfg(windows)]
+fn run_loop_for(duration: Duration) {
+    win::pump(duration);
+}
+
 /// Elsewhere the backend runs its own thread, so the main thread only has to wait.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn run_loop_for(duration: Duration) {
     std::thread::sleep(duration);
 }
@@ -245,7 +368,12 @@ pub fn wake() {
     unsafe { CFRunLoopStop(CFRunLoopGetMain()) };
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+pub fn wake() {
+    win::wake();
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn wake() {}
 
 #[cfg(test)]
@@ -305,6 +433,80 @@ mod tests {
         drop(rx);
         bridge.publish(NowPlaying::default()); // must not panic
         assert_eq!(bridge.commands().count(), 0);
+    }
+
+    /// The whole reason `win` exists. Handing SMTC the console window fails with
+    /// `E_ACCESSDENIED`, since under a pseudo console it belongs to conhost; ours
+    /// has to be accepted, and has to stay off the screen.
+    #[cfg(windows)]
+    #[test]
+    fn windows_accepts_our_window_and_never_shows_it() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        let hwnd = win::hidden_window().expect("no window");
+        assert_eq!(
+            unsafe { IsWindowVisible(hwnd) },
+            0,
+            "the media window must never be visible"
+        );
+
+        let controls = MediaControls::new(PlatformConfig {
+            display_name: "tuneterm-test",
+            dbus_name: "tuneterm-test",
+            hwnd: Some(hwnd),
+        });
+        let mut controls = controls.expect("Windows refused the window");
+        controls.attach(|_| {}).expect("attach");
+        assert!(
+            controls
+                .set_playback(MediaPlayback::Paused { progress: None })
+                .is_ok()
+        );
+    }
+
+    /// End to end, against the real OS: `cargo test media_keys -- --ignored
+    /// --nocapture`, then press play/pause within ten seconds. Ignored because it
+    /// needs a keystroke, and because it registers a real media session.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn media_keys_reach_the_bridge() {
+        let (bridge, host, warning) = start();
+        let mut host = host.unwrap_or_else(|| panic!("no media host: {warning:?}"));
+        // Windows routes the keys to a session that claims to be playing.
+        bridge.publish(NowPlaying {
+            title: "probe".into(),
+            playing: true,
+            ..Default::default()
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen: Vec<Command> = Vec::new();
+        while std::time::Instant::now() < deadline && seen.is_empty() {
+            host.pump();
+            seen.extend(bridge.commands());
+        }
+        println!("commands: {seen:?}");
+        assert!(!seen.is_empty(), "no media key arrived in ten seconds");
+    }
+
+    /// `wake` has to end a pump that is sitting on an empty queue, or quitting
+    /// would wait out the slice.
+    #[cfg(windows)]
+    #[test]
+    fn waking_ends_the_pump_early() {
+        win::hidden_window().expect("no window");
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            wake();
+        });
+        let started = std::time::Instant::now();
+        win::pump(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "pump ran for {:?}, so wake did not reach it",
+            started.elapsed()
+        );
     }
 
     #[test]

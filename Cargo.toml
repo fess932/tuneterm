@@ -31,6 +31,11 @@ ureq = "3"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = "0.8"
 
-# GetConsoleWindow: souvlaki wants an HWND, and a console app has one.
+# A window for the media session, and the message pump it needs. See media.rs:
+# SMTC binds a session to a window, and a console application has none of its own.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Graphics_Gdi",         # WNDCLASSW carries GDI handles
+    "Win32_System_LibraryLoader", # GetModuleHandleW
+    "Win32_UI_WindowsAndMessaging",
+] }
