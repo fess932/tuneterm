@@ -243,18 +243,21 @@ fn media_window() -> Option<*mut std::ffi::c_void> {
 mod win {
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, MSG, MWMO_INPUTAVAILABLE,
-        MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
+        MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostThreadMessageW, QS_ALLINPUT,
         RegisterClassW, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
     };
 
-    /// Where [`wake`] posts, once there is a window to post to.
-    static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    /// The thread currently inside [`pump`] — which is who [`wake`] has to reach.
+    /// Addressing the window instead would post to whichever thread *created* it,
+    /// and that is not necessarily the one waiting.
+    static PUMPING: AtomicU32 = AtomicU32::new(0);
     /// Set by [`wake`], because the posted message alone only ends the *wait*.
     static WOKEN: AtomicBool = AtomicBool::new(false);
 
@@ -294,12 +297,12 @@ mod win {
         if hwnd.is_null() {
             return None;
         }
-        WINDOW.store(hwnd, Ordering::Release);
         Some(hwnd)
     }
 
     /// Deliver whatever the OS has queued, for up to `slice`.
     pub fn pump(slice: Duration) {
+        PUMPING.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
         let deadline = Instant::now() + slice;
         loop {
             unsafe {
@@ -332,9 +335,9 @@ mod win {
     /// only there to end the wait it may be sitting in.
     pub fn wake() {
         WOKEN.store(true, Ordering::Release);
-        let hwnd = WINDOW.load(Ordering::Acquire);
-        if !hwnd.is_null() {
-            unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
+        let thread = PUMPING.load(Ordering::Acquire);
+        if thread != 0 {
+            unsafe { PostThreadMessageW(thread, WM_NULL, 0, 0) };
         }
     }
 }

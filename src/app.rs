@@ -13,7 +13,7 @@ use crate::cover::{self, CoverLoader};
 use crate::library::{self, Folder, Track};
 use crate::media::{self, Command, NowPlaying};
 use crate::player::AudioPlayer;
-use crate::worker::Worker;
+use crate::worker::{Cancel, Worker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -188,8 +188,8 @@ impl App {
             queue_pos: None,
             tracks_dir: None,
             tracks_loading: false,
-            scan: Worker::spawn("scan", |dir: PathBuf| {
-                let tracks = library::scan_tracks_deep(&dir);
+            scan: Worker::spawn("scan", |dir: PathBuf, cancel: &Cancel| {
+                let tracks = library::scan_tracks_deep(&dir, cancel);
                 (dir, tracks)
             }),
             scan_generation: 0,
@@ -217,7 +217,8 @@ impl App {
             feeds: config::load_feeds(),
             feed_state: TableState::default().with_selected(Some(0)),
             feeds_file: config::feeds_path(),
-            fetch: Worker::spawn("feeds", |url: String| {
+            // One request and one parse: nothing worth interrupting halfway.
+            fetch: Worker::spawn("feeds", |url: String, _: &Cancel| {
                 let bytes = crate::net::get(&url)?;
                 crate::feed::parse(&String::from_utf8_lossy(&bytes))
             }),

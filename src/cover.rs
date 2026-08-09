@@ -5,7 +5,7 @@ use image::imageops::FilterType;
 
 use crate::cache;
 use crate::library;
-use crate::worker::Worker;
+use crate::worker::{Cancel, Worker};
 
 pub struct Request {
     pub generation: u64,
@@ -43,12 +43,13 @@ impl CoverLoader {
     /// also stops them from depending on whatever is already in it.
     pub fn with_cache(cache_dir: Option<PathBuf>) -> Self {
         Self {
-            worker: Worker::spawn("covers", move |request: Request| {
+            worker: Worker::spawn("covers", move |request: Request, cancel: &Cancel| {
                 prepare(
                     &request.path,
                     request.art_url.as_deref(),
                     request.box_px,
                     cache_dir.as_deref(),
+                    cancel,
                 )
             }),
         }
@@ -87,6 +88,7 @@ fn prepare(
     art_url: Option<&str>,
     box_px: (u32, u32),
     cache_dir: Option<&Path>,
+    cancel: &Cancel,
 ) -> (Option<DynamicImage>, Option<PathBuf>) {
     // A remote track has no tag to read; its artwork is a URL. Downloading it is
     // exactly as slow as decoding a large JPEG, and this is the same worker, so it
@@ -105,9 +107,17 @@ fn prepare(
         return (Some(cached), file);
     }
 
+    // What is left is the expensive half — ~190 ms to decode and ~400 ms to scale —
+    // and by now the cursor may well have asked for a different cover twice over.
+    if cancel.superseded() {
+        return (None, None);
+    }
     let Ok(decoded) = image::load_from_memory(&picture) else {
         return (None, None);
     };
+    if cancel.superseded() {
+        return (None, None);
+    }
     let scaled = fill(decoded, box_px);
     if let Some(dir) = cache_dir {
         cache::put_in(dir, &key, &scaled);
@@ -351,11 +361,23 @@ mod bench {
             let box_px = (600, 600);
             let t = Instant::now();
             let cache_dir = cache::dir_for(cache::Kind::Art);
-            let (first, _) = prepare(&dir.join("01.wav"), None, box_px, cache_dir.as_deref());
+            let (first, _) = prepare(
+                &dir.join("01.wav"),
+                None,
+                box_px,
+                cache_dir.as_deref(),
+                &Cancel::never(),
+            );
             let cold = t.elapsed();
 
             let t = Instant::now();
-            let (second, _) = prepare(&dir.join("02.wav"), None, box_px, cache_dir.as_deref());
+            let (second, _) = prepare(
+                &dir.join("02.wav"),
+                None,
+                box_px,
+                cache_dir.as_deref(),
+                &Cancel::never(),
+            );
             let warm = t.elapsed();
 
             println!(

@@ -4,6 +4,8 @@ use std::time::Duration;
 use image::DynamicImage;
 use lofty::prelude::*;
 
+use crate::worker::Cancel;
+
 const AUDIO_EXT: &[&str] = &[
     "mp3", "flac", "m4a", "aac", "ogg", "oga", "opus", "wav", "aiff", "wv",
 ];
@@ -125,15 +127,28 @@ fn count_audio(dir: &Path, depth: usize) -> usize {
 /// This is what the right pane shows, so selecting an artist lists their whole
 /// discography rather than an empty folder. Reading tags costs milliseconds per
 /// file, which is why it runs on a worker rather than during a cursor move.
-pub fn scan_tracks_deep(dir: &Path) -> Vec<Track> {
+///
+/// A thousand-file folder therefore runs for seconds, and the cursor does not wait
+/// for it — hence `cancel`. Giving up returns nothing: a half-read folder is not a
+/// listing, and the caller discards a cancelled answer anyway.
+pub fn scan_tracks_deep(dir: &Path, cancel: &Cancel) -> Vec<Track> {
     let mut paths = Vec::new();
-    collect_audio(dir, MAX_DEPTH, &mut paths);
+    collect_audio(dir, MAX_DEPTH, &mut paths, cancel);
     paths.sort();
-    paths.into_iter().map(read_track).collect()
+
+    let mut tracks = Vec::with_capacity(paths.len());
+    for path in paths {
+        // Between files, not inside one: reading a single tag is milliseconds.
+        if cancel.superseded() {
+            return Vec::new();
+        }
+        tracks.push(read_track(path));
+    }
+    tracks
 }
 
-fn collect_audio(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth == 0 {
+fn collect_audio(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, cancel: &Cancel) {
+    if depth == 0 || cancel.superseded() {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -153,7 +168,7 @@ fn collect_audio(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
     subdirs.sort();
     for sub in subdirs {
-        collect_audio(&sub, depth - 1, out);
+        collect_audio(&sub, depth - 1, out, cancel);
     }
 }
 
@@ -406,6 +421,24 @@ mod tests {
             recover_cp1251("01. Âàíÿ (2013)").as_deref(),
             Some("01. Ваня (2013)")
         );
+    }
+
+    /// Reading tags is the slow half, and a cancelled scan must not sit through it.
+    #[test]
+    fn a_cancelled_scan_reads_nothing() {
+        let dir = std::env::temp_dir().join(format!("tuneterm-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 1..=3 {
+            std::fs::write(dir.join(format!("{i:02}.wav")), []).unwrap();
+        }
+
+        assert_eq!(scan_tracks_deep(&dir, &Cancel::never()).len(), 3);
+        assert!(
+            scan_tracks_deep(&dir, &Cancel::already()).is_empty(),
+            "a cancelled scan still produced a listing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

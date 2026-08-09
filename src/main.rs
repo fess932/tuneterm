@@ -248,7 +248,7 @@ fn scan_report(root: &Path) -> io::Result<()> {
         Some(folder) => (folder.label.clone(), folder.path.clone()),
         None => (root.display().to_string(), root.to_path_buf()),
     };
-    let tracks = library::scan_tracks_deep(&dir);
+    let tracks = library::scan_tracks_deep(&dir, &worker::Cancel::never());
     writeln!(out, "\ntracks under \"{label}\": {}", tracks.len())?;
     for track in tracks.iter().take(5) {
         writeln!(

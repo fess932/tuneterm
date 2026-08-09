@@ -8,6 +8,11 @@
 //! work. Each request carries a generation; a job is dropped both before and after
 //! the expensive part if a newer one has been asked for meanwhile. One thread
 //! exists no matter how fast the cursor moves.
+//!
+//! Those two checks bracket the work but cannot interrupt it, and the work here is
+//! long: reading the tags of a thousand files runs for seconds after the cursor has
+//! moved on, holding the one thread while the folder you are actually looking at
+//! waits. So a job is handed a [`Cancel`] and is expected to ask.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryIter};
@@ -16,6 +21,41 @@ use std::thread;
 
 /// The one pending request, and the condvar the thread waits on.
 type Slot<Req> = Arc<(Mutex<Option<(u64, Req)>>, Condvar)>;
+
+/// Handed to a running job so it can give up on work nobody wants any more.
+///
+/// Cheap enough to ask between files: one atomic load.
+#[derive(Clone)]
+pub struct Cancel {
+    generation: u64,
+    latest: Arc<AtomicU64>,
+}
+
+impl Cancel {
+    /// True once a newer request has arrived. Whatever the job returns after this
+    /// is discarded, so it may as well stop.
+    pub fn superseded(&self) -> bool {
+        self.generation < self.latest.load(Ordering::Acquire)
+    }
+
+    /// Never cancels. For callers that run the same work outside a worker, like
+    /// `--scan`.
+    pub fn never() -> Self {
+        Self {
+            generation: 0,
+            latest: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Always cancelled, for testing what a job does when it is asked to stop.
+    #[cfg(test)]
+    pub fn already() -> Self {
+        Self {
+            generation: 0,
+            latest: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
 
 pub struct Worker<Req, Out> {
     slot: Slot<Req>,
@@ -28,10 +68,11 @@ where
     Req: Send + 'static,
     Out: Send + 'static,
 {
-    /// Start the thread. `run` is called for each request that is still wanted.
+    /// Start the thread. `run` is called for each request that is still wanted, and
+    /// should consult its [`Cancel`] if it takes long enough to be worth abandoning.
     pub fn spawn<F>(name: &str, run: F) -> Self
     where
-        F: Fn(Req) -> Out + Send + 'static,
+        F: Fn(Req, &Cancel) -> Out + Send + 'static,
     {
         let slot = Arc::new((Mutex::new(None), Condvar::new()));
         let latest = Arc::new(AtomicU64::new(0));
@@ -57,7 +98,13 @@ where
                     continue;
                 }
 
-                let out = run(request);
+                let out = run(
+                    request,
+                    &Cancel {
+                        generation,
+                        latest: Arc::clone(&worker_latest),
+                    },
+                );
 
                 // Superseded while we were working; do not bother the caller.
                 if generation < worker_latest.load(Ordering::Acquire) {
@@ -119,7 +166,7 @@ mod tests {
 
     #[test]
     fn runs_a_request_and_returns_its_generation() {
-        let worker = Worker::spawn("test-run", |n: u32| n * 2);
+        let worker = Worker::spawn("test-run", |n: u32, _: &Cancel| n * 2);
         worker.request(1, 21);
         assert_eq!(wait_for(&worker, 1), Some(42));
     }
@@ -129,7 +176,7 @@ mod tests {
     fn a_burst_collapses_to_the_last_request() {
         let ran = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&ran);
-        let worker = Worker::spawn("test-burst", move |n: u32| {
+        let worker = Worker::spawn("test-burst", move |n: u32, _: &Cancel| {
             counter.fetch_add(1, Ordering::SeqCst);
             // Slow enough that the burst lands while the first job is running.
             thread::sleep(Duration::from_millis(40));
@@ -149,7 +196,7 @@ mod tests {
     /// Superseded work must not surface, or a stale result would overwrite a fresh one.
     #[test]
     fn stale_results_are_dropped() {
-        let worker = Worker::spawn("test-stale", |n: u32| {
+        let worker = Worker::spawn("test-stale", |n: u32, _: &Cancel| {
             thread::sleep(Duration::from_millis(20));
             n
         });
@@ -162,9 +209,45 @@ mod tests {
         }
     }
 
+    /// The slot cannot stop work already running, so a long job has to give up on
+    /// its own. Without this, a folder of a thousand files reads every tag before
+    /// the one you moved to gets the thread at all.
+    #[test]
+    fn a_running_job_can_give_up_when_it_is_superseded() {
+        const STEPS: usize = 200;
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&steps);
+        let worker = Worker::spawn("test-cancel", move |n: u32, cancel: &Cancel| {
+            for _ in 0..STEPS {
+                if cancel.superseded() {
+                    return 0;
+                }
+                // Only the job that gets cancelled is counted; the one that
+                // replaces it is expected to run all the way through.
+                if n == 1 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            n
+        });
+
+        worker.request(1, 1);
+        // Let it get properly under way before pulling the rug.
+        thread::sleep(Duration::from_millis(40));
+        worker.request(2, 2);
+
+        assert_eq!(wait_for(&worker, 2), Some(2), "the new request never ran");
+        let ran = steps.load(Ordering::SeqCst);
+        assert!(
+            ran < STEPS,
+            "the superseded job ran all {ran} steps instead of stopping"
+        );
+    }
+
     #[test]
     fn the_thread_exits_when_the_worker_is_dropped() {
-        let worker = Worker::spawn("test-drop", |n: u32| n);
+        let worker = Worker::spawn("test-drop", |n: u32, _: &Cancel| n);
         worker.request(1, 1);
         assert_eq!(wait_for(&worker, 1), Some(1));
         drop(worker); // the send in the thread now fails and it returns

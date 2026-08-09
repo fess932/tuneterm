@@ -37,5 +37,6 @@ core-foundation-sys = "0.8"
 windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",         # WNDCLASSW carries GDI handles
     "Win32_System_LibraryLoader", # GetModuleHandleW
+    "Win32_System_Threading",     # GetCurrentThreadId, for waking the pump
     "Win32_UI_WindowsAndMessaging",
 ] }
