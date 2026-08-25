@@ -119,7 +119,7 @@ not `Send`.
 | `Space` | play / pause |
 | `n` / `p` | next / previous track |
 | `[` / `]` | seek ∓5 s |
-| `+` / `-` | volume |
+| `+` / `-` | volume — remembered between runs |
 | `q`, `Esc`, `Ctrl-C` | quit |
 
 ### Mouse
@@ -201,7 +201,7 @@ is instant.
 | `src/worker.rs` | one thread with a replaceable request slot; used by both workers |
 | `src/cache.rs` | on-disk cover cache, content-keyed, 200 MB cap, oldest-first eviction |
 | `src/library.rs` | folder/track scanning, tags and cover extraction (`lofty`) |
-| `src/config.rs` | the user's feed list: `feeds.txt`, parsing and writing |
+| `src/config.rs` | `feeds.txt` and `settings.txt`, parsing and writing |
 | `src/feed.rs` | podcast RSS: episodes, durations, artwork |
 | `src/net.rs` | blocking HTTP, and a seekable reader over range requests |
 | `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
@@ -373,6 +373,15 @@ and fails if clearing blocks.
 Audio does not come back by itself when the device returns; that needs the sink to be
 reopened, which is still to do. But the interface stays alive and quittable.
 
+### Settings live next to the feeds
+
+`settings.txt` sits beside `feeds.txt` in the config directory, in the same
+`key = value` plain text, and holds what the app remembers about itself rather than
+what you curated — the volume, so far. It is written 400 ms after the last `+`/`-`
+so a held-down key does not put a file write behind every repeat, and again on the
+way out so the last nudge is never lost. A value that is not a finite number, or is
+out of range, falls back to the default rather than reaching rodio's amplifier.
+
 ### chafa is not required
 
 `ratatui-image`'s default features link the C library `chafa`, which only improves
@@ -388,7 +397,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 123 tests
+cargo test                                    # 135 tests
 cargo test -- --ignored --nocapture           # plus live network checks
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed

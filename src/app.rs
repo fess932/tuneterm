@@ -115,6 +115,12 @@ pub struct App {
     pub picker: Picker,
     pub audio: AudioPlayer,
 
+    /// Where the settings are written, held rather than looked up for the same
+    /// reason as `feeds_file`: tests must not touch the user's real file.
+    pub settings_file: Option<PathBuf>,
+    /// When the volume last moved, if it has not been written out yet.
+    settings_dirty: Option<Instant>,
+
     /// Written during render so mouse events can hit-test. `*_rows` cover only
     /// the data rows of each table — no border, no header — and `seek_bar` only
     /// the gauge itself, not the time label beside it.
@@ -206,6 +212,8 @@ impl App {
             cover: None,
             picker,
             audio: AudioPlayer::new(wake.clone())?,
+            settings_file: config::settings_path(),
+            settings_dirty: None,
             cover_size: None,
             cover_pending: false,
             cover_file: None,
@@ -249,6 +257,10 @@ impl App {
             status: String::new(),
             should_quit: false,
         };
+        // Pick up where the last run left off. Only the volume for now, and a
+        // missing or unreadable file simply means the defaults.
+        app.audio.set_volume(config::load_settings().volume);
+
         app.status = if app.folders.is_empty() && library::scan_tracks(&app.root).is_empty() {
             format!("no audio found under {}", app.root.display())
         } else {
@@ -703,6 +715,39 @@ impl App {
         }
     }
 
+    /// Move the volume and remember it. The write is deferred: a held-down `+`
+    /// would otherwise put a file write behind every key repeat.
+    pub fn nudge_volume(&mut self, delta: rodio::Float) {
+        self.audio.nudge_volume(delta);
+        self.settings_dirty = Some(Instant::now());
+    }
+
+    /// Write the settings out if they are owed and have settled.
+    ///
+    /// `force` skips the wait, for the way out: whatever the last keystroke was
+    /// must survive quitting even if it was a moment ago.
+    pub fn save_settings(&mut self, force: bool) {
+        /// Long enough that a key repeat writes once at the end of the burst.
+        const SETTLE: Duration = Duration::from_millis(400);
+
+        let Some(changed) = self.settings_dirty else {
+            return;
+        };
+        if !force && changed.elapsed() < SETTLE {
+            return;
+        }
+        self.settings_dirty = None;
+        let Some(path) = self.settings_file.clone() else {
+            return;
+        };
+        let settings = config::Settings {
+            volume: self.audio.volume(),
+        };
+        if let Err(err) = config::save_settings_to(&path, &settings) {
+            self.status = format!("could not save settings: {err}");
+        }
+    }
+
     /// Pick up a seek that failed. Seeks are answered on their own thread now, so
     /// the reason arrives after the fact rather than from `seek_to` itself.
     pub fn poll_seek(&mut self) {
@@ -777,6 +822,7 @@ impl App {
         {
             self.next_track();
         }
+        self.save_settings(false);
     }
 
     /// Move within the focused pane.
@@ -1780,6 +1826,49 @@ mod tests {
             at_end >= Duration::from_millis(1500),
             "should have clamped to the end, got {at_end:?}"
         );
+    }
+
+    /// A volume set in one run has to be there in the next one.
+    #[test]
+    fn the_volume_survives_a_restart() {
+        let lib = Library::new("volume-persist");
+        let mut app = lib.app();
+        let file = std::env::temp_dir().join(format!("tuneterm-vol-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        app.settings_file = Some(file.clone());
+
+        // Explicit rather than relative: `App::new` picks up whatever the machine
+        // running the tests already had saved.
+        app.audio.set_volume(0.8);
+        app.nudge_volume(-0.4);
+        let set = app.audio.volume();
+        assert!((set - 0.4).abs() < 1e-6, "the volume did not move: {set}");
+
+        // Nothing is written until it settles, so that a held-down key does not
+        // put a file write behind every repeat.
+        app.save_settings(false);
+        assert!(!file.exists(), "wrote before the volume had settled");
+
+        // Quitting cannot wait for that.
+        app.save_settings(true);
+        assert_eq!(config::load_settings_from(&file).volume, set);
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Nothing owed, nothing written — an app that never touched the volume must
+    /// not overwrite a settings file it did not read.
+    #[test]
+    fn an_untouched_volume_writes_nothing() {
+        let lib = Library::new("volume-quiet");
+        let mut app = lib.app();
+        let file =
+            std::env::temp_dir().join(format!("tuneterm-vol-quiet-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        app.settings_file = Some(file.clone());
+
+        app.save_settings(true);
+        assert!(!file.exists(), "wrote a file with nothing to say");
     }
 
     /// Seeking with nothing playing must be a no-op, not a panic.

@@ -133,8 +133,9 @@ KEYS
 ENVIRONMENT
     TUNETERM_CACHE_DIR   Cache root. Defaults to the platform cache directory,
                          with art capped at 200 MB and audio at 2000 MB.
-    TUNETERM_CONFIG_DIR  Where feeds.txt lives. Defaults to the platform
-                         config directory.
+    TUNETERM_CONFIG_DIR  Where feeds.txt and settings.txt live. Defaults to the
+                         platform config directory. The volume is remembered in
+                         settings.txt between runs.
     TUNETERM_QUERY=1     Ask the terminal which graphics protocol it supports
                          instead of guessing from the environment. More
                          accurate, but a terminal that never answers leaves the
@@ -389,6 +390,10 @@ fn tui_main(
 
     let result = run(&mut terminal, &mut app, &wakes, &events);
 
+    // The volume is written on a delay while the app runs; quitting is the one
+    // moment that cannot wait for it to settle.
+    app.save_settings(true);
+
     let _ = set_mouse(MOUSE_OFF);
     ratatui::restore();
     result
@@ -507,8 +512,8 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char(' ') => app.toggle_play(),
         KeyCode::Char('n') => app.next_track(),
         KeyCode::Char('p') => app.prev_track(),
-        KeyCode::Char('+') | KeyCode::Char('=') => app.audio.nudge_volume(0.05),
-        KeyCode::Char('-') => app.audio.nudge_volume(-0.05),
+        KeyCode::Char('+') | KeyCode::Char('=') => app.nudge_volume(0.05),
+        KeyCode::Char('-') => app.nudge_volume(-0.05),
         KeyCode::Char('a') if app.tab == app::Tab::Feeds => app.open_add_feed(),
         KeyCode::Char('d') if app.tab == app::Tab::Feeds => app.remove_selected_feed(),
         KeyCode::Char('1') => app.select_tab(app::Tab::Local),

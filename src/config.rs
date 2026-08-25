@@ -12,6 +12,9 @@
 //! Text rather than TOML or JSON for the same reason the cache paths are
 //! hand-rolled: no dependency, obvious in an editor, and a bad line costs one entry
 //! instead of the whole file.
+//!
+//! `settings.txt` sits beside it in the same shape, for what the app remembers
+//! about itself rather than what the user curated — the volume, so far.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,6 +54,80 @@ pub fn dir() -> Option<PathBuf> {
 
 pub fn feeds_path() -> Option<PathBuf> {
     Some(dir()?.join("feeds.txt"))
+}
+
+pub fn settings_path() -> Option<PathBuf> {
+    Some(dir()?.join("settings.txt"))
+}
+
+/// The knobs the app sets for itself, as opposed to the list the user curates.
+///
+/// Same plain-text `key = value` shape as the feeds, and for the same reasons.
+/// An unrecognised key is skipped rather than failing the file, so a settings
+/// file written by a newer build still loads here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    /// rodio's scale: 1.0 is the track untouched.
+    pub volume: f32,
+}
+
+/// Matches the ceiling `AudioPlayer` clamps to, so a hand-edited file cannot ask
+/// for more gain than the `+` key can.
+pub const MAX_VOLUME: f32 = 2.0;
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { volume: 1.0 }
+    }
+}
+
+/// Read the settings, falling back to the defaults when there is no file yet.
+pub fn load_settings() -> Settings {
+    settings_path()
+        .map(|path| load_settings_from(&path))
+        .unwrap_or_default()
+}
+
+pub fn load_settings_from(path: &Path) -> Settings {
+    fs::read_to_string(path)
+        .map(|text| parse_settings(&text))
+        .unwrap_or_default()
+}
+
+/// Write the settings to an explicit path. As with the feeds, the app holds the
+/// path rather than looking it up, so tests never touch the real file.
+pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let text = format!(
+        "# tuneterm settings — written by the app, safe to edit\nvolume = {:.3}\n",
+        settings.volume
+    );
+    fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_settings(text: &str) -> Settings {
+    let mut settings = Settings::default();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "volume" {
+            // A hand-edited file is not to be trusted: a NaN or a negative would
+            // otherwise reach rodio's amplifier and take the audio with it.
+            if let Ok(volume) = value.trim().parse::<f32>()
+                && volume.is_finite()
+            {
+                settings.volume = volume.clamp(0.0, MAX_VOLUME);
+            }
+        }
+    }
+    settings
 }
 
 /// Read the list, falling back to the default when there is no file yet.
@@ -213,6 +290,44 @@ mod tests {
     fn host_is_trimmed_for_display() {
         assert_eq!(host_of("https://www.example.com/a/b?c=1"), "example.com");
         assert_eq!(host_of("http://example.com"), "example.com");
+    }
+
+    #[test]
+    fn settings_default_when_there_is_no_file() {
+        let missing = std::env::temp_dir().join("tuneterm-no-such-settings.txt");
+        let _ = fs::remove_file(&missing);
+        assert_eq!(load_settings_from(&missing), Settings::default());
+        assert_eq!(Settings::default().volume, 1.0, "silence is not a default");
+    }
+
+    #[test]
+    fn settings_survive_a_round_trip() {
+        let dir = std::env::temp_dir().join(format!("tuneterm-set-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("settings.txt");
+
+        let settings = Settings { volume: 0.35 };
+        save_settings_to(&path, &settings).expect("save");
+        assert_eq!(load_settings_from(&path), settings);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The file is meant to be editable, so nothing in it can be trusted to be a
+    /// number, let alone a sane one.
+    #[test]
+    fn a_hand_edited_settings_file_cannot_produce_a_mad_volume() {
+        for (text, expected) in [
+            ("volume = 5\n", MAX_VOLUME),
+            ("volume = -3\n", 0.0),
+            ("volume = NaN\n", 1.0),
+            ("volume = loud\n", 1.0),
+            ("volume\n", 1.0),
+            ("# volume = 0.1\n", 1.0),
+            ("  volume   =   0.25  \n", 0.25),
+            ("shuffle = yes\nvolume = 0.5\n", 0.5),
+        ] {
+            assert_eq!(parse_settings(text).volume, expected, "{text:?}");
+        }
     }
 
     /// Round-tripping must not lose names, and must not invent them either.

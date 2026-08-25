@@ -172,9 +172,12 @@ impl AudioPlayer {
         self.player.volume()
     }
 
+    pub fn set_volume(&self, volume: rodio::Float) {
+        self.player.set_volume(volume.clamp(0.0, MAX_VOLUME));
+    }
+
     pub fn nudge_volume(&self, delta: rodio::Float) {
-        let v = (self.player.volume() + delta).clamp(0.0, 2.0);
-        self.player.set_volume(v);
+        self.set_volume(self.player.volume() + delta);
     }
 }
 
@@ -193,6 +196,10 @@ fn clear_without_waiting(player: &rodio::Player) {
     }
     player.pause();
 }
+
+/// The ceiling on gain. Shared with the settings file so a hand-edited one cannot
+/// ask for more than the `+` key can.
+const MAX_VOLUME: rodio::Float = crate::config::MAX_VOLUME;
 
 #[cfg(test)]
 mod real_file_check {
