@@ -14,10 +14,12 @@
 //! instead of the whole file.
 //!
 //! `settings.txt` sits beside it in the same shape, for what the app remembers
-//! about itself rather than what the user curated — the volume, so far.
+//! about itself rather than what the user curated: the volume, and enough of the
+//! last session to put you back where you left off.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Shipped so the tab is not empty on a first run — and it is the feed that
 /// prompted all of this.
@@ -64,20 +66,71 @@ pub fn settings_path() -> Option<PathBuf> {
 ///
 /// Same plain-text `key = value` shape as the feeds, and for the same reasons.
 /// An unrecognised key is skipped rather than failing the file, so a settings
-/// file written by a newer build still loads here.
-#[derive(Debug, Clone, PartialEq)]
+/// file written by a newer build still loads here, and so does one written before
+/// any of the session keys existed — every one of them is optional.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Settings {
-    /// rodio's scale: 1.0 is the track untouched.
-    pub volume: f32,
+    pub volume: Volume,
+    pub shuffle: bool,
+    /// The session, in as much detail as it can be put back: which source was
+    /// showing, where in it you were, and what was playing.
+    pub session: Session,
 }
+
+/// Where the app was when it was last closed.
+///
+/// Everything is optional and everything is a hint: a folder can be deleted and a
+/// feed can be removed between runs, so nothing here may be trusted to still
+/// exist. The restoring end checks; this end only records.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Session {
+    /// Which source tab was showing: `local`, `feeds` or `radio`.
+    pub tab: Option<String>,
+    /// The folder the left pane was listing.
+    pub folder: Option<PathBuf>,
+    /// The row highlighted in it, whose tracks the right pane was showing. Often
+    /// a subfolder of `folder`, and `folder` itself when it has no subfolders.
+    pub selected: Option<PathBuf>,
+    /// URL of the feed that was selected on the Feeds tab.
+    pub feed: Option<String>,
+    /// What was playing, identified the way a `Track` is: a path, or a URL for a
+    /// stream.
+    pub track: Option<String>,
+    /// How far into it.
+    pub position: Duration,
+}
+
+/// rodio's scale, kept in range by construction: 1.0 is the track untouched.
+///
+/// A newtype because this value is read from a file anyone can edit and then
+/// handed straight to an amplifier, and "did this one get validated?" is not a
+/// question worth asking at each of the places it passes through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Volume(f32);
 
 /// Matches the ceiling `AudioPlayer` clamps to, so a hand-edited file cannot ask
 /// for more gain than the `+` key can.
 pub const MAX_VOLUME: f32 = 2.0;
 
-impl Default for Settings {
+impl Volume {
+    /// Anything that is not a usable number becomes the default rather than
+    /// silence: a broken settings file should not look like broken audio.
+    pub fn new(value: f32) -> Self {
+        if value.is_finite() {
+            Self(value.clamp(0.0, MAX_VOLUME))
+        } else {
+            Self::default()
+        }
+    }
+
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for Volume {
     fn default() -> Self {
-        Self { volume: 1.0 }
+        Self(1.0)
     }
 }
 
@@ -100,11 +153,42 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    let text = format!(
-        "# tuneterm settings — written by the app, safe to edit\nvolume = {:.3}\n",
-        settings.volume
-    );
+    let mut text = String::from("# tuneterm settings — written by the app, safe to edit\n");
+    text.push_str(&format!("volume = {:.3}\n", settings.volume.get()));
+    text.push_str(&format!("shuffle = {}\n", u8::from(settings.shuffle)));
+
+    let session = &settings.session;
+    text.push_str("\n# where the last session left off\n");
+    for (key, value) in [
+        ("tab", session.tab.clone()),
+        ("folder", path_value(session.folder.as_deref())),
+        ("selected", path_value(session.selected.as_deref())),
+        ("feed", session.feed.clone()),
+        ("track", session.track.clone()),
+    ] {
+        // An absent value is left out rather than written empty: the file is meant
+        // to be read by a person, and a column of bare `=` says nothing.
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            text.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+    if session.position > Duration::ZERO {
+        text.push_str(&format!(
+            "position = {:.1}\n",
+            session.position.as_secs_f64()
+        ));
+    }
+
     fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A path as it goes into the file.
+///
+/// Lossy, so a path that is not valid UTF-8 is written mangled and simply fails to
+/// match anything on the way back in — which is the same outcome as a folder that
+/// has been deleted, and is already handled.
+fn path_value(path: Option<&Path>) -> Option<String> {
+    Some(path?.to_string_lossy().into_owned())
 }
 
 fn parse_settings(text: &str) -> Settings {
@@ -114,17 +198,38 @@ fn parse_settings(text: &str) -> Settings {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
     {
+        // Only the first `=` splits: a path or a URL may well contain more.
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() == "volume" {
+        let value = value.trim();
+        // An empty value means "not set", which is what a default already says.
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
             // A hand-edited file is not to be trusted: a NaN or a negative would
             // otherwise reach rodio's amplifier and take the audio with it.
-            if let Ok(volume) = value.trim().parse::<f32>()
-                && volume.is_finite()
-            {
-                settings.volume = volume.clamp(0.0, MAX_VOLUME);
+            "volume" => {
+                if let Ok(volume) = value.parse::<f32>() {
+                    settings.volume = Volume::new(volume);
+                }
             }
+            "shuffle" => settings.shuffle = matches!(value, "1" | "true" | "yes" | "on"),
+            "tab" => settings.session.tab = Some(value.to_ascii_lowercase()),
+            "folder" => settings.session.folder = Some(PathBuf::from(value)),
+            "selected" => settings.session.selected = Some(PathBuf::from(value)),
+            "feed" => settings.session.feed = Some(value.to_string()),
+            "track" => settings.session.track = Some(value.to_string()),
+            "position" => {
+                if let Ok(secs) = value.parse::<f64>()
+                    && secs.is_finite()
+                    && secs >= 0.0
+                {
+                    settings.session.position = Duration::from_secs_f64(secs);
+                }
+            }
+            _ => {}
         }
     }
     settings
@@ -297,7 +402,49 @@ mod tests {
         let missing = std::env::temp_dir().join("tuneterm-no-such-settings.txt");
         let _ = fs::remove_file(&missing);
         assert_eq!(load_settings_from(&missing), Settings::default());
-        assert_eq!(Settings::default().volume, 1.0, "silence is not a default");
+        let fresh = Settings::default();
+        assert_eq!(fresh.volume.get(), 1.0, "silence is not a default");
+        assert!(!fresh.shuffle);
+        assert_eq!(fresh.session, Session::default());
+    }
+
+    fn a_session() -> Settings {
+        Settings {
+            volume: Volume::new(0.35),
+            shuffle: true,
+            session: Session {
+                tab: Some("feeds".into()),
+                folder: Some(PathBuf::from("/music/Deep Purple")),
+                selected: Some(PathBuf::from("/music/Deep Purple/=1")),
+                feed: Some("https://example.com/feed?format=rss&id=7".into()),
+                track: Some("https://example.com/ep 12.mp3".into()),
+                position: Duration::from_secs_f64(93.4),
+            },
+        }
+    }
+
+    /// What the file actually looks like. It is meant to be opened in an editor,
+    /// so its shape is part of the contract, not an implementation detail.
+    #[test]
+    fn the_written_file_is_readable() {
+        let dir = std::env::temp_dir().join(format!("tuneterm-set-shape-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("settings.txt");
+        save_settings_to(&path, &a_session()).expect("save");
+
+        let text = fs::read_to_string(&path).expect("read");
+        for line in [
+            "volume = 0.350",
+            "shuffle = 1",
+            "tab = feeds",
+            "folder = /music/Deep Purple",
+            "selected = /music/Deep Purple/=1",
+            "track = https://example.com/ep 12.mp3",
+            "position = 93.4",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -306,9 +453,45 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("settings.txt");
 
-        let settings = Settings { volume: 0.35 };
+        let settings = a_session();
         save_settings_to(&path, &settings).expect("save");
         assert_eq!(load_settings_from(&path), settings);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A path or a URL may contain `=`, and both are written unquoted.
+    #[test]
+    fn a_value_containing_an_equals_sign_survives() {
+        let parsed = parse_settings(
+            "selected = /music/Deep Purple/=1\nfeed = https://example.com/f?format=rss\n",
+        );
+        assert_eq!(
+            parsed.session.selected,
+            Some(PathBuf::from("/music/Deep Purple/=1"))
+        );
+        assert_eq!(
+            parsed.session.feed.as_deref(),
+            Some("https://example.com/f?format=rss")
+        );
+    }
+
+    /// Nothing set is written out, so the file stays readable and a missing key
+    /// keeps meaning "no opinion" rather than "empty".
+    #[test]
+    fn an_empty_session_writes_no_session_keys() {
+        let dir = std::env::temp_dir().join(format!("tuneterm-set-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("settings.txt");
+
+        save_settings_to(&path, &Settings::default()).expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        for absent in ["tab", "folder", "selected", "feed", "track", "position"] {
+            assert!(
+                !text.contains(&format!("{absent} =")),
+                "{absent} was written"
+            );
+        }
+        assert_eq!(load_settings_from(&path), Settings::default());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -320,13 +503,50 @@ mod tests {
             ("volume = 5\n", MAX_VOLUME),
             ("volume = -3\n", 0.0),
             ("volume = NaN\n", 1.0),
+            ("volume = inf\n", 1.0),
             ("volume = loud\n", 1.0),
             ("volume\n", 1.0),
+            ("volume =\n", 1.0),
             ("# volume = 0.1\n", 1.0),
             ("  volume   =   0.25  \n", 0.25),
-            ("shuffle = yes\nvolume = 0.5\n", 0.5),
+            ("nonsense = yes\nvolume = 0.5\n", 0.5),
         ] {
-            assert_eq!(parse_settings(text).volume, expected, "{text:?}");
+            assert_eq!(parse_settings(text).volume.get(), expected, "{text:?}");
+        }
+    }
+
+    /// Same for the rest of it: a negative or unparsable position must not come
+    /// back as a seek to somewhere impossible.
+    #[test]
+    fn a_hand_edited_position_falls_back_to_the_start() {
+        for text in [
+            "position = -5\n",
+            "position = NaN\n",
+            "position = soon\n",
+            "position =\n",
+        ] {
+            assert_eq!(
+                parse_settings(text).session.position,
+                Duration::ZERO,
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            parse_settings("position = 12.5\n").session.position,
+            Duration::from_secs_f64(12.5)
+        );
+    }
+
+    #[test]
+    fn shuffle_accepts_the_ways_a_person_would_write_it() {
+        for on in ["1", "true", "yes", "on"] {
+            assert!(parse_settings(&format!("shuffle = {on}\n")).shuffle, "{on}");
+        }
+        for off in ["0", "false", "no", "off", "maybe"] {
+            assert!(
+                !parse_settings(&format!("shuffle = {off}\n")).shuffle,
+                "{off}"
+            );
         }
     }
 

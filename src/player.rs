@@ -114,6 +114,13 @@ impl AudioPlayer {
         }
     }
 
+    /// Hold, without touching the queue. Used to bring a restored track back
+    /// stopped where it was rather than playing: launching an app should not make
+    /// noise on its own.
+    pub fn pause(&self) {
+        self.player.pause();
+    }
+
     pub fn stop(&self) {
         clear_without_waiting(&self.player);
     }
@@ -155,8 +162,11 @@ impl AudioPlayer {
     /// on the playhead right after moving it; nothing in the app may wait like this.
     #[cfg(test)]
     pub fn wait_for_seek(&self) -> Option<String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let wanted = self.seek_generation.load(Ordering::Relaxed);
+        if wanted == 0 {
+            return None; // nothing was ever asked for, so nothing is owed
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             for (generation, result) in self.seek.drain() {
                 if generation >= wanted {

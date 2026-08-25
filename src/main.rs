@@ -101,6 +101,11 @@ OPTIONS
     -h, --help        Print this help.
     -V, --version     Print the version.
 
+SESSION
+    Closing and reopening puts you back: the same source tab, the same folder or
+    feed, and the track you were on, paused where you left it. Give a different
+    folder on the command line and only the volume and shuffle carry over.
+
 SOURCES
     Tabs in the top border of the browsing pane. Click one or press 1 - 3;
     switching never stops playback.
@@ -135,8 +140,8 @@ ENVIRONMENT
     TUNETERM_CACHE_DIR   Cache root. Defaults to the platform cache directory,
                          with art capped at 200 MB and audio at 2000 MB.
     TUNETERM_CONFIG_DIR  Where feeds.txt and settings.txt live. Defaults to the
-                         platform config directory. The volume is remembered in
-                         settings.txt between runs.
+                         platform config directory. settings.txt remembers the
+                         volume, shuffle, and where the last session left off.
     TUNETERM_QUERY=1     Ask the terminal which graphics protocol it supports
                          instead of guessing from the environment. More
                          accurate, but a terminal that never answers leaves the
@@ -380,6 +385,8 @@ fn tui_main(
     wakes: Receiver<()>,
 ) -> Result<()> {
     let mut app = App::new(root, picker, bridge, wake.clone())?;
+    // Before the status line is set from the warning, so a warning still wins.
+    app.restore(config::load_settings());
     if let Some(warning) = media_warning {
         app.status = warning;
     }

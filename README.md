@@ -203,7 +203,7 @@ is instant.
 | `src/worker.rs` | one thread with a replaceable request slot; used by both workers |
 | `src/cache.rs` | on-disk cover cache, content-keyed, 200 MB cap, oldest-first eviction |
 | `src/library.rs` | folder/track scanning, tags and cover extraction (`lofty`) |
-| `src/config.rs` | `feeds.txt` and `settings.txt`, parsing and writing |
+| `src/config.rs` | `feeds.txt` and `settings.txt`: the feed list and the session |
 | `src/feed.rs` | podcast RSS: episodes, durations, artwork |
 | `src/net.rs` | blocking HTTP, and a seekable reader over range requests |
 | `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
@@ -379,10 +379,57 @@ reopened, which is still to do. But the interface stays alive and quittable.
 
 `settings.txt` sits beside `feeds.txt` in the config directory, in the same
 `key = value` plain text, and holds what the app remembers about itself rather than
-what you curated — the volume, so far. It is written 400 ms after the last `+`/`-`
-so a held-down key does not put a file write behind every repeat, and again on the
-way out so the last nudge is never lost. A value that is not a finite number, or is
-out of range, falls back to the default rather than reaching rodio's amplifier.
+what you curated: the volume, shuffle, and the session.
+
+```text
+volume = 0.750
+shuffle = 1
+
+# where the last session left off
+tab = feeds
+folder = /Users/me/Music/Deep Purple
+selected = /Users/me/Music/Deep Purple/=1
+track = https://datashat.net/music_for_programming_78-datassette.mp3
+position = 612.4
+```
+
+It is written 400 ms after whatever changed — a held-down `+` would otherwise put
+a file write behind every key repeat — and again on the way out, which is also
+where the playhead is read from. The position is deliberately *not* tracked as it
+moves: marking it dirty every second would mean writing the file every second, and
+the only moment its exact value matters is the one where you quit.
+
+An app that changed nothing writes nothing, rather than overwriting a file it only
+read. A value that is not a finite number, or is out of range, falls back to the
+default rather than reaching rodio's amplifier — the file is meant to be edited,
+so nothing in it is trusted.
+
+### Reopening puts you back where you were
+
+Every key in the session block is a hint from a file that may be older than the
+library it describes, so each is checked rather than believed:
+
+| Remembered | If it has changed |
+| --- | --- |
+| the source tab | — |
+| the folder, and the row highlighted in it | walks down as far as still exists |
+| a folder from some other library | ignored; the root on the command line wins |
+| the selected feed | cursor stays where it was |
+| the track and its position | ignored unless the first listing contains it |
+| a position past the end of the track | starts it again |
+
+The folder is restored by walking back down from the root rather than by assigning
+`cwd`, so the trail is rebuilt and `Backspace` still climbs out one level at a time.
+
+A restored track comes back **paused**. Launching an app should not make noise on
+its own, and rodio answers a seek from the same periodic callback whether it is
+paused or not, so holding it costs nothing.
+
+The resume is spent by the first listing to arrive, found or not. Keeping it alive
+would mean that browsing into that folder an hour later would suddenly start
+playing by itself — which is why the tab decides which list is filled at startup:
+a listing from the tab you are *not* on would otherwise be first, and would spend
+the resume on itself.
 
 ### chafa is not required
 
@@ -399,7 +446,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 135 tests
+cargo test                                    # 149 tests
 cargo test -- --ignored --nocapture           # plus live network checks
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed

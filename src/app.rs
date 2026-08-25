@@ -33,6 +33,20 @@ pub enum Tab {
 impl Tab {
     pub const ALL: [Tab; 3] = [Tab::Local, Tab::Feeds, Tab::Radio];
 
+    /// How the tab is written in `settings.txt`. Not the label: that is on screen
+    /// and can be reworded, while this is on disk and has to keep meaning the same.
+    pub fn key(self) -> &'static str {
+        match self {
+            Tab::Local => "local",
+            Tab::Feeds => "feeds",
+            Tab::Radio => "radio",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Tab::ALL.into_iter().find(|tab| tab.key() == key)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Tab::Local => "Local",
@@ -129,8 +143,15 @@ pub struct App {
     /// Where the settings are written, held rather than looked up for the same
     /// reason as `feeds_file`: tests must not touch the user's real file.
     pub settings_file: Option<PathBuf>,
-    /// When the volume last moved, if it has not been written out yet.
+    /// When the session last changed, if it has not been written out yet.
     settings_dirty: Option<Instant>,
+    /// The track the last session was on, until the first listing has had a chance
+    /// to contain it. One shot: see [`App::try_resume`].
+    resume: Option<Resume>,
+    /// Where to put the playhead once that track is actually queued, which for a
+    /// stream is several seconds after we ask for it — and which track that is,
+    /// since by then it may not be the one still wanted.
+    resume_at: Option<(String, Duration)>,
 
     /// Written during render so mouse events can hit-test. `*_rows` cover only
     /// the data rows of each table — no border, no header — and `seek_bar` only
@@ -187,6 +208,14 @@ pub struct Prompt {
     pub input: String,
     /// Shown under the field: usage, or why the last attempt was refused.
     pub hint: String,
+}
+
+/// What was playing when the app was last closed, waiting for a listing to appear
+/// that contains it.
+struct Resume {
+    /// Identity of the track, the way `Track` carries it: a path, or a URL.
+    track: String,
+    position: Duration,
 }
 
 /// Two clicks on the same row within this window count as a double click.
@@ -264,6 +293,8 @@ impl App {
             rng: Rng::new(),
             settings_file: config::settings_path(),
             settings_dirty: None,
+            resume: None,
+            resume_at: None,
             cover_size: None,
             cover_pending: false,
             cover_file: None,
@@ -308,17 +339,172 @@ impl App {
             status: String::new(),
             should_quit: false,
         };
-        // Pick up where the last run left off. Only the volume for now, and a
-        // missing or unreadable file simply means the defaults.
-        app.audio.set_volume(config::load_settings().volume);
-
         app.status = if app.folders.is_empty() && library::scan_tracks(&app.root).is_empty() {
             format!("no audio found under {}", app.root.display())
         } else {
             format!("{} folders", app.folders.len())
         };
+
         app.reload_tracks();
         Ok(app)
+    }
+
+    /// Put the app back where the last session left it.
+    ///
+    /// A step the caller takes rather than something `new` does for itself, so that
+    /// building an App never depends on what is in the user's config directory —
+    /// which is what the tests need, and is honest besides: restoring is a choice.
+    ///
+    /// Everything here is a hint from a file that may be older than the library it
+    /// describes: a folder can be deleted, a feed removed, a track renamed. So each
+    /// step checks, and anything that no longer holds is dropped rather than
+    /// reported — a first run and a stale line should both just start normally.
+    pub fn restore(&mut self, settings: config::Settings) {
+        self.audio.set_volume(settings.volume.get());
+        self.shuffle = settings.shuffle;
+
+        let session = settings.session;
+        if let Some(folder) = session.folder.as_deref() {
+            self.restore_folder(folder, session.selected.as_deref());
+        }
+        if let Some(url) = session.feed.as_deref()
+            && let Some(index) = self.feeds.iter().position(|feed| feed.url == url)
+        {
+            self.feed_state.select(Some(index));
+        }
+        if let Some(tab) = session.tab.as_deref().and_then(Tab::from_key) {
+            self.tab = tab;
+        }
+        // Held until a listing turns up that contains it; see `try_resume`.
+        self.resume = session.track.map(|track| Resume {
+            track,
+            position: session.position,
+        });
+
+        // Whichever tab we landed on fills its own list — and only that one, or a
+        // listing from the tab we are *not* on would be the first to arrive and
+        // would spend the resume on itself.
+        match self.tab {
+            Tab::Local => self.reload_tracks(),
+            Tab::Feeds => self.reload_feed(),
+            Tab::Radio => {}
+        }
+        // Reloading is skipped when the listing wanted is the one already on
+        // screen, and Radio has no listing at all. Both leave nothing that would
+        // call `show_tracks`, and a resume that is never spent is one that goes
+        // off later, when browsing happens to walk past its track.
+        if !self.tracks_loading && !self.feed_loading {
+            self.try_resume();
+        }
+    }
+
+    /// Walk back down to `folder`, rebuilding the trail as if it had been browsed
+    /// to, so that Backspace still climbs out of it one level at a time.
+    ///
+    /// `selected` is the row that was highlighted there, which is what decides the
+    /// track listing — often a subfolder, and the folder itself when it has none.
+    fn restore_folder(&mut self, folder: &Path, selected: Option<&Path>) {
+        // Only ever inside the root: the folder on the command line decides what
+        // this run is browsing, and a remembered path from a different library has
+        // no business overriding it.
+        let Ok(rest) = folder.strip_prefix(&self.root) else {
+            return;
+        };
+
+        let mut cwd = self.root.clone();
+        let mut trail = Vec::new();
+        for part in rest.components() {
+            let next = cwd.join(part);
+            let Some(row) = library::list_subdirs(&cwd)
+                .iter()
+                .position(|sub| sub.path == next)
+            else {
+                // A folder that is no longer listed — deleted, or emptied of audio.
+                // Stop at the deepest point that still exists.
+                break;
+            };
+            // The row, not the index: every level below the root carries a `..`.
+            trail.push((cwd.clone(), row + usize::from(!trail.is_empty())));
+            cwd = next;
+        }
+
+        self.cwd = cwd;
+        self.trail = trail;
+        self.folders = library::list_subdirs(&self.cwd);
+        self.folder_state = TableState::default();
+
+        // Land on the folder that was highlighted, and on the first real row when
+        // it has gone.
+        let row = selected
+            .and_then(|selected| self.folders.iter().position(|sub| sub.path == selected))
+            .map(|index| index + usize::from(self.shows_up_row()))
+            .unwrap_or_else(|| usize::from(self.shows_up_row()));
+        if self.folder_row_count() > 0 {
+            self.folder_state
+                .select(Some(row.min(self.folder_row_count() - 1)));
+        }
+    }
+
+    /// Start the remembered track, if this listing is the one that holds it.
+    ///
+    /// One shot either way: whether or not it was found, the first listing to
+    /// arrive spends it. Keeping it alive would mean that browsing into that
+    /// folder an hour later would suddenly start playing on its own.
+    fn try_resume(&mut self) {
+        let Some(resume) = self.resume.take() else {
+            return;
+        };
+        let Some(index) = self
+            .tracks
+            .iter()
+            .position(|track| track.path.to_string_lossy() == resume.track)
+        else {
+            return;
+        };
+
+        // Past the end of a track that has been re-encoded shorter, or simply
+        // finished last time: start it again rather than at a point that is not
+        // there any more.
+        let duration = self.tracks[index].duration;
+        let at = match duration {
+            Some(total) if resume.position >= total => Duration::ZERO,
+            _ => resume.position,
+        };
+
+        self.resume_at = Some((resume.track, at));
+        self.play_index(index);
+        self.track_state.select(Some(index));
+    }
+
+    /// Put the playhead where the restored track left off, and hold it there.
+    ///
+    /// Called once the source is actually queued, which for a local file is at
+    /// once and for a stream is whenever the server gets round to it. Pausing
+    /// first: rodio answers a seek from the same periodic callback whether it is
+    /// paused or not, so this costs nothing and keeps the app from making noise
+    /// on its own at launch.
+    fn apply_resume_position(&mut self) {
+        let Some((_, at)) = self.resume_at.take() else {
+            return;
+        };
+        self.audio.pause();
+        if at > Duration::ZERO {
+            self.audio.seek(at);
+        }
+        let title = self
+            .now_playing()
+            .map(|track| track.title.clone())
+            .unwrap_or_default();
+        self.status = format!("{title} — paused at {}", library::fmt_duration(at));
+    }
+
+    /// Note that the session has moved on and is owed a write.
+    ///
+    /// Deliberately not called as the playhead advances: the position is picked up
+    /// by whatever write the rest of the session earns, and by the forced one on
+    /// the way out. Marking it every second would be a file write every second.
+    fn touch_settings(&mut self) {
+        self.settings_dirty = Some(Instant::now());
     }
 
     /// True when row 0 of the folder pane is the `..` entry.
@@ -429,6 +615,7 @@ impl App {
         if !self.tracks.is_empty() {
             self.track_state.select(Some(0));
         }
+        self.try_resume();
     }
 
     /// Bounded so browsing a large tree cannot grow without limit.
@@ -483,6 +670,7 @@ impl App {
         self.trail
             .push((self.cwd.clone(), self.folder_state.selected().unwrap_or(0)));
         self.cwd = target;
+        self.touch_settings();
         self.folders = subdirs;
         self.folder_state = TableState::default();
         // Land on the first real folder, not on `..`.
@@ -497,6 +685,7 @@ impl App {
             return;
         };
         self.cwd = parent;
+        self.touch_settings();
         self.folders = library::list_subdirs(&self.cwd);
         self.folder_state = TableState::default();
         let rows = self.folder_row_count();
@@ -554,6 +743,16 @@ impl App {
             return;
         };
         let path = track.path.clone();
+        // A restored position belongs to one track. Starting any other one means
+        // the session has moved on — while a stream was opening, most likely —
+        // and the playhead must not be dragged into wherever it lands next.
+        if self
+            .resume_at
+            .as_ref()
+            .is_some_and(|(wanted, _)| wanted.as_str() != path.to_string_lossy())
+        {
+            self.resume_at = None;
+        }
         let art_url = track.art_url.clone();
         let title = track.title.clone();
 
@@ -565,6 +764,8 @@ impl App {
                     self.queue_pos = Some(idx);
                     self.status = format!("playing {title}");
                     self.request_cover(&path, art_url);
+                    self.apply_resume_position();
+                    self.touch_settings();
                 }
                 Err(err) => self.status = format!("error: {err:#}"),
             }
@@ -581,6 +782,7 @@ impl App {
         self.open.request(self.open_generation, url);
         self.status = format!("opening {title}");
         self.request_cover(&path, art_url);
+        self.touch_settings();
     }
 
     /// True while a stream is being opened, so nothing takes the silence for the
@@ -615,9 +817,11 @@ impl App {
                     .map(|track| track.title.clone())
                     .unwrap_or_default();
                 self.status = format!("playing {title}");
+                self.apply_resume_position();
             }
             Err(err) => {
                 self.queue_pos = None;
+                self.resume_at = None;
                 self.status = format!("error: {err}");
             }
         }
@@ -747,6 +951,7 @@ impl App {
         self.audio.stop();
         self.opening = None;
         self.queue_pos = None;
+        self.resume_at = None;
     }
 
     pub fn next_track(&mut self) {
@@ -777,6 +982,7 @@ impl App {
     /// playing — it is the order that changes, not what you are listening to.
     pub fn toggle_shuffle(&mut self) {
         self.shuffle = !self.shuffle;
+        self.touch_settings();
         if self.shuffle {
             self.reshuffle_from(self.queue_pos);
             self.status = "shuffle on".into();
@@ -825,7 +1031,7 @@ impl App {
     /// would otherwise put a file write behind every key repeat.
     pub fn nudge_volume(&mut self, delta: rodio::Float) {
         self.audio.nudge_volume(delta);
-        self.settings_dirty = Some(Instant::now());
+        self.touch_settings();
     }
 
     /// Write the settings out if they are owed and have settled.
@@ -847,7 +1053,20 @@ impl App {
             return;
         };
         let settings = config::Settings {
-            volume: self.audio.volume(),
+            volume: config::Volume::new(self.audio.volume()),
+            shuffle: self.shuffle,
+            session: config::Session {
+                tab: Some(self.tab.key().to_string()),
+                folder: Some(self.cwd.clone()),
+                selected: Some(self.listing_dir()),
+                feed: self.selected_feed().map(|feed| feed.url.clone()),
+                track: self
+                    .now_playing()
+                    .map(|track| track.path.to_string_lossy().into_owned()),
+                // Read here rather than tracked as it moves: the playhead changes
+                // every frame, and a write is owed for the session, not the second.
+                position: self.audio.position(),
+            },
         };
         if let Err(err) = config::save_settings_to(&path, &settings) {
             self.status = format!("could not save settings: {err}");
@@ -966,6 +1185,7 @@ impl App {
             return;
         }
         self.tab = tab;
+        self.touch_settings();
         // Each tab owns the track list, so entering one has to refill it.
         match tab {
             Tab::Local => {
@@ -995,6 +1215,7 @@ impl App {
             return;
         }
         self.fetched_url = Some(url.clone());
+        self.touch_settings();
         self.tracks.clear();
         self.feed_loading = true;
         self.fetch_generation += 1;
@@ -1346,6 +1567,7 @@ impl App {
             return;
         }
         self.folder_state.select(Some(row));
+        self.touch_settings();
         self.reload_tracks();
     }
 }
@@ -1426,6 +1648,16 @@ mod tests {
     /// Rows as the renderer would report them: 10 wide, starting at y = 1.
     fn rows(x: u16, y: u16, height: u16) -> Rect {
         Rect::new(x, y, 10, height)
+    }
+
+    /// The pane row of the folder called `name`, `..` accounted for.
+    fn folder_row(app: &App, name: &str) -> usize {
+        let index = app
+            .folders
+            .iter()
+            .position(|folder| folder.label == name)
+            .unwrap_or_else(|| panic!("no folder called {name}"));
+        index + usize::from(app.shows_up_row())
     }
 
     /// Seeks are answered on another thread now, so a test that asserts on where
@@ -1961,8 +2193,233 @@ mod tests {
 
         // Quitting cannot wait for that.
         app.save_settings(true);
-        assert_eq!(config::load_settings_from(&file).volume, set);
+        assert_eq!(config::load_settings_from(&file).volume.get(), set);
 
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The whole point: quit deep in a library, on a track, and come back to it.
+    #[test]
+    fn a_session_is_saved_and_put_back() {
+        let lib = Library::new("session-round-trip");
+        let file = std::env::temp_dir().join(format!("tuneterm-sess-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+
+        // Browse into Artist, land on one of its albums, and play a track.
+        let mut before = lib.app();
+        before.settings_file = Some(file.clone());
+        before.select_folder(folder_row(&before, "Artist"));
+        before.wait_for_tracks();
+        before.enter_folder();
+        before.wait_for_tracks();
+        let cwd = before.cwd.clone();
+        let listing = before.listing_dir();
+        assert_eq!(cwd, lib.0.join("Artist"), "did not descend");
+
+        before.play_index(0);
+        let track = before.now_playing().expect("playing").path.clone();
+        before.seek_to(0.5);
+        assert_eq!(before.audio.wait_for_seek(), None);
+        let at = before.audio.position();
+        before.save_settings(true);
+
+        // A fresh app is at the root and playing nothing until it restores.
+        let mut after = lib.app();
+        assert_eq!(after.cwd, lib.0);
+        assert!(!after.is_playing_something());
+
+        after.restore(config::load_settings_from(&file));
+        after.wait_for_tracks();
+
+        assert_eq!(after.cwd, cwd, "did not come back to the folder");
+        assert_eq!(after.listing_dir(), listing, "lost the highlighted row");
+        assert!(
+            after.can_leave(),
+            "the trail was not rebuilt, Backspace is dead"
+        );
+        assert_eq!(
+            after.now_playing().map(|t| t.path.clone()),
+            Some(track),
+            "the track did not come back: {}",
+            after.status
+        );
+        assert!(
+            after.audio.is_paused(),
+            "a restored track must not start itself"
+        );
+        assert_eq!(after.audio.wait_for_seek(), None);
+        let back = after.audio.position();
+        assert!(
+            back.abs_diff(at) < Duration::from_millis(400),
+            "resumed at {back:?}, left at {at:?}"
+        );
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A remembered path from some other library must not override the folder this
+    /// run was actually pointed at.
+    #[test]
+    fn a_folder_outside_the_root_is_ignored() {
+        let lib = Library::new("session-foreign");
+        let mut app = lib.app();
+        app.restore(config::Settings {
+            session: config::Session {
+                folder: Some(PathBuf::from("/somewhere/else")),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(app.cwd, lib.0, "walked out of the root");
+        assert!(!app.can_leave());
+    }
+
+    /// Libraries change between runs. A folder that has gone stops the walk at the
+    /// deepest point that is still there rather than failing the whole restore.
+    #[test]
+    fn a_deleted_folder_restores_as_far_as_it_can() {
+        let lib = Library::new("session-deleted");
+        let mut app = lib.app();
+        app.restore(config::Settings {
+            session: config::Session {
+                folder: Some(lib.0.join("Artist").join("Gone")),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(app.cwd, lib.0.join("Artist"), "{}", app.status);
+    }
+
+    /// Which source was showing comes back, and the feed that was picked with it.
+    #[test]
+    fn the_tab_and_feed_come_back() {
+        let lib = Library::new("session-tab");
+        let mut app = lib.app();
+        app.feeds = vec![
+            Feed {
+                name: "first".into(),
+                url: "https://example.com/a.xml".into(),
+            },
+            Feed {
+                name: "second".into(),
+                url: TEST_FEED.into(),
+            },
+        ];
+        app.restore(config::Settings {
+            session: config::Session {
+                tab: Some("feeds".into()),
+                feed: Some(TEST_FEED.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(app.tab, Tab::Feeds);
+        assert_eq!(app.selected_feed().map(|f| f.url.as_str()), Some(TEST_FEED));
+    }
+
+    /// A feed that was removed from feeds.txt between runs leaves the cursor where
+    /// it was rather than pointing at nothing.
+    #[test]
+    fn a_feed_that_is_gone_leaves_the_cursor_alone() {
+        let lib = Library::new("session-feed-gone");
+        let mut app = lib.app();
+        let first = app.feeds.first().map(|f| f.url.clone());
+        app.restore(config::Settings {
+            session: config::Session {
+                tab: Some("feeds".into()),
+                feed: Some("https://example.com/deleted.xml".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(app.selected_feed().map(|f| f.url.clone()), first);
+    }
+
+    /// The resume is spent by the first listing, found or not. Otherwise browsing
+    /// into that folder an hour later would start playing on its own.
+    #[test]
+    fn the_resume_does_not_lie_in_wait() {
+        let lib = Library::new("session-one-shot");
+        let mut app = lib.app();
+        // Point it at a track that is not in the folder the app opens on.
+        let elsewhere = lib.0.join("Beta").join("01 song.wav");
+        app.restore(config::Settings {
+            session: config::Session {
+                track: Some(elsewhere.to_string_lossy().into_owned()),
+                position: Duration::from_secs(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        app.wait_for_tracks();
+        assert!(!app.is_playing_something(), "resumed the wrong folder");
+
+        // Now browse to where that track actually is: still nothing must start.
+        app.select_folder(folder_row(&app, "Beta"));
+        app.wait_for_tracks();
+        assert!(
+            !app.is_playing_something(),
+            "browsing started playback by itself: {}",
+            app.status
+        );
+    }
+
+    /// A position past the end of the track — re-encoded shorter, or simply
+    /// finished last time — starts it again instead of seeking off the end.
+    #[test]
+    fn a_position_past_the_end_starts_the_track_over() {
+        let lib = Library::new("session-past-end");
+        let mut app = lib.app();
+        let track = lib.0.join("Alpha").join("01 song.wav");
+        app.restore(config::Settings {
+            session: config::Session {
+                folder: Some(lib.0.join("Alpha")),
+                track: Some(track.to_string_lossy().into_owned()),
+                // The fixture tracks are 2s long.
+                position: Duration::from_secs(600),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        app.wait_for_tracks();
+        assert!(app.is_playing_something(), "{}", app.status);
+        assert_eq!(app.audio.wait_for_seek(), None);
+        assert!(
+            app.audio.position() < Duration::from_millis(500),
+            "seeked past the end: {:?}",
+            app.audio.position()
+        );
+    }
+
+    /// Nothing saved is the first run, which must look like an ordinary start.
+    #[test]
+    fn an_empty_session_changes_nothing() {
+        let lib = Library::new("session-empty");
+        let mut app = lib.app();
+        app.restore(config::Settings::default());
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, lib.0);
+        assert_eq!(app.tab, Tab::Local);
+        assert!(!app.shuffle);
+        assert!(!app.is_playing_something());
+    }
+
+    /// Shuffle is part of the session too.
+    #[test]
+    fn shuffle_survives_a_restart() {
+        let lib = Library::new("session-shuffle");
+        let file =
+            std::env::temp_dir().join(format!("tuneterm-sess-sh-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+
+        let mut before = lib.app();
+        before.settings_file = Some(file.clone());
+        before.toggle_shuffle();
+        before.save_settings(true);
+
+        let mut after = lib.app();
+        after.restore(config::load_settings_from(&file));
+        assert!(after.shuffle);
         let _ = std::fs::remove_file(&file);
     }
 
