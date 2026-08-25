@@ -115,6 +115,17 @@ pub struct App {
     pub picker: Picker,
     pub audio: AudioPlayer,
 
+    /// Play the queue in a scrambled order rather than in listing order.
+    pub shuffle: bool,
+    /// The order `next`/`prev` follow while shuffling: a permutation of `queue`
+    /// with whatever is playing at its head.
+    ///
+    /// A permutation rather than a fresh number per track, so the queue is heard
+    /// once through instead of repeating at random, and so `prev` goes back to
+    /// what was actually just played.
+    shuffle_order: Vec<usize>,
+    rng: Rng,
+
     /// Where the settings are written, held rather than looked up for the same
     /// reason as `feeds_file`: tests must not touch the user's real file.
     pub settings_file: Option<PathBuf>,
@@ -128,6 +139,8 @@ pub struct App {
     pub prev_area: Rect,
     pub next_area: Rect,
     pub seek_bar: Rect,
+    /// The shuffle button in the key bar, for hit-testing.
+    pub shuffle_area: Rect,
     pub folder_rows: Rect,
     pub track_rows: Rect,
     /// Clickable strip per tab, written during render. Same reason as the others:
@@ -179,6 +192,40 @@ pub struct Prompt {
 /// Two clicks on the same row within this window count as a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// A xorshift. Shuffling is the only thing here that wants random numbers, and one
+/// line of arithmetic is not worth a dependency.
+struct Rng(u64);
+
+impl Rng {
+    /// Seeded from the clock: what is wanted is a different order each run, not a
+    /// reproducible one.
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x9E37_79B9_7F4A_7C15, |since| since.as_nanos() as u64);
+        // Any seed but zero; xorshift never leaves it.
+        Self(nanos | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// Below `n`. The modulo bias is one part in `2^64 / n`, which for a track
+    /// listing is not something anyone can hear.
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
 impl App {
     /// `wake` is what every worker rings when it has something, so the loop can
     /// wait instead of asking.
@@ -212,6 +259,9 @@ impl App {
             cover: None,
             picker,
             audio: AudioPlayer::new(wake.clone())?,
+            shuffle: false,
+            shuffle_order: Vec::new(),
+            rng: Rng::new(),
             settings_file: config::settings_path(),
             settings_dirty: None,
             cover_size: None,
@@ -226,6 +276,7 @@ impl App {
             prev_area: Rect::ZERO,
             next_area: Rect::ZERO,
             seek_bar: Rect::ZERO,
+            shuffle_area: Rect::ZERO,
             folder_rows: Rect::ZERO,
             track_rows: Rect::ZERO,
             tab_areas: [Rect::ZERO; Tab::ALL.len()],
@@ -492,6 +543,9 @@ impl App {
             return;
         }
         self.queue = self.tracks.clone();
+        if self.shuffle {
+            self.reshuffle_from(Some(idx));
+        }
         self.play_queue_index(idx);
     }
 
@@ -697,22 +751,74 @@ impl App {
 
     pub fn next_track(&mut self) {
         match self.queue_pos {
-            Some(current) if current + 1 < self.queue.len() => {
-                self.play_queue_index(current + 1);
-            }
-            Some(_) => {
-                self.stop_playback();
-                self.status = "end of queue".into();
-            }
+            Some(current) => match self.following(current) {
+                Some(next) => self.play_queue_index(next),
+                None => {
+                    self.stop_playback();
+                    self.status = "end of queue".into();
+                }
+            },
             // Nothing queued yet: start from whatever is on screen.
             None => self.play_selected_track(),
         }
     }
 
     pub fn prev_track(&mut self) {
-        if let Some(i) = self.queue_pos.filter(|i| *i > 0) {
-            self.play_queue_index(i - 1);
+        if let Some(current) = self.queue_pos
+            && let Some(previous) = self.preceding(current)
+        {
+            self.play_queue_index(previous);
         }
+    }
+
+    /// Turn shuffling on or off.
+    ///
+    /// Turning it on scrambles the rest of the queue but leaves the current track
+    /// playing — it is the order that changes, not what you are listening to.
+    pub fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        if self.shuffle {
+            self.reshuffle_from(self.queue_pos);
+            self.status = "shuffle on".into();
+        } else {
+            self.shuffle_order.clear();
+            self.status = "shuffle off".into();
+        }
+    }
+
+    /// A fresh permutation of the queue, `head` first when it is given.
+    fn reshuffle_from(&mut self, head: Option<usize>) {
+        let mut order: Vec<usize> = (0..self.queue.len()).collect();
+        // Fisher-Yates, back to front.
+        for i in (1..order.len()).rev() {
+            order.swap(i, self.rng.below(i + 1));
+        }
+        // Swapping rather than removing and re-inserting: the displaced entry
+        // takes the head's old slot, which is as good a place as any.
+        if let Some(head) = head
+            && let Some(at) = order.iter().position(|&i| i == head)
+        {
+            order.swap(0, at);
+        }
+        self.shuffle_order = order;
+    }
+
+    /// What follows `current` in the queue, or `None` at the end of it.
+    fn following(&self, current: usize) -> Option<usize> {
+        if !self.shuffle {
+            return (current + 1 < self.queue.len()).then_some(current + 1);
+        }
+        let at = self.shuffle_order.iter().position(|&i| i == current)?;
+        self.shuffle_order.get(at + 1).copied()
+    }
+
+    /// What came before `current`, or `None` at the start.
+    fn preceding(&self, current: usize) -> Option<usize> {
+        if !self.shuffle {
+            return current.checked_sub(1);
+        }
+        let at = self.shuffle_order.iter().position(|&i| i == current)?;
+        self.shuffle_order.get(at.checked_sub(1)?).copied()
     }
 
     /// Move the volume and remember it. The write is deferred: a held-down `+`
@@ -1125,6 +1231,10 @@ impl App {
         }
         if self.seek_bar.contains(pos) {
             self.seek_to(self.bar_fraction(pos.x));
+            return;
+        }
+        if self.shuffle_area.contains(pos) {
+            self.toggle_shuffle();
             return;
         }
         let Some(pane) = self.pane_at(pos) else {
@@ -1869,6 +1979,112 @@ mod tests {
 
         app.save_settings(true);
         assert!(!file.exists(), "wrote a file with nothing to say");
+    }
+
+    /// Shuffle changes the order the queue is played in, and nothing else: every
+    /// track still comes up, exactly once, until the queue runs out.
+    #[test]
+    fn shuffle_plays_the_whole_queue_exactly_once() {
+        let lib = Library::new("shuffle-cover");
+        let mut app = lib.app();
+        app.select_folder(1); // Artist, four tracks under Late plus two under Early
+        app.wait_for_tracks();
+        let total = app.tracks.len();
+        assert!(total >= 4, "need a few tracks to shuffle, got {total}");
+
+        app.toggle_shuffle();
+        app.play_index(0);
+
+        let mut heard = vec![app.queue_pos.expect("playing")];
+        for _ in 1..total {
+            app.next_track();
+            heard.push(app.queue_pos.expect("still playing"));
+        }
+        app.next_track();
+        assert!(!app.is_playing_something(), "shuffle ran past the queue");
+        assert_eq!(app.status, "end of queue");
+
+        let mut seen = heard.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            total,
+            "a track was repeated or skipped: {heard:?}"
+        );
+        assert_eq!(heard[0], 0, "the track you started stays the one playing");
+    }
+
+    /// The coverage test above would still pass if the "permutation" came back in
+    /// listing order. Two hundred entries settles that: in order means unshuffled.
+    #[test]
+    fn the_shuffle_actually_shuffles() {
+        const N: usize = 200;
+        let lib = Library::new("shuffle-order");
+        let mut app = lib.app();
+        app.queue = vec![app.tracks[0].clone(); N];
+        app.reshuffle_from(None);
+
+        let order = app.shuffle_order.clone();
+        assert_ne!(
+            order,
+            (0..N).collect::<Vec<_>>(),
+            "the listing order came back untouched"
+        );
+        let mut sorted = order;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..N).collect::<Vec<_>>(), "not a permutation");
+    }
+
+    /// Previous has to undo next, or the button is a lie.
+    #[test]
+    fn shuffle_walks_backwards_the_way_it_came() {
+        let lib = Library::new("shuffle-back");
+        let mut app = lib.app();
+        app.toggle_shuffle();
+        app.play_index(0);
+
+        app.next_track();
+        let second = app.queue_pos.expect("advanced");
+        app.next_track();
+        app.prev_track();
+        assert_eq!(app.queue_pos, Some(second));
+        app.prev_track();
+        assert_eq!(app.queue_pos, Some(0), "back to where it started");
+    }
+
+    /// Turning it on mid-track reorders what is coming, not what is playing.
+    #[test]
+    fn turning_shuffle_on_does_not_interrupt_the_track() {
+        let lib = Library::new("shuffle-live");
+        let mut app = lib.app();
+        app.play_index(1);
+        let playing = app.now_playing().map(|t| t.path.clone());
+
+        app.toggle_shuffle();
+        assert!(app.shuffle);
+        assert_eq!(app.now_playing().map(|t| t.path.clone()), playing);
+        assert_eq!(app.queue_pos, Some(1));
+
+        // And off again leaves the listing order intact.
+        app.toggle_shuffle();
+        assert!(!app.shuffle);
+        app.next_track();
+        assert_eq!(app.queue_pos, Some(2));
+    }
+
+    /// The button in the key bar is the only sign shuffling is on, so it has to be
+    /// clickable and it has to be where the renderer said it was.
+    #[test]
+    fn clicking_the_shuffle_button_toggles_it() {
+        let lib = Library::new("shuffle-click");
+        let mut app = lib.app();
+        app.shuffle_area = Rect::new(40, 31, 12, 1);
+
+        app.click(Position { x: 45, y: 31 }, Instant::now());
+        assert!(app.shuffle, "{}", app.status);
+        app.click(Position { x: 45, y: 31 }, Instant::now());
+        assert!(!app.shuffle, "{}", app.status);
     }
 
     /// Seeking with nothing playing must be a no-op, not a panic.

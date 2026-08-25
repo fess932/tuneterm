@@ -121,11 +121,12 @@ KEYS
     j/k, PgUp/PgDn    Move selection         n / p         Next / previous
     Enter             Open folder / play     [ / ]         Seek -/+ 5s
     Backspace         Go up a folder         + / -         Volume
-    1 - 3             Switch source
+    1 - 3             Switch source          s             Shuffle
     q, Esc, Ctrl-C    Quit
 
     The mouse works too: click a row to select, double-click to play, click the
-    transport buttons, and click or drag the progress bar to seek.
+    transport buttons, click the shuffle button in the key bar, and click or drag
+    the progress bar to seek.
 
     Media keys, headphone buttons, Control Center and MPRIS control playback
     even while the terminal is in the background.
@@ -514,6 +515,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') => app.prev_track(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.nudge_volume(0.05),
         KeyCode::Char('-') => app.nudge_volume(-0.05),
+        KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_shuffle(),
         KeyCode::Char('a') if app.tab == app::Tab::Feeds => app.open_add_feed(),
         KeyCode::Char('d') if app.tab == app::Tab::Feeds => app.remove_selected_feed(),
         KeyCode::Char('1') => app.select_tab(app::Tab::Local),

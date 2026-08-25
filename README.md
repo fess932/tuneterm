@@ -31,7 +31,7 @@ breaking.
 │                        ││                               │││ ⏮ ││⏸ Pause││ ⏭ ││
 │                        ││                               ││╰───╯╰───────╯╰───╯│
 ╰────────────────────────╯╰───────────────────────────────╯╰───────────────────╯
- Tab pane  ↑↓ move  ⏎ play  Space pause  n/p track  [/] seek  +/- vol  q quit
+ Tab pane  ↑↓ move  ⏎ play  Space pause  n/p track  [/] seek  +/- vol  s shuffle
 ```
 
 ## Install
@@ -120,6 +120,7 @@ not `Send`.
 | `n` / `p` | next / previous track |
 | `[` / `]` | seek ∓5 s |
 | `+` / `-` | volume — remembered between runs |
+| `s` | shuffle the queue on / off |
 | `q`, `Esc`, `Ctrl-C` | quit |
 
 ### Mouse
@@ -135,6 +136,7 @@ not `Send`.
 | double-click a track | play it |
 | click `⏮` / `⏭` | previous / next track |
 | click `▶ Play` | toggle playback |
+| click ` s  shuffle ` | shuffle on / off |
 | click the progress bar | seek there |
 | drag the progress bar | scrub |
 | scroll wheel | moves **the pane under the cursor**, focused or not |
@@ -417,7 +419,8 @@ are the easy part; the `Source` abstraction and a seekable HTTP reader are the w
 
 ## Limitations
 
-- No shuffle, no repeat, no playlist files (`.m3u`).
+- No repeat, no playlist files (`.m3u`). Shuffle is `s`, and reshuffles from
+  wherever you are rather than restarting the queue.
 - Audio does not resume on its own after the output device changes — see the note
   above. The app stays responsive; playback has to be restarted.
 - Folder scanning is depth-limited to 5 and runs at startup, so a very large

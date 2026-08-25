@@ -662,9 +662,11 @@ fn transport_button(text: &str, color: Color) -> Paragraph<'_> {
     )
 }
 
-fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
-    // Kept terse on purpose: the line has to survive a narrow terminal without
-    // truncating away `q quit`.
+fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Kept terse on purpose: the whole bar wants about 130 columns, and anything
+    // narrower loses it from the right — so the reminders are ordered by how much
+    // they are worth, and the volume readout, which the shuffle button sits beside,
+    // is last because it is the one you can most afford to lose.
     let keys = [
         ("Tab", "pane"),
         ("↑↓", "move"),
@@ -674,23 +676,67 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ("n/p", "track"),
         ("[/]", "seek"),
         ("+/-", "vol"),
+        // Beside the volume, and lit when it is on: this is the only thing on
+        // screen that says whether the queue is being shuffled.
+        (SHUFFLE_KEY, "shuffle"),
         ("1-3", "source"),
         ("q", "quit"),
     ];
+
     let mut spans = Vec::new();
+    let mut offset = 0u16;
     for (key, desc) in keys {
-        spans.push(Span::styled(
+        let shuffle = key == SHUFFLE_KEY;
+        let colour = if shuffle && app.shuffle { ACCENT } else { DIM };
+        let mut label = Style::new().fg(colour);
+        if shuffle && app.shuffle {
+            label = label.add_modifier(Modifier::BOLD);
+        }
+
+        let chip = Span::styled(
             format!(" {key} "),
-            Style::new().fg(Color::Rgb(30, 30, 46)).bg(DIM),
-        ));
-        spans.push(Span::styled(format!(" {desc} "), Style::new().fg(DIM)));
+            Style::new().fg(Color::Rgb(30, 30, 46)).bg(colour),
+        );
+        let text = Span::styled(format!(" {desc} "), label);
+        let width = (chip.width() + text.width()) as u16;
+        if shuffle {
+            // Measured here rather than guessed by the mouse handler, for the same
+            // reason as every other clickable: only the layout knows where it went.
+            app.shuffle_area = cells_at(area, offset, width);
+        }
+        offset += width;
+        spans.push(chip);
+        spans.push(text);
     }
+
     spans.push(Span::styled(
         format!("vol {:.0}%", app.audio.volume() * 100.0),
         Style::new().fg(DIM),
     ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The key that toggles shuffling, in the one place the bar and the button agree on.
+const SHUFFLE_KEY: &str = "s";
+
+/// The rect `width` cells starting `offset` into `area` occupy, clipped to what is
+/// actually on screen.
+///
+/// A narrow terminal truncates the line, and something that was never drawn must
+/// not still be clickable — which is the whole reason the mouse handler is given
+/// measured rects rather than left to guess where the text ended up.
+fn cells_at(area: Rect, offset: u16, width: u16) -> Rect {
+    let x = area.x.saturating_add(offset);
+    if x >= area.right() || area.height == 0 {
+        return Rect::ZERO;
+    }
+    Rect {
+        x,
+        y: area.y,
+        width: width.min(area.right() - x),
+        height: 1,
+    }
 }
 
 #[cfg(test)]
@@ -717,7 +763,9 @@ mod tests {
 
     #[test]
     fn renders_all_three_panes() {
-        let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        // Wide enough for the whole key bar; narrower terminals lose it from the
+        // right, which `survives_tiny_terminals` covers.
+        let mut terminal = Terminal::new(TestBackend::new(130, 32)).unwrap();
         let mut app = App::new(
             PathBuf::from(std::env::var("TUNETERM_ROOT").unwrap_or_else(|_| ".".into())),
             Picker::halfblocks(),
@@ -742,6 +790,36 @@ mod tests {
         }
     }
 
+    /// The shuffle button has to be drawn where it reports being, or clicking it
+    /// lands on whatever text happens to sit there instead.
+    #[test]
+    fn the_shuffle_button_is_where_it_says_it_is() {
+        let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        let mut app = app();
+        app.shuffle = true;
+        terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+
+        let area = app.shuffle_area;
+        let buffer = terminal.backend().buffer().clone();
+        let drawn: String = (area.x..area.right())
+            .map(|x| buffer[(x, area.y)].symbol().to_string())
+            .collect();
+        assert_eq!(
+            drawn, " s  shuffle ",
+            "the button is not under its own rect"
+        );
+    }
+
+    /// A terminal too narrow for the key bar must not leave a button clickable
+    /// where nothing was drawn.
+    #[test]
+    fn a_truncated_key_bar_reports_no_shuffle_button() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let mut app = app();
+        terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+        assert_eq!(app.shuffle_area, Rect::ZERO);
+    }
+
     /// The play button must land somewhere clickable.
     #[test]
     fn control_areas_are_recorded() {
@@ -753,6 +831,7 @@ mod tests {
             ("prev", app.prev_area),
             ("next", app.next_area),
             ("seek", app.seek_bar),
+            ("shuffle", app.shuffle_area),
         ] {
             assert!(area.width > 0 && area.height > 0, "{name} not laid out");
         }
