@@ -145,6 +145,8 @@ pub struct App {
     pub settings_file: Option<PathBuf>,
     /// When the session last changed, if it has not been written out yet.
     settings_dirty: Option<Instant>,
+    /// The playhead as last written, so `tick` can tell how far it has drifted.
+    saved_position: Duration,
     /// The track the last session was on, until the first listing has had a chance
     /// to contain it. One shot: see [`App::try_resume`].
     resume: Option<Resume>,
@@ -298,6 +300,7 @@ impl App {
             rng: Rng::new(),
             settings_file: config::settings_path(),
             settings_dirty: None,
+            saved_position: Duration::ZERO,
             resume: None,
             resume_at: None,
             resume_playing: false,
@@ -1064,17 +1067,25 @@ impl App {
     /// Write the settings out if they are owed and have settled.
     ///
     /// `force` skips the wait, for the way out: whatever the last keystroke was
-    /// must survive quitting even if it was a moment ago.
+    /// must survive quitting even if it was a moment ago — and so must the
+    /// playhead, which never announces itself at all.
     pub fn save_settings(&mut self, force: bool) {
         /// Long enough that a key repeat writes once at the end of the burst.
         const SETTLE: Duration = Duration::from_millis(400);
 
-        let Some(changed) = self.settings_dirty else {
-            return;
-        };
-        if !force && changed.elapsed() < SETTLE {
-            return;
+        if !force {
+            let Some(changed) = self.settings_dirty else {
+                return;
+            };
+            if changed.elapsed() < SETTLE {
+                return;
+            }
         }
+        self.write_settings();
+    }
+
+    /// Gather the session and put it on disk. Unconditional; the callers decide.
+    fn write_settings(&mut self) {
         self.settings_dirty = None;
         let Some(path) = self.settings_file.clone() else {
             return;
@@ -1090,12 +1101,11 @@ impl App {
                 track: self
                     .now_playing()
                     .map(|track| track.path.to_string_lossy().into_owned()),
-                // Read here rather than tracked as it moves: the playhead changes
-                // every frame, and a write is owed for the session, not the second.
                 position: self.audio.position(),
                 playing: self.is_playing_something() && !self.audio.is_paused(),
             },
         };
+        self.saved_position = settings.session.position;
         if let Err(err) = config::save_settings_to(&path, &settings) {
             self.status = format!("could not save settings: {err}");
         }
@@ -1184,6 +1194,25 @@ impl App {
         {
             self.next_track();
         }
+
+        // The playhead is the only part of the session that moves without anyone
+        // asking, so it is the only part that has to be noticed rather than
+        // announced. Once a second: the file is a couple of hundred bytes, which
+        // is less work than one of the frames already drawn every 120ms, and it
+        // means a kill, a crash or a closed terminal costs a second rather than
+        // the whole sitting.
+        //
+        // Written straight out rather than marked: the settle delay is there to
+        // batch a key repeat, and a threshold of a second is already its own
+        // batching. Going through it as well would only make the cadence 1.4s.
+        const SAVE_POSITION_EVERY: Duration = Duration::from_secs(1);
+        if self.is_playing_something()
+            && !self.audio.is_paused()
+            && self.audio.position().abs_diff(self.saved_position) >= SAVE_POSITION_EVERY
+        {
+            self.write_settings();
+        }
+
         self.save_settings(false);
     }
 
@@ -1660,6 +1689,18 @@ mod tests {
                 }
             }
             Self(root)
+        }
+
+        /// Straight out of `App::new`, with the first scan still in flight —
+        /// which is the state `main` restores into.
+        fn raw_app(&self) -> App {
+            App::new(
+                self.0.clone(),
+                Picker::halfblocks(),
+                media::Bridge::detached(),
+                Wake::none(),
+            )
+            .expect("app init")
         }
 
         /// Ready to assert on: the first listing has already landed.
@@ -2557,19 +2598,142 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
-    /// Nothing owed, nothing written — an app that never touched the volume must
-    /// not overwrite a settings file it did not read.
+    /// Quitting long after the last thing you touched must still record where the
+    /// playhead got to. The playhead moves on its own, so "nothing has changed
+    /// since the last write" is never true while a track is playing.
     #[test]
-    fn an_untouched_volume_writes_nothing() {
-        let lib = Library::new("volume-quiet");
+    fn quitting_records_where_the_playhead_actually_got_to() {
+        let lib = Library::new("session-late-quit");
+        let file = std::env::temp_dir().join(format!("tuneterm-sess-q-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+
+        let mut app = lib.app();
+        app.settings_file = Some(file.clone());
+        app.play_index(0);
+
+        // The write the start of the track earned, which lands near 0:00.
+        app.save_settings(true);
+        let early = config::load_settings_from(&file).session.position;
+
+        // Now play on without touching anything, the way listening works.
+        app.seek_to(0.5);
+        settled(&app);
+        let now = app.audio.position();
+        assert!(
+            now > early + Duration::from_millis(400),
+            "the playhead did not move"
+        );
+
+        app.save_settings(true);
+        let saved = config::load_settings_from(&file).session.position;
+        assert!(
+            saved.abs_diff(now) < Duration::from_millis(400),
+            "quit recorded {saved:?}, but the playhead was at {now:?}"
+        );
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The playhead is the one part of the session that changes without anyone
+    /// asking, so it is the one part `tick` has to notice by itself — otherwise a
+    /// kill, a crash or a closed terminal loses everything since the last keypress.
+    #[test]
+    fn playing_on_its_own_earns_a_write() {
+        let lib = Library::new("session-tick");
+        let file = std::env::temp_dir().join(format!("tuneterm-sess-t-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+
+        let mut app = lib.app();
+        app.settings_file = Some(file.clone());
+        app.play_index(0);
+        app.save_settings(true);
+
+        // Somewhere past the once-a-second mark, without a single keystroke.
+        app.seek_to(0.6);
+        settled(&app);
+        app.tick();
+        let saved = config::load_settings_from(&file).session.position;
+        assert!(
+            saved >= Duration::from_secs(1),
+            "a moving playhead owes a write and nobody noticed: disk says {saved:?}"
+        );
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The whole thing, driven the way `run` drives it: restore from a real file,
+    /// then do nothing but turn the loop. The position on disk has to follow the
+    /// playhead, because that is what is left behind when the terminal is closed
+    /// or the process is killed.
+    #[test]
+    fn turning_the_loop_keeps_the_position_on_disk_up_to_date() {
+        let lib = Library::new("session-loop");
+        let file = std::env::temp_dir().join(format!("tuneterm-sess-l-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+
+        let track = lib.0.join("Alpha").join("01 song.wav");
+        config::save_settings_to(
+            &file,
+            &config::Settings {
+                session: config::Session {
+                    folder: Some(lib.0.join("Alpha")),
+                    track: Some(track.to_string_lossy().into_owned()),
+                    position: Duration::ZERO,
+                    playing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("seed");
+
+        // Restored the way `main` does it: straight after `new`, with the root
+        // scan still in flight.
+        let mut app = lib.raw_app();
+        app.settings_file = Some(file.clone());
+        app.restore(config::load_settings_from(&file));
+
+        // Exactly what `run` calls, for most of a 2s track.
+        let deadline = Instant::now() + Duration::from_millis(1800);
+        while Instant::now() < deadline {
+            app.poll_tracks();
+            app.poll_seek();
+            app.tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(app.is_playing_something(), "never started: {}", app.status);
+        assert!(!app.audio.is_paused(), "never let go: {}", app.status);
+
+        let on_disk = config::load_settings_from(&file).session.position;
+        assert!(
+            on_disk >= Duration::from_secs(1),
+            "the loop ran through 1.8s of playback but disk still says {on_disk:?}"
+        );
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Nothing owed, nothing written — the loop calls this every pass, and a
+    /// hundred writes a second is not a way to keep a file.
+    #[test]
+    fn an_idle_pass_writes_nothing() {
+        let lib = Library::new("session-quiet");
         let mut app = lib.app();
         let file =
             std::env::temp_dir().join(format!("tuneterm-vol-quiet-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&file);
         app.settings_file = Some(file.clone());
 
-        app.save_settings(true);
+        app.tick();
+        app.save_settings(false);
         assert!(!file.exists(), "wrote a file with nothing to say");
+
+        // Quitting is not an idle pass: it records the session whether or not
+        // anything announced itself, because the playhead never does.
+        app.save_settings(true);
+        assert!(file.exists(), "quitting recorded nothing");
+        let _ = std::fs::remove_file(&file);
     }
 
     /// Shuffle changes the order the queue is played in, and nothing else: every

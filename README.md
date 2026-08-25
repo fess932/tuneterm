@@ -395,16 +395,25 @@ position = 612.4
 playing = 1
 ```
 
-It is written 400 ms after whatever changed — a held-down `+` would otherwise put
-a file write behind every key repeat — and again on the way out, which is also
-where the playhead is read from. The position is deliberately *not* tracked as it
-moves: marking it dirty every second would mean writing the file every second, and
-the only moment its exact value matters is the one where you quit.
+Anything you *do* — a key, a click, a folder — is written 400 ms later, so that a
+held-down `+` does not put a file write behind every key repeat.
 
-An app that changed nothing writes nothing, rather than overwriting a file it only
-read. A value that is not a finite number, or is out of range, falls back to the
-default rather than reaching rodio's amplifier — the file is meant to be edited,
-so nothing in it is trusted.
+The playhead is different, because it is the one part of the session that moves
+without anyone asking. It gets written once a second while something is playing,
+and the settle delay is skipped for it: a threshold of a second is already its own
+batching, and going through the delay as well would only make the cadence 1.4 s.
+The file is a couple of hundred bytes — less work than one of the frames already
+drawn every 120 ms — and the point is that closing the terminal, or `kill -9`,
+costs you a second instead of the whole sitting.
+
+An idle pass writes nothing, since the loop calls the same function every time
+round. Quitting always writes, though, whether or not anything announced itself —
+asking "has anything changed?" first is exactly what used to make quitting record
+a position from twenty minutes earlier.
+
+A value that is not a finite number, or is out of range, falls back to the default
+rather than reaching rodio's amplifier — the file is meant to be edited, so nothing
+in it is trusted.
 
 ### Reopening puts you back where you were
 
@@ -455,7 +464,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 152 tests
+cargo test                                    # 155 tests
 cargo test -- --ignored --nocapture           # plus live network checks
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
