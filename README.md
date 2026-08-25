@@ -348,6 +348,31 @@ placeholders.
 forward works, so it is easy to miss. rodio also reports a seek as successful
 without performing it when nothing is queued.
 
+### Unplugging headphones used to freeze the whole app
+
+Two of rodio's controls wait for the audio device's callback to acknowledge them:
+`Player::clear` waits for the queue to drain, and `Player::try_seek` waits for the
+answer to its seek order. Both answers come from inside the callback.
+
+On macOS that callback stops for good when the output device goes away. cpal binds
+its audio unit to the device it opened (`kAudioOutputUnitProperty_CurrentDevice`)
+rather than following the default, and for the *default* device it installs a dummy
+error callback — so nothing is reported and nothing calls back again.
+
+Pull your headphones out mid-track, then press `n`, `Space` or `]`, and the wait
+never ends. It happens on the thread that draws, so there is no redraw, no keyboard,
+not even `q`: the process has to be killed from another terminal.
+
+So nothing on that thread waits on the audio thread any more. `player.rs` clears by
+asking (`skip_one` per queued sound) instead of asking-and-waiting, which costs at
+most the 5 ms of the old source already in flight, and seeks on a thread of their
+own, with the answer picked up later by `poll_seek`. The regression test builds a
+player whose samples nobody pulls — which is what a disconnected device amounts to —
+and fails if clearing blocks.
+
+Audio does not come back by itself when the device returns; that needs the sink to be
+reopened, which is still to do. But the interface stays alive and quittable.
+
 ### chafa is not required
 
 `ratatui-image`'s default features link the C library `chafa`, which only improves
@@ -363,7 +388,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 109 tests
+cargo test                                    # 123 tests
 cargo test -- --ignored --nocapture           # plus live network checks
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed
@@ -384,6 +409,8 @@ are the easy part; the `Source` abstraction and a seekable HTTP reader are the w
 ## Limitations
 
 - No shuffle, no repeat, no playlist files (`.m3u`).
+- Audio does not resume on its own after the output device changes — see the note
+  above. The app stays responsive; playback has to be restarted.
 - Folder scanning is depth-limited to 5 and runs at startup, so a very large
   library pauses briefly before the first frame.
 - rodio's decoders cover mp3, flac, m4a/aac, ogg/vorbis and wav. Opus does not work.

@@ -205,7 +205,7 @@ impl App {
             memo_order: VecDeque::new(),
             cover: None,
             picker,
-            audio: AudioPlayer::new()?,
+            audio: AudioPlayer::new(wake.clone())?,
             cover_size: None,
             cover_pending: false,
             cover_file: None,
@@ -703,6 +703,14 @@ impl App {
         }
     }
 
+    /// Pick up a seek that failed. Seeks are answered on their own thread now, so
+    /// the reason arrives after the fact rather than from `seek_to` itself.
+    pub fn poll_seek(&mut self) {
+        if let Some(err) = self.audio.seek_error() {
+            self.status = format!("seek failed: {err}");
+        }
+    }
+
     /// Act on media keys, headphone buttons and Control Center / MPRIS.
     pub fn poll_media(&mut self) {
         let commands: Vec<Command> = self.media.commands().collect();
@@ -1160,10 +1168,8 @@ impl App {
             return;
         };
         let target = total.mul_f32(fraction.clamp(0.0, 1.0));
-        match self.audio.seek(target) {
-            Ok(()) => self.status = format!("seek {}", library::fmt_duration(target)),
-            Err(err) => self.status = format!("seek failed: {err:#}"),
-        }
+        self.audio.seek(target);
+        self.status = format!("seek {}", library::fmt_duration(target));
     }
 
     /// Nudge the playhead by `delta` seconds, clamped to the track.
@@ -1174,10 +1180,8 @@ impl App {
         let now = self.audio.position().as_secs_f64();
         let target = (now + delta as f64).clamp(0.0, total.as_secs_f64());
         let target = Duration::from_secs_f64(target);
-        match self.audio.seek(target) {
-            Ok(()) => self.status = format!("seek {}", library::fmt_duration(target)),
-            Err(err) => self.status = format!("seek failed: {err:#}"),
-        }
+        self.audio.seek(target);
+        self.status = format!("seek {}", library::fmt_duration(target));
     }
 
     /// Selecting a folder rescans it, so skip the work when nothing changed.
@@ -1266,6 +1270,12 @@ mod tests {
     /// Rows as the renderer would report them: 10 wide, starting at y = 1.
     fn rows(x: u16, y: u16, height: u16) -> Rect {
         Rect::new(x, y, 10, height)
+    }
+
+    /// Seeks are answered on another thread now, so a test that asserts on where
+    /// the playhead ended up has to wait for that answer first.
+    fn settled(app: &App) {
+        assert_eq!(app.audio.wait_for_seek(), None, "seek failed");
     }
 
     /// The left pane lists one level, and empty branches never appear.
@@ -1726,6 +1736,7 @@ mod tests {
         app.seek_bar = Rect::new(0, 30, 11, 1);
         // Middle of the bar on a 2 s track.
         app.click(Position { x: 5, y: 30 }, Instant::now());
+        settled(&app);
 
         // Playback keeps running, so the bounds are generous on purpose — the
         // claim is "it jumped to the middle", not an exact sample offset.
@@ -1753,8 +1764,9 @@ mod tests {
         // seeking when `sound_count == 0`). In the app `tick()` moves to the next
         // track at that point, so the dead state never lingers.
         app.seek_to(0.75);
+        settled(&app);
         app.seek_by(-600); // far before the start
-        assert!(!app.status.contains("failed"), "{}", app.status);
+        settled(&app);
         let at_start = app.audio.position();
         assert!(
             at_start < Duration::from_millis(500),
@@ -1762,7 +1774,7 @@ mod tests {
         );
 
         app.seek_by(600); // far past the 2 s end
-        assert!(!app.status.contains("failed"), "{}", app.status);
+        settled(&app);
         let at_end = app.audio.position();
         assert!(
             at_end >= Duration::from_millis(1500),
