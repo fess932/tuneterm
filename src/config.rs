@@ -98,6 +98,9 @@ pub struct Session {
     pub track: Option<String>,
     /// How far into it.
     pub position: Duration,
+    /// Whether it was playing rather than paused, so it comes back the way it was
+    /// left rather than always one way.
+    pub playing: bool,
 }
 
 /// rodio's scale, kept in range by construction: 1.0 is the track untouched.
@@ -178,6 +181,10 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> 
             session.position.as_secs_f64()
         ));
     }
+    // Only alongside a track: on its own it would describe nothing.
+    if session.track.is_some() {
+        text.push_str(&format!("playing = {}\n", u8::from(session.playing)));
+    }
 
     fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -189,6 +196,11 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> 
 /// has been deleted, and is already handled.
 fn path_value(path: Option<&Path>) -> Option<String> {
     Some(path?.to_string_lossy().into_owned())
+}
+
+/// The ways a person might write "on" in a file they edited by hand.
+fn is_yes(value: &str) -> bool {
+    matches!(value, "1" | "true" | "yes" | "on")
 }
 
 fn parse_settings(text: &str) -> Settings {
@@ -215,7 +227,8 @@ fn parse_settings(text: &str) -> Settings {
                     settings.volume = Volume::new(volume);
                 }
             }
-            "shuffle" => settings.shuffle = matches!(value, "1" | "true" | "yes" | "on"),
+            "shuffle" => settings.shuffle = is_yes(value),
+            "playing" => settings.session.playing = is_yes(value),
             "tab" => settings.session.tab = Some(value.to_ascii_lowercase()),
             "folder" => settings.session.folder = Some(PathBuf::from(value)),
             "selected" => settings.session.selected = Some(PathBuf::from(value)),
@@ -419,6 +432,7 @@ mod tests {
                 feed: Some("https://example.com/feed?format=rss&id=7".into()),
                 track: Some("https://example.com/ep 12.mp3".into()),
                 position: Duration::from_secs_f64(93.4),
+                playing: true,
             },
         }
     }
@@ -441,6 +455,7 @@ mod tests {
             "selected = /music/Deep Purple/=1",
             "track = https://example.com/ep 12.mp3",
             "position = 93.4",
+            "playing = 1",
         ] {
             assert!(text.contains(line), "missing {line:?} in:\n{text}");
         }
@@ -485,7 +500,9 @@ mod tests {
 
         save_settings_to(&path, &Settings::default()).expect("save");
         let text = fs::read_to_string(&path).expect("read");
-        for absent in ["tab", "folder", "selected", "feed", "track", "position"] {
+        for absent in [
+            "tab", "folder", "selected", "feed", "track", "position", "playing",
+        ] {
             assert!(
                 !text.contains(&format!("{absent} =")),
                 "{absent} was written"

@@ -114,11 +114,15 @@ impl AudioPlayer {
         }
     }
 
-    /// Hold, without touching the queue. Used to bring a restored track back
-    /// stopped where it was rather than playing: launching an app should not make
-    /// noise on its own.
+    /// Hold, without touching the queue. Used to keep a restored track quiet
+    /// until its playhead has been put where it belongs.
     pub fn pause(&self) {
         self.player.pause();
+    }
+
+    /// Release a hold. No effect if nothing is paused.
+    pub fn play(&self) {
+        self.player.play();
     }
 
     pub fn stop(&self) {
@@ -149,13 +153,14 @@ impl AudioPlayer {
         self.seek.request(generation, pos);
     }
 
-    /// Why the last seek failed, once. `None` while seeks are landing, which is
-    /// every seek that is not asking a decoder for something it cannot do.
-    pub fn seek_error(&self) -> Option<String> {
-        self.seek
-            .drain()
-            .filter_map(|(_, result)| result.err())
-            .last()
+    /// The answer to the last seek, once, or `None` while none has arrived.
+    ///
+    /// Both outcomes are reported, not just the failures: a caller waiting to
+    /// start playback at the restored position needs to know the playhead has
+    /// moved, and a seek that could not be performed should not leave it waiting
+    /// forever.
+    pub fn seek_result(&self) -> Option<Result<(), String>> {
+        self.seek.drain().map(|(_, result)| result).last()
     }
 
     /// Block until the outstanding seek has been answered. For tests, which assert

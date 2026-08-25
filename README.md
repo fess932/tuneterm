@@ -389,8 +389,10 @@ shuffle = 1
 tab = feeds
 folder = /Users/me/Music/Deep Purple
 selected = /Users/me/Music/Deep Purple/=1
+feed = https://musicforprogramming.net/rss.xml
 track = https://datashat.net/music_for_programming_78-datassette.mp3
 position = 612.4
+playing = 1
 ```
 
 It is written 400 ms after whatever changed — a held-down `+` would otherwise put
@@ -415,15 +417,22 @@ library it describes, so each is checked rather than believed:
 | the folder, and the row highlighted in it | walks down as far as still exists |
 | a folder from some other library | ignored; the root on the command line wins |
 | the selected feed | cursor stays where it was |
-| the track and its position | ignored unless the first listing contains it |
+| the track, its position, and whether it was playing | ignored unless the first listing contains it |
 | a position past the end of the track | starts it again |
 
 The folder is restored by walking back down from the root rather than by assigning
 `cwd`, so the trail is rebuilt and `Backspace` still climbs out one level at a time.
 
-A restored track comes back **paused**. Launching an app should not make noise on
-its own, and rodio answers a seek from the same periodic callback whether it is
-paused or not, so holding it costs nothing.
+A restored track comes back the way it was left: playing if it was playing,
+paused if it was paused, from the moment you quit.
+
+Either way it is held quiet until its seek has been answered. Appending starts a
+source at the beginning, so the few milliseconds before the playhead moves would
+otherwise be a click of the wrong audio — the opening of the track instead of the
+middle of it. rodio answers a seek from the same periodic callback whether it is
+paused or not, so the hold costs nothing, and `poll_seek` lets it go. A seek that
+*fails* releases it too: the alternative is silence forever because some decoder
+would not seek.
 
 The resume is spent by the first listing to arrive, found or not. Keeping it alive
 would mean that browsing into that folder an hour later would suddenly start
@@ -446,7 +455,7 @@ brew install chafa
 ## Tests
 
 ```sh
-cargo test                                    # 149 tests
+cargo test                                    # 152 tests
 cargo test -- --ignored --nocapture           # plus live network checks
 make check                                    # what CI runs
 cargo test -- --ignored --nocapture           # benchmarks, printed

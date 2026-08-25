@@ -103,8 +103,9 @@ OPTIONS
 
 SESSION
     Closing and reopening puts you back: the same source tab, the same folder or
-    feed, and the track you were on, paused where you left it. Give a different
-    folder on the command line and only the volume and shuffle carry over.
+    feed, and the track you were on, at the moment you left it — playing if it
+    was playing, paused if it was paused. Give a different folder on the command
+    line and only the volume and shuffle carry over.
 
 SOURCES
     Tabs in the top border of the browsing pane. Click one or press 1 - 3;

@@ -152,6 +152,9 @@ pub struct App {
     /// stream is several seconds after we ask for it — and which track that is,
     /// since by then it may not be the one still wanted.
     resume_at: Option<(String, Duration)>,
+    /// Set while a restored track is held quiet waiting for its seek to land, so
+    /// that [`App::poll_seek`] knows to let it go when the answer arrives.
+    resume_playing: bool,
 
     /// Written during render so mouse events can hit-test. `*_rows` cover only
     /// the data rows of each table — no border, no header — and `seek_bar` only
@@ -216,6 +219,8 @@ struct Resume {
     /// Identity of the track, the way `Track` carries it: a path, or a URL.
     track: String,
     position: Duration,
+    /// Whether it was playing rather than paused when the app was closed.
+    playing: bool,
 }
 
 /// Two clicks on the same row within this window count as a double click.
@@ -295,6 +300,7 @@ impl App {
             settings_dirty: None,
             resume: None,
             resume_at: None,
+            resume_playing: false,
             cover_size: None,
             cover_pending: false,
             cover_file: None,
@@ -379,6 +385,7 @@ impl App {
         self.resume = session.track.map(|track| Resume {
             track,
             position: session.position,
+            playing: session.playing,
         });
 
         // Whichever tab we landed on fills its own list — and only that one, or a
@@ -472,30 +479,47 @@ impl App {
         };
 
         self.resume_at = Some((resume.track, at));
+        self.resume_playing = resume.playing;
         self.play_index(index);
         self.track_state.select(Some(index));
     }
 
-    /// Put the playhead where the restored track left off, and hold it there.
+    /// Put the playhead where the restored track left off, and leave it playing or
+    /// paused the way it was.
     ///
-    /// Called once the source is actually queued, which for a local file is at
-    /// once and for a stream is whenever the server gets round to it. Pausing
-    /// first: rodio answers a seek from the same periodic callback whether it is
-    /// paused or not, so this costs nothing and keeps the app from making noise
-    /// on its own at launch.
+    /// Called once the source is actually queued, which for a local file is at once
+    /// and for a stream is whenever the server gets round to it.
+    ///
+    /// It is held quiet either way until the seek has been answered, even when it
+    /// is going to play: appending starts at the beginning of the track, and the
+    /// few milliseconds before the seek lands would otherwise be a click of the
+    /// wrong audio. rodio answers a seek from the same periodic callback whether
+    /// it is paused or not, so the hold costs nothing. `poll_seek` lets it go.
     fn apply_resume_position(&mut self) {
         let Some((_, at)) = self.resume_at.take() else {
             return;
         };
-        self.audio.pause();
-        if at > Duration::ZERO {
-            self.audio.seek(at);
-        }
+        let playing = self.resume_playing;
         let title = self
             .now_playing()
             .map(|track| track.title.clone())
             .unwrap_or_default();
-        self.status = format!("{title} — paused at {}", library::fmt_duration(at));
+
+        if at > Duration::ZERO {
+            self.audio.pause();
+            self.audio.seek(at);
+        } else {
+            // Nothing to wait for at the start of a track.
+            self.resume_playing = false;
+            if !playing {
+                self.audio.pause();
+            }
+        }
+
+        self.status = match playing {
+            true => format!("{title} — resumed at {}", library::fmt_duration(at)),
+            false => format!("{title} — paused at {}", library::fmt_duration(at)),
+        };
     }
 
     /// Note that the session has moved on and is owed a write.
@@ -752,6 +776,7 @@ impl App {
             .is_some_and(|(wanted, _)| wanted.as_str() != path.to_string_lossy())
         {
             self.resume_at = None;
+            self.resume_playing = false;
         }
         let art_url = track.art_url.clone();
         let title = track.title.clone();
@@ -822,6 +847,7 @@ impl App {
             Err(err) => {
                 self.queue_pos = None;
                 self.resume_at = None;
+                self.resume_playing = false;
                 self.status = format!("error: {err}");
             }
         }
@@ -952,6 +978,7 @@ impl App {
         self.opening = None;
         self.queue_pos = None;
         self.resume_at = None;
+        self.resume_playing = false;
     }
 
     pub fn next_track(&mut self) {
@@ -1066,6 +1093,7 @@ impl App {
                 // Read here rather than tracked as it moves: the playhead changes
                 // every frame, and a write is owed for the session, not the second.
                 position: self.audio.position(),
+                playing: self.is_playing_something() && !self.audio.is_paused(),
             },
         };
         if let Err(err) = config::save_settings_to(&path, &settings) {
@@ -1073,11 +1101,20 @@ impl App {
         }
     }
 
-    /// Pick up a seek that failed. Seeks are answered on their own thread now, so
-    /// the reason arrives after the fact rather than from `seek_to` itself.
+    /// Pick up the answer to a seek. Seeks are answered on their own thread now, so
+    /// both the reason one failed and the fact one landed arrive after the event.
     pub fn poll_seek(&mut self) {
-        if let Some(err) = self.audio.seek_error() {
+        let Some(result) = self.audio.seek_result() else {
+            return;
+        };
+        if let Err(err) = result {
             self.status = format!("seek failed: {err}");
+        }
+        // A restored track was held quiet until its playhead was in the right
+        // place. Released on a failed seek too: the alternative is leaving it
+        // paused forever because a decoder would not seek.
+        if std::mem::take(&mut self.resume_playing) {
+            self.audio.play();
         }
     }
 
@@ -1664,6 +1701,22 @@ mod tests {
     /// the playhead ended up has to wait for that answer first.
     fn settled(app: &App) {
         assert_eq!(app.audio.wait_for_seek(), None, "seek failed");
+    }
+
+    /// Drive the loop the way `run` does until a restored track has been let go.
+    ///
+    /// Not `AudioPlayer::wait_for_seek`: that drains the answer `poll_seek` needs,
+    /// so waiting on it first is exactly what would leave the track paused.
+    fn settle_resume(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            app.poll_seek();
+            if !app.resume_playing {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the restored track was never let go: {}", app.status);
     }
 
     /// The left pane lists one level, and empty branches never appear.
@@ -2255,6 +2308,87 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Paused when you quit means paused when you come back — the restore brings
+    /// the state back, it does not pick one.
+    #[test]
+    fn a_track_that_was_paused_comes_back_paused() {
+        let lib = Library::new("session-was-paused");
+        let file = std::env::temp_dir().join(format!("tuneterm-sess-p-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+
+        let mut before = lib.app();
+        before.settings_file = Some(file.clone());
+        before.play_index(0);
+        before.toggle_play();
+        assert!(before.audio.is_paused(), "did not pause");
+        before.save_settings(true);
+        assert!(!config::load_settings_from(&file).session.playing);
+
+        let mut after = lib.app();
+        after.restore(config::load_settings_from(&file));
+        after.wait_for_tracks();
+        settle_resume(&mut after);
+        assert!(after.is_playing_something(), "{}", after.status);
+        assert!(after.audio.is_paused(), "started itself: {}", after.status);
+    }
+
+    /// A track held quiet while its seek is in flight has to be let go once the
+    /// playhead has moved, or restoring a playing track leaves silence.
+    #[test]
+    fn a_restored_track_is_only_let_go_once_the_playhead_has_moved() {
+        let lib = Library::new("session-let-go");
+        let mut app = lib.app();
+        let track = lib.0.join("Alpha").join("01 song.wav");
+        app.restore(config::Settings {
+            session: config::Session {
+                folder: Some(lib.0.join("Alpha")),
+                track: Some(track.to_string_lossy().into_owned()),
+                position: Duration::from_millis(900),
+                playing: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        app.wait_for_tracks();
+
+        // Held until the seek is answered, so the first thing heard is the right
+        // part of the track rather than a click of its opening. Nothing but
+        // `poll_seek` releases it, so this is a fact and not a race.
+        assert!(app.audio.is_paused(), "played before it had seeked");
+
+        settle_resume(&mut app);
+        assert!(!app.audio.is_paused(), "never let go: {}", app.status);
+        assert!(
+            app.audio.position() >= Duration::from_millis(700),
+            "let go before the playhead moved: {:?}",
+            app.audio.position()
+        );
+    }
+
+    /// A track saved at the very start has no seek to wait for, so it must not sit
+    /// waiting for one that will never be answered.
+    #[test]
+    fn a_track_restored_at_the_start_needs_no_seek_to_begin() {
+        let lib = Library::new("session-from-zero");
+        let mut app = lib.app();
+        let track = lib.0.join("Alpha").join("01 song.wav");
+        app.restore(config::Settings {
+            session: config::Session {
+                folder: Some(lib.0.join("Alpha")),
+                track: Some(track.to_string_lossy().into_owned()),
+                position: Duration::ZERO,
+                playing: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        app.wait_for_tracks();
+        assert!(
+            !app.audio.is_paused(),
+            "waiting on a seek it never asked for"
+        );
     }
 
     /// A remembered path from some other library must not override the folder this
