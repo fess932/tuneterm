@@ -272,6 +272,126 @@ feeds, and only some attach enclosures. That is an argument for the generic feed
 source rather than for hardcoding any of them: paste a URL, and it either has
 enclosures and works or it does not and shows nothing.
 
+### Subscribing to YouTube channels and mixes
+
+The other thing a feed list is good for. Not a catalogue to browse — a few channels
+and mixes that publish music, sitting in the same `feeds.txt` as the podcasts,
+playing whatever is newest.
+
+Everything below was measured against a real channel and a real mix rather than
+assumed, because the assumptions turned out to be wrong in both directions: the
+browsing is far better than expected, and the playback is much worse.
+
+#### Channels: an ordinary feed, and it costs nothing
+
+`https://www.youtube.com/feeds/videos.xml?channel_id=UC…` answers 200 with plain
+Atom — no key, no extractor, no account. Measured on one channel: 51 KB, **15
+entries**, each carrying `yt:videoId`, title, author, `published`, a
+`media:thumbnail` at 480×360 and a description. The repository already has `ureq`
+and `quick-xml`, so the whole feed side is **zero new dependencies**.
+
+Two holes, both real:
+
+- **No `<enclosure>` and no length.** A podcast entry *is* a URL to a file; a
+  YouTube entry is a video id that has to be *asked* what its file is. That is one
+  extra `resolve` step in the source trait — podcasts return the enclosure
+  unchanged, YouTube shells out. `yt-dlp -f … -g` answers in about **2 seconds**.
+- **No duration.** The feed does not carry one, so "is this a two-hour mix or a
+  90-second announcement" cannot be answered without resolving. On a channel where
+  the music varies, so does everything else. Play it all and let `n` sort it out.
+
+15 entries is also the whole feed, so this is a *subscription* — what is new — and
+not a way to reach a back catalogue.
+
+#### Mixes: much bigger than expected, and not a feed at all
+
+An `RD` list — `watch?v=…&list=RD…&start_radio=1`, the shape that prompted this —
+is generated from the seed video, so there is no RSS for it. `yt-dlp
+--flat-playlist -J` handles it, and the numbers are not what a "radio" suggests:
+
+| Fetched | Entries |
+| --- | --- |
+| with `&start_radio=1` | **500** |
+| the same list without it | **1835** |
+
+Order differs between fetches, but the sets barely do — **492 of 500** ids were
+common to both. So a mix is not a 25-track generator needing refills; it is a large,
+mostly-stable list that can be materialised in one call. And the flat listing
+already carries `duration`, `title`, `channel`, `thumbnails` and `view_count` per
+entry, so unlike the channel feed it needs **no resolve just to populate the table**
+— only to play.
+
+That still wants the [queue](#what-the-ui-has-to-grow), because 500 rows is an
+ordering that outlives the folder it came from. But it does not need the
+append-while-playing machinery that was assumed.
+
+#### Playback: two things break, and one of them is a wall
+
+**The default format cannot be decoded here.** `bestaudio` is itag 251 — Opus in
+WebM. The build has `symphonia-format-isomp4`, `ogg` and `riff`, and codecs `aac`,
+`mp3`, `flac`, `vorbis`, `pcm`. There is **no Matroska/WebM demuxer and no Opus
+decoder**. So `bestaudio` is exactly the wrong thing to ask for. Itag **140** —
+AAC-LC in MP4, 129 kbit — is offered alongside it and lands on `isomp4` + `aac`,
+which are already linked. The fix is one format string, but getting it wrong fails
+at decode time with nothing obviously to do with YouTube.
+
+**Range requests do work,** which was the load-bearing assumption and it holds. A
+resolved `googlevideo.com` URL answered:
+
+```
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 100-1099/108782116
+Accept-Ranges: bytes
+```
+
+Full length, byte ranges, `audio/webm` or `audio/mp4` — precisely what the
+`Read + Seek` reader from step 2 needs.
+
+**But the bytes are gated.** Reads from offset 0 succeeded; every read past roughly
+1 MiB returned **403**, at any window size, with or without a matching User-Agent,
+and reading the first megabyte did not advance the boundary:
+
+```
+offset          0 : 206        range 0-1048576   : 206
+offset    1048576 : 206        range 0-1572863   : 403
+offset    2097152 : 403        no Range header   : 403
+```
+
+`yt-dlp` cannot get past it either, on any video, on any client, and it says why:
+
+```
+tv_simply client https formats require a GVS PO Token which was not provided
+```
+
+An unsigned URL buys a ~1 MiB preview. Full delivery needs a **proof-of-origin
+token**, which yt-dlp does not mint itself — it delegates to a provider plugin that
+runs its own Node server or container, exactly as `rustypipe` delegates to
+`rustypipe-botguard`. Both routes end at the same place: a **third moving part**
+beside the player and the extractor, that has to be installed, kept running and
+kept current.
+
+(Some of those 403s may be an IP flagged by ~30 probe requests in a few minutes.
+But `mweb`, `ios` and `web_safari` refused to even *list* format 140 — a token gate
+that has nothing to do with rate limiting — so the conclusion stands either way.)
+
+#### What this actually means
+
+The order of difficulty is the reverse of what the [YouTube Music
+section](#youtube-music-in-more-detail) assumed. Browsing is the easy half:
+channels are free, mixes are one command and come back richer than the local
+library's own listing. Playback is the hard half, and its cost is not code — it is
+**an extra daemon and a permanent maintenance tax on someone else's schedule.**
+
+Which argues for building it in the order that keeps value regardless:
+
+1. The generic feed source and the `resolve` step. Podcasts use it and work today.
+2. Channel and mix subscriptions as *listings* — titles, durations, art, all of it
+   real and none of it gated.
+3. Audio last, forced to itag 140, behind a feature flag that fails per entry and
+   leaves the rest of the feed list alone.
+
+Steps 1 and 2 are worth having even if step 3 never works again.
+
 ### Cache
 
 Episodes are 50–375 MB each, against ~200 KB for a cover, so the budgets are separate
@@ -297,8 +417,11 @@ touch the file, so what you actually listen to survives.
    musicforprogramming.net is the first entry. Brings the `:` command line, which
    search needs anyway.
 4. **Radio.** Forces the unknown-duration work, which everything else benefits from.
-5. **YouTube Music**, behind a feature flag. Cheap on the playback side once step 1
+5. **YouTube channel and mix subscriptions**, as listings first. The browsing half
+   is free and ungated; the audio half needs a PO token daemon, so it goes last and
+   behind a flag.
+6. **YouTube Music**, behind a feature flag. Cheap on the playback side once step 1
    exists; budget the time for browsing and for keeping extraction alive.
-6. **Spotify**, only if Premium is acceptable and a second playback path is worth it.
+7. **Spotify**, only if Premium is acceptable and a second playback path is worth it.
 
 Steps 1 and 2 are the ones that matter. Everything after is incremental.
