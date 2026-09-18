@@ -88,6 +88,9 @@ fn prepare(
     // exactly as slow as decoding a large JPEG, and this is the same worker, so it
     // costs the interface nothing either way.
     let picture = match art_url {
+        // A track on a tuneterm server: the server finds its art the way the local
+        // library does, embedded picture first.
+        Some(url) if crate::remote::is_remote(url) => crate::remote::cover(url),
         Some(url) => crate::net::get(url).ok(),
         None => library::load_cover_bytes(path),
     };

@@ -12,6 +12,9 @@
 
 BIN     := tuneterm
 MUSIC   ?=
+# podman works the same: make image DOCKER=podman
+DOCKER  ?= docker
+IMAGE   ?= tuneterm-server
 
 ifeq ($(OS),Windows_NT)
 
@@ -84,7 +87,7 @@ endef
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help run dev install uninstall build check test fmt lint bench scan clean clean-cache release-dry
+.PHONY: help run dev install uninstall build check test fmt lint bench scan clean clean-cache release-dry serve image image-run
 
 help: ## Show this help
 	@$(TITLE)
@@ -127,6 +130,15 @@ bench: ## Run the ignored benchmarks and print their numbers
 
 scan: ## Headless dump of folders, tags and cover sizes
 	cargo run --release -- $(MUSIC) --scan
+
+serve: ## Serve MUSIC over gRPC on :7700, without Docker
+	cargo run --release -- serve $(MUSIC)
+
+image: ## Build the server's Docker image (DOCKER=podman works too)
+	$(DOCKER) build -t $(IMAGE) .
+
+image-run: ## Run the image, serving MUSIC on :7700
+	$(DOCKER) run --rm -p 7700:7700 -v "$(MUSIC):/music" -e TUNETERM_TOKEN $(IMAGE)
 
 clean: ## Remove build output
 	cargo clean

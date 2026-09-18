@@ -192,11 +192,71 @@ the same replaceable-slot cancellation the cover loader uses: scrolling the fold
 cannot pile up work. Recently visited folders are remembered, so moving back over one
 is instant.
 
+## Server
+
+`tuneterm serve` shares one music folder over gRPC, and the player browses it
+exactly like a local folder — same panes, same `..`, same breadcrumb, same session
+restore. The protocol is [proto/tuneterm/v1/library.proto](proto/tuneterm/v1/library.proto).
+
+```sh
+docker compose up -d                         # or: make image && make image-run MUSIC=~/Music
+tuneterm tuneterm://TOKEN@nas                # browse and play it
+```
+
+Settings for `compose.yaml` go in a `.env` next to it:
+
+```sh
+MUSIC=/srv/music
+TUNETERM_TOKEN=something-long    # leave out for an open, read-only server
+PUID=1000                        # uploads are owned by this user
+PGID=1000
+```
+
+The image is the server alone — built with `--no-default-features`, so no ALSA and no
+terminal graphics — on distroless, about 40 MB. Without Docker, `tuneterm serve
+~/Music` does the same thing.
+
+Filling it from the terminal:
+
+```sh
+export TUNETERM_SERVER=tuneterm://nas TUNETERM_TOKEN=something-long
+tuneterm push ~/Downloads/Lumen          # -> /Lumen, subfolders and all
+tuneterm push cover.jpg /Lumen/2002      # into an existing folder
+tuneterm ls /Lumen
+tuneterm mv /Lumen/old /Lumen/new
+tuneterm rm -r /Lumen/junk
+```
+
+`push` skips files already there with the same size, so re-running it after an
+interruption only sends what is missing. An upload lands under a hidden temporary name
+and is renamed into place once every byte has arrived; nothing half-written ever shows
+up in a listing.
+
+What the protocol does:
+
+- **One call per pane.** `ListFolders` is the left pane — subfolders with recursive
+  counts. `ListTracks` is the right pane — every track below a folder with its tags,
+  read on the server, so an artist's whole discography is one round trip rather than
+  a walk.
+- **Audio is a server stream from an offset.** `RemoteFile` is the same shape as the
+  HTTP reader: read forwards through one stream, and a seek drops it and opens
+  another further along. Seeking forward within the chunk already received is free.
+- **No index.** Every call reads the filesystem as it is, with the same code the
+  player uses locally, so files copied in by hand appear at once.
+- **Paths cannot escape.** Each is checked lexically (no `..`) and then against the
+  real filesystem, so a symlink inside the music folder cannot reach outside it.
+- **Changes need a token.** With `TUNETERM_TOKEN` set, every call must carry it as a
+  bearer token; without it the server serves anyone and refuses every change.
+
+There is no TLS: on anything but a trusted network, put it behind WireGuard or
+Tailscale.
+
 ## How it works
 
 | File | Role |
 | --- | --- |
-| `src/main.rs` | entry point, graphics-protocol detection, event loop, input |
+| `src/main.rs` | entry point: a subcommand, or the player |
+| `src/tui.rs` | the player's arguments, graphics-protocol detection, event loop, input |
 | `src/app.rs` | all mutable state; no rendering |
 | `src/ui.rs` | rendering only; writes back just the hit-test rects |
 | `src/cover.rs` | cover-art worker: decode + scale, cached |
@@ -208,6 +268,10 @@ is instant.
 | `src/net.rs` | blocking HTTP, and a seekable reader over range requests |
 | `src/player.rs` | thin `rodio` wrapper (play/pause/seek/position/volume) |
 | `src/media.rs` | OS media keys and now-playing metadata (`souvlaki`) |
+| `src/proto.rs` | types generated from `proto/tuneterm/v1/library.proto` (`tonic` + `prost`) |
+| `src/server.rs` | `tuneterm serve`: the gRPC service over one folder |
+| `src/remote.rs` | the client: blocking calls on a small runtime, and a seekable remote file |
+| `src/cli.rs` | `serve`, `push`, `ls`, `mv`, `rm` |
 
 Built on [ratatui](https://ratatui.rs) +
 [ratatui-image](https://github.com/benjajaja/ratatui-image) for drawing,
@@ -492,6 +556,9 @@ are the easy part; the `Source` abstraction and a seekable HTTP reader are the w
   library pauses briefly before the first frame.
 - rodio's decoders cover mp3, flac, m4a/aac, ogg/vorbis and wav. Opus does not work.
 - Seeking a track that has already drained does nothing, per rodio.
+- Descending into a folder on a server waits for its listing on the drawing thread,
+  as a local folder does. Normally milliseconds; against a server that has gone away,
+  up to the 10 s call timeout.
 
 ## License
 

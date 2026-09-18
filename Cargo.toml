@@ -8,35 +8,60 @@ repository = "https://github.com/fess932/tuneterm"
 keywords = ["music", "player", "tui", "terminal", "ratatui"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
+[features]
+default = ["player"]
+# The terminal player. Without it the binary is only the server and the commands
+# that talk to one, which is what the Docker image builds: no audio device, no
+# ALSA headers, no terminal graphics.
+player = [
+    "dep:rodio",
+    "dep:ratatui",
+    "dep:ratatui-image",
+    "dep:souvlaki",
+    "dep:core-foundation-sys",
+    "dep:windows-sys",
+]
+
 [dependencies]
 anyhow = "1.0.104"
 image = "0.25"
 lofty = "0.24"
+prost = "0.14"
 quick-xml = "0.41"
-ratatui = "0.30"
+ratatui = { version = "0.30", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "signal", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
 # chafa is a C library and only improves the halfblocks fallback; the kitty /
 # sixel / iterm2 protocols work without it. Opt back in with `chafa-dyn` after
 # `brew install chafa` if you want nicer art on graphics-less terminals.
-ratatui-image = { version = "11", default-features = false, features = [
+ratatui-image = { version = "11", default-features = false, optional = true, features = [
     "image-defaults",
     "crossterm",
 ] }
-rodio = "0.22"
+rodio = { version = "0.22", optional = true }
 # Media keys. Default features pull libdbus (a C library) on Linux; use_zbus is
 # pure Rust, so the build needs no system packages there either.
-souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+souvlaki = { version = "0.8", default-features = false, optional = true, features = ["use_zbus"] }
 ureq = "3"
 
 # Pumping the AppKit run loop, which is what macOS needs to deliver media keys.
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation-sys = "0.8"
+core-foundation-sys = { version = "0.8", optional = true }
 
 # A window for the media session, and the message pump it needs. See media.rs:
 # SMTC binds a session to a window, and a console application has none of its own.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Graphics_Gdi",         # WNDCLASSW carries GDI handles
     "Win32_System_LibraryLoader", # GetModuleHandleW
     "Win32_System_Threading",     # GetCurrentThreadId, for waking the pump
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# The gRPC code is generated from proto/tuneterm.proto at build time. protoc comes
+# vendored, so neither a developer machine nor the Docker builder has to install it.
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"

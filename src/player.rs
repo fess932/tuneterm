@@ -9,8 +9,12 @@ use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink};
 
 use crate::worker::{Cancel, Wake, Worker};
 
+/// Anything a stream can be read from: a web server or a tuneterm server.
+pub trait Media: std::io::Read + std::io::Seek + Send + Sync {}
+impl<T: std::io::Read + std::io::Seek + Send + Sync> Media for T {}
+
 /// A remote track, decoded far enough to play.
-pub type RemoteSource = Decoder<std::io::BufReader<crate::net::HttpFile>>;
+pub type RemoteSource = Decoder<std::io::BufReader<Box<dyn Media>>>;
 
 /// Open `url` and get it ready for [`AudioPlayer::play_remote`].
 ///
@@ -24,8 +28,15 @@ pub type RemoteSource = Decoder<std::io::BufReader<crate::net::HttpFile>>;
 /// local files. `BufReader` is still wanted here, to turn the decoder's many
 /// small reads into few requests.
 pub fn open_url(url: &str) -> Result<RemoteSource> {
-    let remote = crate::net::HttpFile::open(url).map_err(|e| anyhow::anyhow!(e))?;
-    let len = remote.len();
+    let (remote, len): (Box<dyn Media>, u64) = if crate::remote::is_remote(url) {
+        let file = crate::remote::RemoteFile::open(url).map_err(|e| anyhow::anyhow!(e))?;
+        let len = file.len();
+        (Box::new(file), len)
+    } else {
+        let file = crate::net::HttpFile::open(url).map_err(|e| anyhow::anyhow!(e))?;
+        let len = file.len();
+        (Box::new(file), len)
+    };
     rodio::Decoder::builder()
         .with_data(std::io::BufReader::with_capacity(256 * 1024, remote))
         .with_byte_len(len)
@@ -332,6 +343,37 @@ mod device_loss {
         assert!(
             answered.recv_timeout(Duration::from_secs(2)).is_ok(),
             "clearing blocked on an audio thread that will never answer"
+        );
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+    use crate::server::{TempDir, spawn_for_test, wav};
+    use rodio::Source;
+
+    /// The whole road a track on a server travels: gRPC stream, the seekable
+    /// reader, and a decoder that knows the length — which is what lets it seek
+    /// backwards at all.
+    #[test]
+    fn a_track_on_a_server_decodes_and_seeks_both_ways() {
+        let lib = TempDir::new("decode");
+        std::fs::write(lib.0.join("t.wav"), wav(5)).unwrap();
+        let addr = spawn_for_test(&lib.0, None);
+
+        let mut source = open_url(&format!("tuneterm://{addr}/t.wav")).expect("open");
+        let total = source.total_duration().expect("a length");
+        assert!((total.as_secs_f32() - 5.0).abs() < 0.1, "{total:?}");
+
+        assert!(source.by_ref().take(100).count() == 100, "no samples");
+        source.try_seek(Duration::from_secs(4)).expect("forwards");
+        source.try_seek(Duration::from_secs(1)).expect("backwards");
+        // One second left after 4 of 5 would be 8000 samples; from 1 it is 32000.
+        let rest = source.count();
+        assert!(
+            (31_000..=33_000).contains(&rest),
+            "{rest} samples after seeking back"
         );
     }
 }

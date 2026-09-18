@@ -50,6 +50,56 @@ pub struct Track {
     pub art_url: Option<String>,
 }
 
+/// Where the library lives: this machine's filesystem, or a `tuneterm serve`.
+///
+/// Paths look the same either way — a remote folder is `/Artist/Album`, rooted at
+/// the server's music folder — so the browsing code, the trail back up, the memo
+/// and the saved session never need to ask which one they are walking.
+#[derive(Clone)]
+pub enum Store {
+    Local,
+    Remote(Box<crate::remote::Server>),
+}
+
+impl Store {
+    /// The store a root argument names, and the root to browse in it. A
+    /// `tuneterm://` address is a server, browsed from its top; anything else is a
+    /// folder here.
+    pub fn for_root(root: PathBuf) -> Result<(Self, PathBuf), String> {
+        match root.to_str() {
+            Some(url) if crate::remote::is_remote(url) => {
+                let server = crate::remote::Server::open(url)?;
+                Ok((Store::Remote(Box::new(server)), PathBuf::from("/")))
+            }
+            _ => Ok((Store::Local, root)),
+        }
+    }
+
+    /// What to call the root in the breadcrumb, when it is not a folder name.
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            Store::Local => None,
+            Store::Remote(server) => Some(server.authority()),
+        }
+    }
+
+    pub fn subdirs(&self, dir: &Path) -> Result<Vec<Folder>, String> {
+        match self {
+            Store::Local => Ok(list_subdirs(dir)),
+            Store::Remote(server) => server.folders(dir),
+        }
+    }
+
+    /// See [`scan_tracks_deep`]. A server does the walk itself, in one call, so the
+    /// cancel can only discard its answer rather than cut it short.
+    pub fn tracks(&self, dir: &Path, cancel: &Cancel) -> Result<Vec<Track>, String> {
+        match self {
+            Store::Local => Ok(scan_tracks_deep(dir, cancel)),
+            Store::Remote(server) => server.tracks(dir),
+        }
+    }
+}
+
 /// Immediate subdirectories of `dir` that hold audio anywhere beneath them, with a
 /// recursive track count.
 ///
@@ -325,6 +375,7 @@ pub fn load_cover(path: &Path) -> Option<DynamicImage> {
     image::load_from_memory(&load_cover_bytes(path)?).ok()
 }
 
+#[cfg(feature = "player")]
 /// Turn a feed's episodes into tracks, so everything downstream — the queue, the
 /// play marker, the cover pipeline — needs no idea where they came from.
 pub fn tracks_from_feed(channel: &crate::feed::Channel) -> Vec<Track> {

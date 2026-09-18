@@ -10,7 +10,7 @@ use ratatui_image::protocol::StatefulProtocol;
 
 use crate::config::{self, Feed};
 use crate::cover::{self, CoverLoader};
-use crate::library::{self, Folder, Track};
+use crate::library::{self, Folder, Store, Track};
 use crate::media::{self, Command, NowPlaying};
 use crate::player::{self, AudioPlayer};
 use crate::worker::{Cancel, Wake, Worker};
@@ -67,6 +67,8 @@ impl Tab {
 
 pub struct App {
     pub root: PathBuf,
+    /// Where `root` lives: here, or on a `tuneterm serve`.
+    pub store: Store,
     /// Which source is on screen.
     pub tab: Tab,
     /// Directory the left pane is listing. Never climbs above `root`.
@@ -92,7 +94,7 @@ pub struct App {
     pub tracks_loading: bool,
     /// Hands back the directory it scanned, so a result can never be filed under
     /// whatever the cursor has moved to meanwhile.
-    scan: Worker<PathBuf, (PathBuf, Vec<Track>)>,
+    scan: Worker<PathBuf, (PathBuf, Result<Vec<Track>, String>)>,
     /// Opens remote streams, which blocks for as long as the server takes. Hands
     /// back the URL for the same reason the scan hands back its directory.
     open: Worker<String, (String, Result<player::RemoteSource, String>)>,
@@ -266,7 +268,10 @@ impl App {
     /// `wake` is what every worker rings when it has something, so the loop can
     /// wait instead of asking.
     pub fn new(root: PathBuf, picker: Picker, media: media::Bridge, wake: Wake) -> Result<Self> {
-        let folders = library::list_subdirs(&root);
+        let (store, root) = Store::for_root(root).map_err(anyhow::Error::msg)?;
+        let listed = store.subdirs(&root);
+        let unreachable = listed.as_ref().err().cloned();
+        let folders = listed.unwrap_or_default();
         let mut folder_state = TableState::default();
         if !folders.is_empty() {
             folder_state.select(Some(0));
@@ -276,6 +281,7 @@ impl App {
             cwd: root.clone(),
             trail: Vec::new(),
             root,
+            store: store.clone(),
             folders,
             tracks: Vec::new(),
             folder_state,
@@ -285,10 +291,14 @@ impl App {
             queue_pos: None,
             tracks_dir: None,
             tracks_loading: false,
-            scan: Worker::spawn("scan", wake.clone(), |dir: PathBuf, cancel: &Cancel| {
-                let tracks = library::scan_tracks_deep(&dir, cancel);
-                (dir, tracks)
-            }),
+            scan: Worker::spawn(
+                "scan",
+                wake.clone(),
+                move |dir: PathBuf, cancel: &Cancel| {
+                    let tracks = store.tracks(&dir, cancel);
+                    (dir, tracks)
+                },
+            ),
             scan_generation: 0,
             memo: HashMap::new(),
             memo_order: VecDeque::new(),
@@ -348,7 +358,12 @@ impl App {
             status: String::new(),
             should_quit: false,
         };
-        app.status = if app.folders.is_empty() && library::scan_tracks(&app.root).is_empty() {
+        let empty = app.folders.is_empty()
+            && matches!(app.store, Store::Local)
+            && library::scan_tracks(&app.root).is_empty();
+        app.status = if let Some(err) = unreachable {
+            format!("error: {err}")
+        } else if empty {
             format!("no audio found under {}", app.root.display())
         } else {
             format!("{} folders", app.folders.len())
@@ -425,7 +440,10 @@ impl App {
         let mut trail = Vec::new();
         for part in rest.components() {
             let next = cwd.join(part);
-            let Some(row) = library::list_subdirs(&cwd)
+            let Some(row) = self
+                .store
+                .subdirs(&cwd)
+                .unwrap_or_default()
                 .iter()
                 .position(|sub| sub.path == next)
             else {
@@ -440,7 +458,7 @@ impl App {
 
         self.cwd = cwd;
         self.trail = trail;
-        self.folders = library::list_subdirs(&self.cwd);
+        self.folders = self.store.subdirs(&self.cwd).unwrap_or_default();
         self.folder_state = TableState::default();
 
         // Land on the folder that was highlighted, and on the first real row when
@@ -632,8 +650,18 @@ impl App {
             return;
         }
         self.tracks_loading = false;
-        self.remember(dir, tracks.clone());
-        self.show_tracks(tracks);
+        match tracks {
+            Ok(tracks) => {
+                self.remember(dir, tracks.clone());
+                self.show_tracks(tracks);
+            }
+            // Not remembered, so moving back onto the folder asks again.
+            Err(err) => {
+                self.tracks_dir = None;
+                self.status = format!("error: {err}");
+                self.show_tracks(Vec::new());
+            }
+        }
     }
 
     fn show_tracks(&mut self, tracks: Vec<Track>) {
@@ -687,7 +715,13 @@ impl App {
             return;
         };
         let target = folder.path.clone();
-        let subdirs = library::list_subdirs(&target);
+        let subdirs = match self.store.subdirs(&target) {
+            Ok(subdirs) => subdirs,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
+            }
+        };
         // A leaf album has nothing to descend into; the right pane already shows it.
         if subdirs.is_empty() {
             self.focus = Pane::Tracks;
@@ -708,12 +742,20 @@ impl App {
 
     /// Step back up, restoring the row we came from. Stops at the root.
     pub fn leave_folder(&mut self) {
-        let Some((parent, selected)) = self.trail.pop() else {
+        let Some((parent, selected)) = self.trail.last().cloned() else {
             return;
         };
+        let folders = match self.store.subdirs(&parent) {
+            Ok(folders) => folders,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
+            }
+        };
+        self.trail.pop();
         self.cwd = parent;
         self.touch_settings();
-        self.folders = library::list_subdirs(&self.cwd);
+        self.folders = folders;
         self.folder_state = TableState::default();
         let rows = self.folder_row_count();
         if rows > 0 {
@@ -728,11 +770,14 @@ impl App {
 
     /// Breadcrumb for the pane title: the root's name plus the way down.
     pub fn here(&self) -> String {
-        let root_name = self
-            .root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.root.display().to_string());
+        let root_name = match self.store.label() {
+            Some(label) => label.to_string(),
+            None => self
+                .root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.root.display().to_string()),
+        };
         match self.cwd.strip_prefix(&self.root) {
             Ok(rest) if rest.as_os_str().is_empty() => root_name,
             Ok(rest) => {
@@ -1788,6 +1833,53 @@ mod tests {
         app.reload_tracks();
         app.wait_for_tracks();
         assert_eq!(app.tracks.len(), 6, "both albums of the artist");
+    }
+
+    /// A server is browsed by the very same code as a folder: listing, descending,
+    /// the `..` row, the breadcrumb, climbing back — and a track plays from it.
+    #[test]
+    fn a_server_browses_and_plays_like_a_folder() {
+        let lib = Library::new("served");
+        let addr = crate::server::spawn_for_test(&lib.0, None);
+        let mut app = App::new(
+            PathBuf::from(format!("tuneterm://{addr}")),
+            Picker::halfblocks(),
+            media::Bridge::detached(),
+            Wake::none(),
+        )
+        .expect("app init");
+        app.wait_for_tracks();
+
+        let labels: Vec<_> = app.folders.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["Alpha", "Artist", "Beta"]);
+        assert_eq!(app.here(), addr.to_string());
+        assert!(!app.shows_up_row(), "no way up from the top of a server");
+
+        app.folder_state.select(Some(folder_row(&app, "Artist")));
+        app.enter_folder();
+        app.wait_for_tracks();
+        assert_eq!(app.cwd, PathBuf::from("/Artist"));
+        assert!(app.shows_up_row());
+        assert_eq!(app.here(), format!("{addr} / Artist"));
+        assert_eq!(app.tracks.len(), 2, "the first album, Early, is listed");
+
+        app.play_index(0);
+        assert!(app.is_opening(), "a stream opens off the drawing thread");
+        for _ in 0..400 {
+            app.poll_open();
+            if !app.is_opening() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.status.starts_with("playing"), "{}", app.status);
+
+        app.leave_folder();
+        assert_eq!(app.cwd, PathBuf::from("/"));
+        assert_eq!(
+            app.selected_folder().map(|f| f.label.as_str()),
+            Some("Artist")
+        );
     }
 
     #[test]

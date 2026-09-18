@@ -1,0 +1,151 @@
+// The tuneterm library protocol.
+//
+// A server exposes one music folder. Everything is addressed by a path relative to
+// that folder, `/`-separated, with "" for the folder itself — the same tree the
+// player browses locally, so the two can share every line of browsing code.
+//
+// Authentication is a bearer token in the `authorization` metadata. A server started
+// without a token serves anyone and refuses every change.
+
+syntax = "proto3";
+
+package tuneterm.v1;
+
+service LibraryService {
+  // Immediate subfolders that hold audio somewhere beneath them, with a recursive
+  // track count. What the left pane shows.
+  rpc ListFolders(ListFoldersRequest) returns (ListFoldersResponse);
+
+  // Every track at or below a folder, tags read. What the right pane shows, and
+  // the reason this is one call rather than a walk: an artist's whole
+  // discography arrives in a single round trip.
+  rpc ListTracks(ListTracksRequest) returns (ListTracksResponse);
+
+  // Cover art for a track, undecoded: embedded picture first, then a sidecar
+  // image in its folder. Empty when there is none.
+  rpc GetCover(GetCoverRequest) returns (GetCoverResponse);
+
+  // Size of a file, or whether a path exists at all.
+  rpc Stat(StatRequest) returns (StatResponse);
+
+  // A file from `offset` to the end, in chunks. Seeking is closing the stream and
+  // opening another one further along.
+  rpc Read(ReadRequest) returns (stream ReadResponse);
+
+  // Every entry directly inside a folder — files of any kind and all folders, not
+  // just the audio. For managing the library, not for browsing it.
+  rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
+
+  // Write a file. The first message carries the header and may carry data; the
+  // rest carry data. Lands under a temporary name and is renamed into place only
+  // once every byte has arrived, so an interrupted upload leaves nothing behind
+  // that looks finished.
+  rpc Upload(stream UploadRequest) returns (UploadResponse);
+
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+  rpc Move(MoveRequest) returns (MoveResponse);
+}
+
+message ListFoldersRequest {
+  string path = 1;
+}
+
+message ListFoldersResponse {
+  repeated Folder folders = 1;
+}
+
+message Folder {
+  string path = 1;
+  string name = 2;
+  uint32 count = 3;
+}
+
+message ListTracksRequest {
+  string path = 1;
+}
+
+message ListTracksResponse {
+  repeated Track tracks = 1;
+}
+
+message Track {
+  string path = 1;
+  string title = 2;
+  string artist = 3;
+  string album = 4;
+  // Absent when the file could not be read far enough to tell.
+  optional uint64 duration_ms = 5;
+  uint64 size = 6;
+}
+
+message GetCoverRequest {
+  // A track.
+  string path = 1;
+}
+
+message GetCoverResponse {
+  bytes data = 1;
+}
+
+message StatRequest {
+  string path = 1;
+}
+
+message StatResponse {
+  bool exists = 1;
+  bool is_dir = 2;
+  uint64 size = 3;
+}
+
+message ReadRequest {
+  string path = 1;
+  uint64 offset = 2;
+}
+
+message ReadResponse {
+  bytes data = 1;
+}
+
+message ListEntriesRequest {
+  string path = 1;
+}
+
+message ListEntriesResponse {
+  repeated Entry entries = 1;
+}
+
+message Entry {
+  string name = 1;
+  bool is_dir = 2;
+  uint64 size = 3;
+}
+
+message UploadRequest {
+  // Only in the first message.
+  UploadHeader header = 1;
+  bytes data = 2;
+}
+
+message UploadHeader {
+  string path = 1;
+  uint64 size = 2;
+}
+
+message UploadResponse {
+  uint64 size = 1;
+}
+
+message RemoveRequest {
+  string path = 1;
+  // Required to remove a folder that is not empty.
+  bool recursive = 2;
+}
+
+message RemoveResponse {}
+
+message MoveRequest {
+  string from = 1;
+  string to = 2;
+}
+
+message MoveResponse {}
