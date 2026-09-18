@@ -502,7 +502,16 @@ impl App {
         self.audio.set_volume(settings.volume.get());
         self.shuffle = settings.shuffle;
 
-        let session = settings.session;
+        let mut session = settings.session;
+        // What was local last time may have been moved to the server since, with
+        // `u`: then it is found there, under the same path.
+        session.folder = session.folder.map(|path| self.on_server_if_moved(path));
+        session.selected = session.selected.map(|path| self.on_server_if_moved(path));
+        session.track = session.track.map(|track| {
+            self.on_server_if_moved(PathBuf::from(&track))
+                .to_string_lossy()
+                .into_owned()
+        });
         if let Some(folder) = session.folder.as_deref() {
             self.restore_folder(folder, session.selected.as_deref());
         }
@@ -536,6 +545,30 @@ impl App {
         if !self.tracks_loading && !self.feed_loading {
             self.try_resume();
         }
+    }
+
+    /// Where a local path went if it was moved to the server: the same place under
+    /// the server's address. Unchanged if it still exists here, is not in this
+    /// library, or there is no server.
+    fn on_server_if_moved(&self, path: PathBuf) -> PathBuf {
+        let Some(server) = self.remote.server.as_deref() else {
+            return path;
+        };
+        if path.exists() || library::remote_url(&path).is_some() {
+            return path;
+        }
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return path;
+        };
+        let rel = rel
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel.is_empty() {
+            return path;
+        }
+        PathBuf::from(format!("{server}/{rel}"))
     }
 
     /// Walk back down to `folder`, rebuilding the trail as if it had been browsed
@@ -2497,6 +2530,117 @@ mod tests {
         app.folder_state.select(Some(folder_row(&app, "Beta")));
         app.move_selected();
         assert!(!app.is_moving(), "a server folder is not moved");
+    }
+
+    /// The session as it looked in the report: at the root, an artist
+    /// highlighted, a track of theirs playing, and a server added. It must come
+    /// back playing.
+    #[test]
+    fn a_playing_track_comes_back_playing_with_a_server_added() {
+        for reachable in [true, false] {
+            let lib = Library::new(&format!("resume-server-{reachable}"));
+            let served = crate::server::TempDir::new("resume-served");
+            let server = if reachable {
+                format!(
+                    "tuneterm://{}",
+                    crate::server::spawn_for_test(&served.0, None)
+                )
+            } else {
+                "tuneterm://127.0.0.1:1".to_string()
+            };
+            let track = lib.0.join("Beta").join("02 song.wav");
+            let settings = config::Settings {
+                session: config::Session {
+                    tab: Some("local".into()),
+                    folder: Some(lib.0.clone()),
+                    selected: Some(lib.0.join("Beta")),
+                    track: Some(track.to_string_lossy().into_owned()),
+                    position: Duration::from_millis(500),
+                    playing: true,
+                    ..Default::default()
+                },
+                remote: config::Remote {
+                    server: Some(server),
+                    token: None,
+                },
+                ..Default::default()
+            };
+
+            let mut app = lib.raw_app();
+            app.settings_file = None;
+            app.restore(settings);
+            app.wait_for_tracks();
+            settle_resume(&mut app);
+            assert_eq!(
+                app.now_playing().map(|t| t.path.clone()),
+                Some(track.clone()),
+                "reachable={reachable}: nothing came back: {}",
+                app.status
+            );
+            assert!(
+                !app.audio.is_paused(),
+                "reachable={reachable}: came back paused"
+            );
+        }
+    }
+
+    /// A folder moved to the server while its track was playing: the session names
+    /// the local path, which is gone, and the track comes back from the server.
+    #[test]
+    fn a_track_moved_to_the_server_comes_back_from_there() {
+        let lib = Library::new("resume-moved");
+        let served = crate::server::TempDir::new("resume-moved-served");
+        let addr = crate::server::spawn_for_test(&served.0, None);
+        std::fs::create_dir_all(served.0.join("Beta")).unwrap();
+        for name in ["01 song.wav", "02 song.wav"] {
+            std::fs::rename(
+                lib.0.join("Beta").join(name),
+                served.0.join("Beta").join(name),
+            )
+            .unwrap();
+        }
+        std::fs::remove_dir(lib.0.join("Beta")).unwrap();
+
+        let settings = config::Settings {
+            session: config::Session {
+                tab: Some("local".into()),
+                folder: Some(lib.0.clone()),
+                selected: Some(lib.0.join("Beta")),
+                track: Some(
+                    lib.0
+                        .join("Beta/02 song.wav")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                position: Duration::from_millis(500),
+                playing: true,
+                ..Default::default()
+            },
+            remote: config::Remote {
+                server: Some(format!("tuneterm://{addr}")),
+                token: None,
+            },
+            ..Default::default()
+        };
+        let mut app = lib.raw_app();
+        app.settings_file = None;
+        app.restore(settings);
+        app.wait_for_tracks();
+        wait_for_open(&mut app);
+        settle_resume(&mut app);
+
+        assert_eq!(
+            app.selected_folder().map(|f| f.path.clone()),
+            Some(PathBuf::from(format!("tuneterm://{addr}/Beta"))),
+            "the highlight followed the folder to the server"
+        );
+        assert_eq!(
+            app.now_playing().map(|t| t.path.clone()),
+            Some(PathBuf::from(format!("tuneterm://{addr}/Beta/02 song.wav"))),
+            "{}",
+            app.status
+        );
+        assert!(!app.audio.is_paused(), "came back paused: {}", app.status);
     }
 
     /// A mistyped address is refused where it was typed, and an unreachable one
