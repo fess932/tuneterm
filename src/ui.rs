@@ -206,12 +206,17 @@ fn draw_transfer(frame: &mut Frame, view: &crate::app::TransferView, pane: Rect)
     frame.render_widget(Clear, area);
 
     let done = view.finished.is_some();
+    let (mark, colour) = match (done, view.failed) {
+        (_, true) => ("✕", ACCENT_ALT),
+        (true, false) => ("✓", ACCENT),
+        (false, false) => ("↑", ACCENT),
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if done { DIM } else { ACCENT }))
+        .border_style(Style::new().fg(if done && !view.failed { DIM } else { colour }))
         .title(Span::styled(
-            format!(" {} {} ", if done { "✓" } else { "↑" }, view.title),
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            format!(" {mark} {} ", view.title),
+            Style::new().fg(colour).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(" l hides ", Style::new().fg(DIM))).right_aligned());
     let inner = block.inner(area);
@@ -232,14 +237,25 @@ fn draw_transfer(frame: &mut Frame, view: &crate::app::TransferView, pane: Rect)
         ])
     };
 
+    let message = |mark: &str, text: &str, colour: Color| {
+        Line::from(vec![
+            Span::styled(format!("{mark} "), Style::new().fg(colour)),
+            Span::styled(
+                shorten_end(text, width.saturating_sub(2)),
+                Style::new().fg(colour),
+            ),
+        ])
+    };
+
     let mut lines: Vec<Line> = view
         .log
         .iter()
         .map(|line| match line {
             LogLine::Sent { name, size } => row("✓", name, human(*size), ACCENT),
             LogLine::Same { name, .. } => row("=", name, "already there".into(), DIM),
-            LogLine::Failed(text) => row("✕", text, String::new(), ACCENT_ALT),
-            LogLine::Note(text) => row("·", text, String::new(), DIM),
+            // Messages keep their start, which is where the reason is.
+            LogLine::Failed(text) => message("✕", text, ACCENT_ALT),
+            LogLine::Note(text) => message("·", text, DIM),
         })
         .collect();
     if let Some((name, sent, size)) = &view.current {
@@ -282,8 +298,8 @@ fn draw_transfer(frame: &mut Frame, view: &crate::app::TransferView, pane: Rect)
         LineGauge::default()
             .ratio(ratio)
             .label(Span::styled(
-                shorten_start(&label, width.saturating_sub(8)),
-                Style::new().fg(if done { ACCENT } else { TEXT }),
+                shorten_end(&label, width.saturating_sub(8)),
+                Style::new().fg(if done { colour } else { TEXT }),
             ))
             .filled_style(Style::new().fg(ACCENT))
             .unfilled_style(Style::new().fg(DIM))
@@ -291,6 +307,18 @@ fn draw_transfer(frame: &mut Frame, view: &crate::app::TransferView, pane: Rect)
             .unfilled_symbol(ratatui::symbols::line::HORIZONTAL),
         bar,
     );
+}
+
+/// Keep the start of `text` within `max` characters, marking the cut.
+fn shorten_end(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let head: String = text.chars().take(max - 1).collect();
+    format!("{head}…")
 }
 
 /// Keep the end of `text` within `max` characters, marking the cut.

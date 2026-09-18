@@ -107,7 +107,46 @@ fn parse(url: &str) -> Result<(Option<String>, String, String), String> {
     } else {
         format!("{host}:{}", proto::DEFAULT_PORT)
     };
+    check_host(&host)?;
     Ok((token, host, path.to_string()))
+}
+
+/// Refuse a host that could not be one, with a reason a person can act on. Without
+/// this, `token&nas` becomes a host name, fails as a DNS error, and shows the token
+/// on screen.
+fn check_host(authority: &str) -> Result<(), String> {
+    let (host, port) = match authority.rfind(']') {
+        Some(bracket) => (&authority[..=bracket], &authority[bracket + 1..]),
+        None => match authority.rsplit_once(':') {
+            Some((host, _)) => (host, &authority[host.len()..]),
+            None => (authority, ""),
+        },
+    };
+    let port = port.trim_start_matches(':');
+    if port.parse::<u16>().is_err() {
+        return Err(format!("the port must be a number, not `{port}`"));
+    }
+    if let Some(inside) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return match inside
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            true => Ok(()),
+            false => Err(format!("`{host}` is not an IPv6 address")),
+        };
+    }
+    if host.is_empty() {
+        return Err("no host".into());
+    }
+    match host
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    {
+        None => Ok(()),
+        Some(c) => Err(format!(
+            "`{c}` cannot be in a host name; a token goes first, with @: TOKEN@host:port"
+        )),
+    }
 }
 
 /// `host:port` of an address, for showing. `None` if it is not one.
@@ -412,7 +451,8 @@ pub fn push(
                 pushed.done.push(sent);
             }
             Err(err) => {
-                pushed.error = Some(format!("/{remote}: {err}"));
+                // The reason first: it is what a truncated line must still show.
+                pushed.error = Some(format!("{err} — /{remote}"));
                 break;
             }
         }
@@ -558,28 +598,50 @@ pub fn join(dir: &str, name: &str) -> String {
     }
 }
 
-/// Delete what a push confirmed, then any folder under `local` it left empty.
-/// Files the push did not confirm, and hidden files it never sent, stay — and so
-/// do the folders holding them.
-pub fn remove_moved(local: &Path, pushed: &Pushed) -> io::Result<usize> {
+/// Delete what a push confirmed, and the folders it came from.
+///
+/// When everything arrived, the moved folder goes entirely, subfolders and all —
+/// including what was never sent because it was hidden, like `.DS_Store`, which
+/// would otherwise keep every folder alive. When the push stopped partway, only
+/// the confirmed files go, and only the folders that leaves empty.
+///
+/// `keep` is never removed, only emptied: the library's own root, when what was
+/// moved is the songs lying directly in it.
+pub fn remove_moved(local: &Path, pushed: &Pushed, keep: &Path) -> io::Result<usize> {
     let mut removed = 0;
     for sent in &pushed.done {
         std::fs::remove_file(&sent.local)?;
         removed += 1;
     }
-    if local.is_dir() {
-        prune(local)?;
+    if !local.is_dir() {
+        return Ok(removed);
+    }
+    let complete = pushed.error.is_none() && pushed.done.len() == pushed.total;
+    match (complete, local == keep) {
+        (true, false) => std::fs::remove_dir_all(local)?,
+        (true, true) => {
+            for entry in std::fs::read_dir(local)?.flatten() {
+                let path = entry.path();
+                if path.is_dir() && !path.is_symlink() {
+                    std::fs::remove_dir_all(&path)?;
+                }
+            }
+        }
+        (false, _) => prune(local, keep)?,
     }
     Ok(removed)
 }
 
 /// Remove empty folders bottom-up, `dir` included.
-fn prune(dir: &Path) -> io::Result<()> {
+fn prune(dir: &Path, keep: &Path) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
         if path.is_dir() && !path.is_symlink() {
-            prune(&path)?;
+            prune(&path, keep)?;
         }
+    }
+    if dir == keep {
+        return Ok(());
     }
     match std::fs::remove_dir(dir) {
         Ok(()) => Ok(()),
@@ -598,7 +660,7 @@ fn prune(dir: &Path) -> io::Result<()> {
 /// A status as a person would want it in one line.
 pub fn describe(status: &Status) -> String {
     match status.code() {
-        tonic::Code::Unavailable => format!("server unreachable: {}", status.message()),
+        tonic::Code::Unavailable => format!("cannot reach the server ({})", status.message()),
         tonic::Code::Unauthenticated => "wrong or missing token for the server".into(),
         tonic::Code::DeadlineExceeded => "the server took too long".into(),
         // A server built from an older schema answers a call it does not know with
@@ -926,6 +988,14 @@ mod tests {
             assert_eq!(got_token.as_deref(), token, "{typed}");
         }
         assert!(split_address("").is_err());
+
+        // The mistake that prompted the check: `&` where `@` belongs.
+        let err = split_address("simple_token&192.168.0.200:7700").unwrap_err();
+        assert!(err.contains('@'), "{err}");
+        assert!(split_address("nas:port").is_err());
+        assert!(split_address("[zz::1]").is_err());
+        assert!(split_address("my_nas.local:7700").is_ok());
+        assert!(split_address("[::1]:7700").is_ok());
     }
 
     #[test]
@@ -951,12 +1021,48 @@ mod tests {
         assert!(pushed.error.is_none(), "{:?}", pushed.error);
         assert_eq!(pushed.done.len(), 2, "the hidden file is not sent");
         pushed.done.truncate(1);
-        remove_moved(&local.0.join("Lumen"), &pushed).unwrap();
+        pushed.error = Some("stopped".into());
+        remove_moved(&local.0.join("Lumen"), &pushed, &local.0).unwrap();
         assert!(!album.join("01.wav").exists());
         assert!(
             album.join("02.wav").exists(),
             "an unconfirmed file was deleted"
         );
         assert!(served.0.join("Lumen/2002/02.wav").is_file());
+    }
+
+    /// A complete move takes the folder with it, subfolders, `.DS_Store` and all;
+    /// the library root is only ever emptied.
+    #[test]
+    fn a_complete_move_leaves_no_folders_behind() {
+        let local = TempDir::new("move-whole");
+        for dir in ["Lumen/2002", "Lumen/2004/CD1"] {
+            let dir = local.0.join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("01.wav"), wav(1)).unwrap();
+            std::fs::write(dir.join(".DS_Store"), b"x").unwrap();
+        }
+        std::fs::write(local.0.join("loose.wav"), wav(1)).unwrap();
+        let served = TempDir::new("move-whole-dst");
+        let addr = spawn_for_test(&served.0, Some("k"));
+        let server = Server::open(&format!("tuneterm://k@{addr}")).unwrap();
+        let uploaded = Arc::new(AtomicU64::new(0));
+
+        let lumen = local.0.join("Lumen");
+        let pushed = push(&server, &lumen, "Lumen", &uploaded, |_| {});
+        assert!(pushed.error.is_none(), "{:?}", pushed.error);
+        remove_moved(&lumen, &pushed, &local.0).unwrap();
+        assert!(
+            !lumen.exists(),
+            "the moved folder is gone, subfolders and all"
+        );
+        assert!(served.0.join("Lumen/2004/CD1/01.wav").is_file());
+
+        // The root itself: its songs go, it stays.
+        let pushed = push(&server, &local.0, "", &uploaded, |_| {});
+        assert!(pushed.error.is_none(), "{:?}", pushed.error);
+        remove_moved(&local.0, &pushed, &local.0).unwrap();
+        assert!(local.0.is_dir(), "the library root is never removed");
+        assert!(!local.0.join("loose.wav").exists());
     }
 }

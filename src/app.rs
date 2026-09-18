@@ -225,6 +225,9 @@ pub struct Prompt {
     pub input: String,
     /// Shown under the field: usage, or why the last attempt was refused.
     pub hint: String,
+    /// An input that already failed a check the user may overrule: Enter on it
+    /// again goes ahead anyway.
+    pub retry: Option<String>,
 }
 
 /// What Enter in the prompt does.
@@ -268,6 +271,8 @@ struct Move {
     started: Instant,
     /// Set once the thread is finished: what to say about it.
     finished: Option<String>,
+    /// It finished without moving everything.
+    failed: bool,
 }
 
 impl Move {
@@ -315,6 +320,7 @@ pub struct TransferView {
     pub speed: f64,
     pub left: Option<Duration>,
     pub finished: Option<String>,
+    pub failed: bool,
 }
 
 /// What was playing when the app was last closed, waiting for a listing to appear
@@ -952,6 +958,7 @@ impl App {
             title: "Add server",
             input: String::new(),
             hint,
+            retry: None,
         });
     }
 
@@ -970,8 +977,20 @@ impl App {
                 return;
             }
         };
-        if let Err(err) = remote::Server::connect(&server, token.as_deref()) {
-            prompt.hint = err;
+        let connected = match remote::Server::connect(&server, token.as_deref()) {
+            Ok(connected) => connected,
+            Err(err) => {
+                prompt.hint = err;
+                return;
+            }
+        };
+        // Try it now, while the address is still in the field to fix. A server
+        // that is only switched off can still be added, on a second Enter.
+        if prompt.retry.as_deref() != Some(prompt.input.as_str())
+            && let Err(err) = connected.folders("")
+        {
+            prompt.hint = format!("{err} · Enter again to add it anyway");
+            prompt.retry = Some(prompt.input.clone());
             return;
         }
         self.prompt = None;
@@ -1050,6 +1069,7 @@ impl App {
             log: VecDeque::new(),
             started: Instant::now(),
             finished: None,
+            failed: false,
         }));
         let uploaded = Arc::new(AtomicU64::new(0));
         self.transfer = Some(Transfer {
@@ -1061,6 +1081,7 @@ impl App {
         self.status = format!("moving {label}…");
 
         let wake = self.wake.clone();
+        let root = self.root.clone();
         let spawned = std::thread::Builder::new()
             .name("move".into())
             .spawn(move || {
@@ -1099,7 +1120,7 @@ impl App {
                     wake.nudge();
                 };
                 let pushed = remote::push(&server, &local, &rel, &uploaded, report);
-                let removed = remote::remove_moved(&local, &pushed);
+                let removed = remote::remove_moved(&local, &pushed, &root);
 
                 let Ok(mut state) = state.lock() else {
                     return;
@@ -1113,13 +1134,20 @@ impl App {
                         state.note(LogLine::Note(format!("deleted {n} files here")));
                         format!("moved {label} to the server: {} files", pushed.done.len())
                     }
+                    (Some(_), Ok(0)) => {
+                        state.note(LogLine::Note("nothing deleted here".into()));
+                        state.failed = true;
+                        "move failed; nothing was deleted".to_string()
+                    }
                     (Some(_), Ok(n)) => {
                         state.note(LogLine::Note(format!(
-                            "deleted the {n} files the server has; the rest stay here"
+                            "deleted {n} files the server has; the rest stay here"
                         )));
+                        state.failed = true;
                         format!("move stopped after {n} of {} files", pushed.total)
                     }
                     (_, Err(err)) => {
+                        state.failed = true;
                         state.note(LogLine::Failed(format!("could not delete here: {err}")));
                         format!("uploaded, but could not delete here: {err}")
                     }
@@ -1189,6 +1217,7 @@ impl App {
             speed,
             left,
             finished: state.finished.clone(),
+            failed: state.failed,
         })
     }
 
@@ -1889,6 +1918,7 @@ impl App {
             title: "Add feed",
             input: String::new(),
             hint: "paste an RSS URL · Enter to add · Esc to cancel".into(),
+            retry: None,
         });
     }
 
@@ -2467,6 +2497,46 @@ mod tests {
         app.folder_state.select(Some(folder_row(&app, "Beta")));
         app.move_selected();
         assert!(!app.is_moving(), "a server folder is not moved");
+    }
+
+    /// A mistyped address is refused where it was typed, and an unreachable one
+    /// is only added when asked twice.
+    #[test]
+    fn a_server_address_is_checked_before_it_is_kept() {
+        let lib = Library::new("check-server");
+        let mut app = lib.app();
+        app.settings_file = None;
+        let type_in = |app: &mut App, text: &str| {
+            app.open_add_server();
+            for c in text.chars() {
+                app.prompt_key(c);
+            }
+            app.submit_prompt();
+        };
+
+        type_in(&mut app, "simple_token&192.168.0.200:7700");
+        let hint = app
+            .prompt
+            .as_ref()
+            .map(|p| p.hint.clone())
+            .expect("kept open");
+        assert!(hint.contains('@'), "{hint}");
+        assert_eq!(app.remote.server, None);
+        app.cancel_prompt();
+
+        // Nothing listens on port 1: refused at once, kept open to fix.
+        type_in(&mut app, "tok@127.0.0.1:1");
+        let hint = app
+            .prompt
+            .as_ref()
+            .map(|p| p.hint.clone())
+            .expect("kept open");
+        assert!(hint.contains("anyway"), "{hint}");
+        assert_eq!(app.remote.server, None);
+        app.submit_prompt();
+        assert!(app.prompt.is_none(), "a second Enter adds it anyway");
+        assert_eq!(app.remote.server.as_deref(), Some("tuneterm://127.0.0.1:1"));
+        assert_eq!(app.remote.token.as_deref(), Some("tok"));
     }
 
     /// The button at the end of the root: a click or Enter opens the field.
