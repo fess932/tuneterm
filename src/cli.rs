@@ -9,8 +9,8 @@
 //! tuneterm rm -r /Lumen/junk
 //! ```
 //!
-//! The server comes from `--server` or `TUNETERM_SERVER`, the token from the
-//! address or `TUNETERM_TOKEN`.
+//! The server comes from `--server` or `server` in `settings.txt`, the token from
+//! the address or `token` there.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -51,7 +51,11 @@ SERVER
     {name} rm [-r] PATH
                       Remove a file, or a folder with -r.
 
-    These take --server tuneterm://HOST[:PORT], or TUNETERM_SERVER.",
+    These take --server tuneterm://HOST[:PORT], or use `server` from
+    settings.txt; the token is `token` there unless the address has one:
+
+        server = tuneterm://nas
+        token = something-long",
         name = env!("CARGO_PKG_NAME"),
         port = proto::DEFAULT_PORT,
     )
@@ -64,7 +68,9 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     match command.as_str() {
         "serve" => serve(options),
         other => {
-            let server = options.server()?;
+            let remote = crate::config::load_settings().remote;
+            remote::set_default_token(remote.token);
+            let server = options.server(remote.server)?;
             let runtime = remote::runtime();
             match other {
                 "push" => runtime.block_on(push(&server, &options.positional)),
@@ -103,13 +109,17 @@ impl Options {
         Ok(options)
     }
 
-    fn server(&mut self) -> anyhow::Result<Server> {
+    fn server(&mut self, configured: Option<String>) -> anyhow::Result<Server> {
         let address = self
             .server
             .take()
-            .or_else(|| std::env::var("TUNETERM_SERVER").ok())
+            .or(configured)
             .filter(|address| !address.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("which server? pass --server or set TUNETERM_SERVER"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "which server? pass --server, or set `server = ...` in settings.txt"
+                )
+            })?;
         let address = if remote::is_remote(&address) {
             address
         } else {

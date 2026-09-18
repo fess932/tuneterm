@@ -9,8 +9,8 @@
 //!
 //! A server is written `tuneterm://[token@]host[:port]`, and a file on it
 //! `tuneterm://host:port/path/inside`. Tracks carry the second form without the
-//! token, so no secret ever reaches `settings.txt`; the token lives in the
-//! [`Server`] registered for that host, or in `TUNETERM_TOKEN`.
+//! token, so no secret ends up in the saved session; the token lives in the
+//! [`Server`] registered for that host, or is the `token` from `settings.txt`.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -109,6 +109,17 @@ fn parse(url: &str) -> Result<(Option<String>, String, String), String> {
     Ok((token, host, path.to_string()))
 }
 
+/// The token for a server whose address carries none: `token` in `settings.txt`.
+fn default_token() -> &'static Mutex<Option<String>> {
+    static TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    TOKEN.get_or_init(Default::default)
+}
+
+/// Set once at startup, from the settings, before any server is opened.
+pub fn set_default_token(token: Option<String>) {
+    *default_token().lock().expect("token lock poisoned") = token.filter(|t| !t.is_empty());
+}
+
 fn registry() -> &'static Mutex<HashMap<String, Server>> {
     static SERVERS: OnceLock<Mutex<HashMap<String, Server>>> = OnceLock::new();
     SERVERS.get_or_init(Default::default)
@@ -121,7 +132,7 @@ impl Server {
     pub fn open(url: &str) -> Result<Self, String> {
         let (token, authority, _) = parse(url)?;
         let token = token
-            .or_else(|| std::env::var("TUNETERM_TOKEN").ok())
+            .or_else(|| default_token().lock().expect("token lock poisoned").clone())
             .filter(|token| !token.is_empty());
         let header = token
             .map(|token| {
@@ -285,8 +296,16 @@ fn local(path: &str) -> PathBuf {
 pub fn describe(status: &Status) -> String {
     match status.code() {
         tonic::Code::Unavailable => format!("server unreachable: {}", status.message()),
-        tonic::Code::Unauthenticated => "the server wants a token (TUNETERM_TOKEN)".into(),
+        tonic::Code::Unauthenticated => {
+            "wrong or missing token: set `token = ...` in settings.txt".into()
+        }
         tonic::Code::DeadlineExceeded => "the server took too long".into(),
+        // A server built from an older schema answers a call it does not know with
+        // no message at all.
+        tonic::Code::Unimplemented => {
+            "the server does not know this call; client and server versions differ".into()
+        }
+        _ if status.message().is_empty() => format!("{:?}", status.code()),
         _ => status.message().to_string(),
     }
 }

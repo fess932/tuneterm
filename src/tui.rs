@@ -134,9 +134,7 @@ KEYS
 {server}
 
 ENVIRONMENT
-    TUNETERM_SERVER      Server for push, ls, mv and rm.
-    TUNETERM_TOKEN       Token for a server, when its address carries none; for
-                         serve, the token clients must present.
+    TUNETERM_TOKEN       For serve: the token clients must present.
     TUNETERM_CACHE_DIR   Cache root. Defaults to the platform cache directory,
                          with art capped at 200 MB and audio at 2000 MB.
     TUNETERM_CONFIG_DIR  Where feeds.txt and settings.txt live. Defaults to the
@@ -315,6 +313,10 @@ pub fn main(args: Vec<String>) -> Result<()> {
 
     // One-off: entries predate the art/audio split and are now unreachable.
     cache::tidy();
+
+    // Before anything can open a server: a `tuneterm://` root without a token in it
+    // uses the one from the settings.
+    crate::remote::set_default_token(config::load_settings().remote.token);
 
     let root = args.root.unwrap_or_else(default_root);
     if args.scan {

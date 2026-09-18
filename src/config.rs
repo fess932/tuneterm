@@ -75,6 +75,17 @@ pub struct Settings {
     /// The session, in as much detail as it can be put back: which source was
     /// showing, where in it you were, and what was playing.
     pub session: Session,
+    /// A `tuneterm serve` to talk to. Set by hand, never by the app — which only
+    /// has to carry it through its own writes.
+    pub remote: Remote,
+}
+
+/// The server `push`, `ls`, `mv` and `rm` use when not given one, and the token for
+/// any server whose address does not carry its own.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Remote {
+    pub server: Option<String>,
+    pub token: Option<String>,
 }
 
 /// Where the app was when it was last closed.
@@ -160,6 +171,16 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> 
     text.push_str(&format!("volume = {:.3}\n", settings.volume.get()));
     text.push_str(&format!("shuffle = {}\n", u8::from(settings.shuffle)));
 
+    let remote = &settings.remote;
+    text.push_str(
+        "\n# a tuneterm server: `server` for push, ls, mv and rm; `token` for any server\n",
+    );
+    for (key, value) in [("server", &remote.server), ("token", &remote.token)] {
+        if let Some(value) = value.as_deref().filter(|value| !value.is_empty()) {
+            text.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+
     let session = &settings.session;
     text.push_str("\n# where the last session left off\n");
     for (key, value) in [
@@ -234,6 +255,8 @@ fn parse_settings(text: &str) -> Settings {
             "selected" => settings.session.selected = Some(PathBuf::from(value)),
             "feed" => settings.session.feed = Some(value.to_string()),
             "track" => settings.session.track = Some(value.to_string()),
+            "server" => settings.remote.server = Some(value.to_string()),
+            "token" => settings.remote.token = Some(value.to_string()),
             "position" => {
                 if let Ok(secs) = value.parse::<f64>()
                     && secs.is_finite()
@@ -434,6 +457,10 @@ mod tests {
                 position: Duration::from_secs_f64(93.4),
                 playing: true,
             },
+            remote: Remote {
+                server: Some("tuneterm://nas".into()),
+                token: Some("s3cret=with=equals".into()),
+            },
         }
     }
 
@@ -456,6 +483,8 @@ mod tests {
             "track = https://example.com/ep 12.mp3",
             "position = 93.4",
             "playing = 1",
+            "server = tuneterm://nas",
+            "token = s3cret=with=equals",
         ] {
             assert!(text.contains(line), "missing {line:?} in:\n{text}");
         }

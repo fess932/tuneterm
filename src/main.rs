@@ -7,7 +7,6 @@ mod app;
 #[cfg(feature = "player")]
 mod cache;
 mod cli;
-#[cfg(feature = "player")]
 mod config;
 #[cfg(feature = "player")]
 mod cover;

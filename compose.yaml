@@ -1,11 +1,7 @@
 # docker compose up -d        (or: podman compose up -d)
 #
-# Put the settings in a .env file next to this one:
-#
-#   MUSIC=/path/to/music
-#   TUNETERM_TOKEN=something-long      # leave out for an open, read-only server
-#   PUID=1000                          # `id -u`: uploads are owned by this user
-#   PGID=1000                          # `id -g`
+# Change the token, and point the volume at the music. Without a token the server
+# is open to anyone and read-only.
 
 services:
   tuneterm:
@@ -15,7 +11,6 @@ services:
     ports:
       - "7700:7700"
     volumes:
-      - "${MUSIC:-./music}:/music"
+      - "./music:/music"
     environment:
-      TUNETERM_TOKEN: "${TUNETERM_TOKEN:-}"
-    user: "${PUID:-1000}:${PGID:-1000}"
+      TUNETERM_TOKEN: "TOKEN"

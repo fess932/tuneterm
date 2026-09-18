@@ -145,6 +145,9 @@ pub struct App {
     /// Where the settings are written, held rather than looked up for the same
     /// reason as `feeds_file`: tests must not touch the user's real file.
     pub settings_file: Option<PathBuf>,
+    /// The server and token from the settings. The app never changes them, but it
+    /// rewrites the whole file, so it has to hand them back.
+    remote_settings: config::Remote,
     /// When the session last changed, if it has not been written out yet.
     settings_dirty: Option<Instant>,
     /// The playhead as last written, so `tick` can tell how far it has drifted.
@@ -309,6 +312,7 @@ impl App {
             shuffle_order: Vec::new(),
             rng: Rng::new(),
             settings_file: config::settings_path(),
+            remote_settings: config::Remote::default(),
             settings_dirty: None,
             saved_position: Duration::ZERO,
             resume: None,
@@ -384,6 +388,7 @@ impl App {
     /// step checks, and anything that no longer holds is dropped rather than
     /// reported — a first run and a stale line should both just start normally.
     pub fn restore(&mut self, settings: config::Settings) {
+        self.remote_settings = settings.remote.clone();
         self.audio.set_volume(settings.volume.get());
         self.shuffle = settings.shuffle;
 
@@ -1149,6 +1154,7 @@ impl App {
                 position: self.audio.position(),
                 playing: self.is_playing_something() && !self.audio.is_paused(),
             },
+            remote: self.remote_settings.clone(),
         };
         self.saved_position = settings.session.position;
         if let Err(err) = config::save_settings_to(&path, &settings) {

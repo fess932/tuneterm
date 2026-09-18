@@ -203,17 +203,13 @@ docker compose up -d                         # or: make image && make image-run 
 tuneterm tuneterm://TOKEN@nas                # browse and play it
 ```
 
-Settings for `compose.yaml` go in a `.env` next to it:
-
-```sh
-MUSIC=/srv/music
-TUNETERM_TOKEN=something-long    # leave out for an open, read-only server
-PUID=1000                        # uploads are owned by this user
-PGID=1000
-```
+`compose.yaml` serves `./music` with the token `TOKEN`. Change both in the file:
+the volume to where the music is, the token to something long. Without a token the
+server is open to anyone and read-only.
 
 The image is the server alone — built with `--no-default-features`, so no ALSA and no
-terminal graphics — on distroless, about 40 MB. Without Docker, `tuneterm serve
+terminal graphics — on distroless, about 40 MB. It runs as root, so on a rootful
+Docker host whatever `push` uploads is owned by root. Without Docker, `tuneterm serve
 ~/Music` does the same thing.
 
 Filling it from the terminal:

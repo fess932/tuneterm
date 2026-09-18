@@ -13,8 +13,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --no-default-features \
     && cp target/release/tuneterm /tuneterm
 
-# glibc and nothing else; runs as an unprivileged user unless compose says which.
-FROM gcr.io/distroless/cc-debian12:nonroot
+# glibc and nothing else. Runs as root, so uploads on a rootful Docker host are
+# owned by root.
+FROM gcr.io/distroless/cc-debian12
 COPY --from=build /tuneterm /usr/local/bin/tuneterm
 EXPOSE 7700
 VOLUME ["/music"]
