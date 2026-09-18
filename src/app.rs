@@ -2177,7 +2177,11 @@ mod tests {
             app.prompt_key(c);
         }
         app.submit_prompt();
-        assert!(app.prompt.is_none(), "{:?}", app.prompt.as_ref().map(|p| &p.hint));
+        assert!(
+            app.prompt.is_none(),
+            "{:?}",
+            app.prompt.as_ref().map(|p| &p.hint)
+        );
 
         // Alpha is in both: shown once, as the local one.
         let labels: Vec<_> = app.folders.iter().map(|f| f.label.as_str()).collect();
@@ -2228,7 +2232,10 @@ mod tests {
         app.folder_state.select(Some(folder_row(&app, "Beta")));
         app.ask_move();
         assert!(
-            matches!(app.prompt.as_ref().map(|p| &p.kind), Some(PromptKind::Move { .. })),
+            matches!(
+                app.prompt.as_ref().map(|p| &p.kind),
+                Some(PromptKind::Move { .. })
+            ),
             "a move is confirmed first"
         );
         assert!(lib.0.join("Beta").is_dir(), "nothing happens before Enter");
@@ -2238,7 +2245,10 @@ mod tests {
         assert!(app.status.starts_with("moved Beta"), "{}", app.status);
         assert!(!lib.0.join("Beta").exists(), "the local copy is gone");
         for name in ["01 song.wav", "02 song.wav"] {
-            assert!(served.0.join("Beta").join(name).is_file(), "{name} not on the server");
+            assert!(
+                served.0.join("Beta").join(name).is_file(),
+                "{name} not on the server"
+            );
         }
         let beta = app
             .folders
@@ -2280,7 +2290,10 @@ mod tests {
         assert_eq!(app.tracks.len(), 2, "the first album, Early, is listed");
 
         app.leave_folder();
-        assert_eq!(app.selected_folder().map(|f| f.label.as_str()), Some("Artist"));
+        assert_eq!(
+            app.selected_folder().map(|f| f.label.as_str()),
+            Some("Artist")
+        );
     }
 
     #[test]

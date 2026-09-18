@@ -702,7 +702,10 @@ mod tests {
         let top = folders(&format!("tuneterm://{addr}")).unwrap();
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].label, "Artist");
-        assert_eq!(top[0].path, PathBuf::from(format!("tuneterm://{addr}/Artist")));
+        assert_eq!(
+            top[0].path,
+            PathBuf::from(format!("tuneterm://{addr}/Artist"))
+        );
         assert_eq!(top[0].count, 2, "the count is recursive");
 
         let below = folders(&top[0].path.to_string_lossy()).unwrap();
@@ -847,7 +850,10 @@ mod tests {
     fn addresses_split_into_parts() {
         assert_eq!(path_of("tuneterm://nas/Lumen/2002"), "Lumen/2002");
         assert_eq!(path_of("tuneterm://nas"), "");
-        assert_eq!(authority_of("tuneterm://k@nas/x").as_deref(), Some("nas:7700"));
+        assert_eq!(
+            authority_of("tuneterm://k@nas/x").as_deref(),
+            Some("nas:7700")
+        );
         for (typed, server, token) in [
             ("nas", "tuneterm://nas:7700", None),
             ("  k@nas:9 ", "tuneterm://nas:9", Some("k")),
@@ -879,7 +885,10 @@ mod tests {
         pushed.done.truncate(1);
         remove_moved(&local.0.join("Lumen"), &pushed).unwrap();
         assert!(!album.join("01.wav").exists());
-        assert!(album.join("02.wav").exists(), "an unconfirmed file was deleted");
+        assert!(
+            album.join("02.wav").exists(),
+            "an unconfirmed file was deleted"
+        );
         assert!(served.0.join("Lumen/2002/02.wav").is_file());
     }
 }
