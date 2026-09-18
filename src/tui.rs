@@ -128,7 +128,9 @@ KEYS
     j/k, PgUp/PgDn    Move selection         n / p         Next / previous
     Enter             Open folder / play     [ / ]         Seek -/+ 5s
     a                 Add a server (Local)   u             Move to the server
-    l                 Show / hide move log
+    l                 Show / hide move log   ?             All keys
+    r                 Rename                 m             Move within
+    x                 Delete (y confirms)
     Backspace         Go up a folder         + / -         Volume
     1 - 3             Switch source          s             Shuffle
     q, Esc, Ctrl-C    Quit
@@ -518,7 +520,15 @@ fn on_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The key list is up until the next key, which it swallows: whatever that key
+    // was, it was pressed to get back, not to act.
+    if app.show_keys {
+        app.show_keys = false;
+        return;
+    }
+
     match key.code {
+        KeyCode::Char('?') => app.show_keys = true,
         // Escape closes the move log first, if it is up.
         KeyCode::Esc if app.hide_transfer_log() => {}
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
@@ -545,6 +555,9 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('a') if app.tab == app::Tab::Feeds => app.open_add_feed(),
         KeyCode::Char('a') if app.tab == app::Tab::Local => app.open_add_server(),
         KeyCode::Char('u') if app.tab == app::Tab::Local => app.move_selected(),
+        KeyCode::Char('r') if app.tab == app::Tab::Local => app.ask_rename(),
+        KeyCode::Char('m') if app.tab == app::Tab::Local => app.ask_relocate(),
+        KeyCode::Char('x') if app.tab == app::Tab::Local => app.ask_delete(),
         KeyCode::Char('d') if app.tab == app::Tab::Feeds => app.remove_selected_feed(),
         KeyCode::Char('1') => app.select_tab(app::Tab::Local),
         KeyCode::Char('2') => app.select_tab(app::Tab::Feeds),

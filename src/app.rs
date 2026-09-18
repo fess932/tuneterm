@@ -90,6 +90,9 @@ pub struct App {
     /// whatever folder you happened to be hovering.
     queue: Vec<Track>,
     queue_pos: Option<usize>,
+    /// The folder the queue was listed from, so a restart can rebuild it even
+    /// when the cursor has moved elsewhere since. `None` for a feed.
+    queue_dir: Option<PathBuf>,
     /// Directory whose tracks are listed, and whether the worker is still on it.
     tracks_dir: Option<PathBuf>,
     pub tracks_loading: bool,
@@ -213,6 +216,8 @@ pub struct App {
 
     pub status: String,
     pub should_quit: bool,
+    /// The key list, drawn over everything until the next key.
+    pub show_keys: bool,
 }
 
 /// A floating one-line input. Opened by the Add button, closed by Enter or Escape.
@@ -235,20 +240,18 @@ pub struct Prompt {
 pub enum PromptKind {
     Feed,
     Server,
+    /// A new name for this folder or track, in the same place.
+    Rename(PathBuf),
+    /// A new path for this folder or track, from the top of its library.
+    Relocate(PathBuf),
+    /// Waiting for `y` before deleting this folder or track.
+    Delete(PathBuf),
 }
 
-/// One line of a move's log.
+/// One line of a move's log: something that went wrong, or how it ended. Files
+/// that arrived are not listed — the bar counts them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogLine {
-    Sent {
-        name: String,
-        size: u64,
-    },
-    /// Already on the server with the same size, so not sent again.
-    Same {
-        name: String,
-        size: u64,
-    },
     Failed(String),
     Note(String),
 }
@@ -265,8 +268,10 @@ struct Move {
     done_files: usize,
     /// Bytes of files the server already had: done, but never sent.
     skipped_bytes: u64,
-    /// The file being sent: its name, size, and the byte counter when it began.
-    current: Option<(String, u64, u64)>,
+    /// The files being sent, several at once: name, size, and each one's own
+    /// byte counter. A file leaves when it is done; the log is not a record of
+    /// every file, only of what is happening and what went wrong.
+    sending: Vec<(String, u64, Arc<AtomicU64>)>,
     log: VecDeque<LogLine>,
     started: Instant,
     /// Set once the thread is finished: what to say about it.
@@ -310,8 +315,8 @@ struct Transfer {
 pub struct TransferView {
     pub title: String,
     pub log: Vec<LogLine>,
-    /// The file being sent: name, bytes sent, size.
-    pub current: Option<(String, u64, u64)>,
+    /// The files being sent: name, bytes sent, size.
+    pub sending: Vec<(String, u64, u64)>,
     pub files_done: usize,
     pub files: usize,
     pub bytes_done: u64,
@@ -331,6 +336,23 @@ struct Resume {
     position: Duration,
     /// Whether it was playing rather than paused when the app was closed.
     playing: bool,
+}
+
+/// Where to put the playhead for a remembered track. Past the end of one that has
+/// been re-encoded shorter, or simply finished last time, it starts again rather
+/// than at a point that is not there any more.
+fn resume_point(resume: &Resume, duration: Option<Duration>) -> Duration {
+    match duration {
+        Some(total) if resume.position >= total => Duration::ZERO,
+        _ => resume.position,
+    }
+}
+
+/// The last part of a path or an address, for showing.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 /// Two clicks on the same row within this window count as a double click.
@@ -393,6 +415,7 @@ impl App {
             focus: Pane::Folders,
             queue: Vec::new(),
             queue_pos: None,
+            queue_dir: None,
             tracks_dir: None,
             tracks_loading: false,
             scan: Worker::spawn(
@@ -464,6 +487,7 @@ impl App {
             published: None,
             status: String::new(),
             should_quit: false,
+            show_keys: false,
         };
         let empty = app.folders.is_empty()
             && library::remote_url(&app.root).is_none()
@@ -507,11 +531,24 @@ impl App {
         // `u`: then it is found there, under the same path.
         session.folder = session.folder.map(|path| self.on_server_if_moved(path));
         session.selected = session.selected.map(|path| self.on_server_if_moved(path));
+        session.queue = session.queue.map(|path| self.on_server_if_moved(path));
         session.track = session.track.map(|track| {
             self.on_server_if_moved(PathBuf::from(&track))
                 .to_string_lossy()
                 .into_owned()
         });
+        // Back to what was playing, not to wherever the cursor had wandered: the
+        // queue's folder, highlighted in the folder that holds it. Tracks lying
+        // loose in the root have no row of their own, so there the cursor goes
+        // back where it was.
+        if session.track.is_some()
+            && let Some(queue) = session.queue.take()
+            && queue != self.root
+            && let Some(parent) = queue.parent()
+        {
+            session.folder = Some(parent.to_path_buf());
+            session.selected = Some(queue);
+        }
         if let Some(folder) = session.folder.as_deref() {
             self.restore_folder(folder, session.selected.as_deref());
         }
@@ -634,16 +671,7 @@ impl App {
         else {
             return;
         };
-
-        // Past the end of a track that has been re-encoded shorter, or simply
-        // finished last time: start it again rather than at a point that is not
-        // there any more.
-        let duration = self.tracks[index].duration;
-        let at = match duration {
-            Some(total) if resume.position >= total => Duration::ZERO,
-            _ => resume.position,
-        };
-
+        let at = resume_point(&resume, self.tracks[index].duration);
         self.resume_at = Some((resume.track, at));
         self.resume_playing = resume.playing;
         self.play_index(index);
@@ -1098,7 +1126,7 @@ impl App {
             bytes: 0,
             done_files: 0,
             skipped_bytes: 0,
-            current: None,
+            sending: Vec::new(),
             log: VecDeque::new(),
             started: Instant::now(),
             finished: None,
@@ -1127,25 +1155,21 @@ impl App {
                             state.files = files;
                             state.bytes = bytes;
                         }
-                        remote::Step::Start { remote, size, .. } => {
+                        remote::Step::Start { remote, size, sent } => {
                             let name = state.name(remote);
-                            state.current = Some((name, size, uploaded.load(Ordering::Relaxed)));
+                            state.sending.push((name, size, Arc::clone(sent)));
                         }
+                        remote::Step::Failed { remote } => {
+                            let name = state.name(remote);
+                            state.sending.retain(|(n, _, _)| *n != name);
+                        }
+                        // Done files leave the card; the bar counts them.
                         remote::Step::Done { index, sent } => {
                             let name = state.name(&sent.remote);
                             state.done_files = index;
-                            state.current = None;
+                            state.sending.retain(|(n, _, _)| *n != name);
                             if sent.skipped {
                                 state.skipped_bytes += sent.size;
-                                state.note(LogLine::Same {
-                                    name,
-                                    size: sent.size,
-                                });
-                            } else {
-                                state.note(LogLine::Sent {
-                                    name,
-                                    size: sent.size,
-                                });
                             }
                         }
                     }
@@ -1158,7 +1182,7 @@ impl App {
                 let Ok(mut state) = state.lock() else {
                     return;
                 };
-                state.current = None;
+                state.sending.clear();
                 if let Some(err) = &pushed.error {
                     state.note(LogLine::Failed(err.clone()));
                 }
@@ -1193,6 +1217,201 @@ impl App {
             self.transfer = None;
             self.status = format!("error: {err}");
         }
+    }
+
+    /// What `r`, `m` and `x` act on: the highlighted folder in the left pane, or
+    /// the highlighted track in the right one. Its path, and what to call it.
+    fn edit_target(&self) -> Option<(PathBuf, String)> {
+        if self.tab != Tab::Local {
+            return None;
+        }
+        match self.focus {
+            Pane::Folders => self
+                .selected_folder()
+                .map(|folder| (folder.path.clone(), folder.label.clone())),
+            Pane::Tracks => {
+                let track = self.tracks.get(self.track_state.selected()?)?;
+                let name = file_name(&track.path);
+                Some((track.path.clone(), name))
+            }
+        }
+    }
+
+    /// The path of `target` from the top of its library: the local root, or the
+    /// server's music folder.
+    fn library_path(&self, target: &Path) -> Option<String> {
+        match library::remote_url(target) {
+            Some(url) => Some(remote::path_of(url)),
+            None => Some(
+                target
+                    .strip_prefix(&self.root)
+                    .ok()?
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ),
+        }
+    }
+
+    /// `r`: a new name for the highlighted folder or track.
+    pub fn ask_rename(&mut self) {
+        let Some((target, name)) = self.edit_target() else {
+            return;
+        };
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Rename(target),
+            title: "Rename",
+            input: name,
+            hint: "new name · Enter renames · Esc cancels".into(),
+            retry: None,
+        });
+    }
+
+    /// `m`: a new place for the highlighted folder or track, as a path from the
+    /// top of its library. Local things stay local and server things stay on the
+    /// server; `u` is what crosses over.
+    pub fn ask_relocate(&mut self) {
+        let Some((target, _)) = self.edit_target() else {
+            return;
+        };
+        let Some(path) = self.library_path(&target) else {
+            return;
+        };
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Relocate(target),
+            title: "Move to",
+            input: path,
+            hint: "path from the top of the library, folders are made as needed · Enter · Esc"
+                .into(),
+            retry: None,
+        });
+    }
+
+    /// `x`: delete the highlighted folder or track, once `y` confirms it.
+    pub fn ask_delete(&mut self) {
+        let Some((target, name)) = self.edit_target() else {
+            return;
+        };
+        let place = if library::remote_url(&target).is_some() {
+            "on the server"
+        } else {
+            "here"
+        };
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Delete(target),
+            title: "Delete",
+            input: String::new(),
+            hint: format!("delete {name} {place}, for good? y deletes · Esc keeps it"),
+            retry: None,
+        });
+    }
+
+    fn submit_rename(&mut self, target: PathBuf) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        let name = prompt.input.trim().to_string();
+        if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
+            prompt.hint = "a name, without / — to put it elsewhere, use m".into();
+            return;
+        }
+        let Some(path) = self.library_path(&target) else {
+            return;
+        };
+        let to = match path.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{name}"),
+            None => name.clone(),
+        };
+        self.change(&target, &to, format!("renamed to {name}"));
+    }
+
+    fn submit_relocate(&mut self, target: PathBuf) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        let to = prompt.input.trim().trim_matches('/').to_string();
+        if to.is_empty()
+            || to
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            prompt.hint = "a path like Artist/Album, from the top of the library".into();
+            return;
+        }
+        self.change(&target, &to, format!("moved to /{to}"));
+    }
+
+    /// Rename or move `target` to `to`, a path from the top of its own library.
+    /// Refuses to overwrite: whatever is at `to` already stays.
+    fn change(&mut self, target: &Path, to: &str, done: String) {
+        let result = match library::remote_url(target) {
+            Some(url) => remote::move_to(url, to),
+            None => {
+                let dest = to
+                    .split('/')
+                    .fold(self.root.clone(), |path, part| path.join(part));
+                if dest.exists() {
+                    Err(format!("/{to} already exists"))
+                } else if dest.starts_with(target) {
+                    Err("cannot move a folder into itself".into())
+                } else {
+                    dest.parent()
+                        .map_or(Ok(()), std::fs::create_dir_all)
+                        .and_then(|()| std::fs::rename(target, &dest))
+                        .map_err(|err| err.to_string())
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.prompt = None;
+                self.status = done;
+                self.refresh_listing();
+            }
+            // Kept open, so a typo can be fixed rather than typed again.
+            Err(err) => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.hint = err;
+                }
+            }
+        }
+    }
+
+    fn delete(&mut self, target: &Path) {
+        let name = file_name(target);
+        let result = match library::remote_url(target) {
+            Some(url) => remote::remove(url),
+            // Never the library itself — only ever something listed inside it.
+            None if target == self.root || !target.starts_with(&self.root) => {
+                Err("refusing to delete the library itself".into())
+            }
+            None if target.is_dir() => std::fs::remove_dir_all(target).map_err(|e| e.to_string()),
+            None => std::fs::remove_file(target).map_err(|e| e.to_string()),
+        };
+        self.status = match result {
+            Ok(()) => format!("deleted {name}"),
+            Err(err) => format!("could not delete {name}: {err}"),
+        };
+        self.refresh_listing();
+    }
+
+    /// List the folder on screen again after something in it changed, keeping the
+    /// cursor on the same row as far as the new list allows.
+    fn refresh_listing(&mut self) {
+        self.memo.clear();
+        self.memo_order.clear();
+        self.tracks_dir = None;
+        let cwd = self.cwd.clone();
+        let selected = self.folder_state.selected();
+        self.folders = self.list(&cwd).unwrap_or_default();
+        self.folder_state = TableState::default();
+        let rows = self.folder_row_count();
+        if rows > 0 {
+            self.folder_state
+                .select(Some(selected.unwrap_or(0).min(rows - 1)));
+        }
+        self.reload_tracks();
     }
 
     /// True while a folder is on its way to the server.
@@ -1236,13 +1455,13 @@ impl App {
         Some(TransferView {
             title: state.title.clone(),
             log: state.log.iter().cloned().collect(),
-            current: state.current.as_ref().map(|(name, size, from)| {
-                (
-                    name.clone(),
-                    uploaded.saturating_sub(*from).min(*size),
-                    *size,
-                )
-            }),
+            sending: state
+                .sending
+                .iter()
+                .map(|(name, size, sent)| {
+                    (name.clone(), sent.load(Ordering::Relaxed).min(*size), *size)
+                })
+                .collect(),
             files_done: state.done_files,
             files: state.files,
             bytes_done,
@@ -1276,19 +1495,7 @@ impl App {
         }
         self.status = message;
         // Both sides changed: nothing remembered about either still holds.
-        self.memo.clear();
-        self.memo_order.clear();
-        self.tracks_dir = None;
-        let cwd = self.cwd.clone();
-        let selected = self.folder_state.selected();
-        self.folders = self.list(&cwd).unwrap_or_default();
-        self.folder_state = TableState::default();
-        let rows = self.folder_row_count();
-        if rows > 0 {
-            self.folder_state
-                .select(Some(selected.unwrap_or(0).min(rows - 1)));
-        }
-        self.reload_tracks();
+        self.refresh_listing();
     }
 
     /// Block until a move has finished. Tests only: the real loop polls.
@@ -1354,6 +1561,10 @@ impl App {
             return;
         }
         self.queue = self.tracks.clone();
+        self.queue_dir = match self.tab {
+            Tab::Local => self.tracks_dir.clone(),
+            _ => None,
+        };
         if self.shuffle {
             self.reshuffle_from(Some(idx));
         }
@@ -1698,6 +1909,7 @@ impl App {
                     .map(|track| track.path.to_string_lossy().into_owned()),
                 position: self.audio.position(),
                 playing: self.is_playing_something() && !self.audio.is_paused(),
+                queue: self.now_playing().and(self.queue_dir.clone()),
             },
             remote: self.remote.clone(),
         };
@@ -1962,6 +2174,20 @@ impl App {
     /// Feed a keystroke to the open input. Returns whether it was consumed, so the
     /// caller knows not to also treat it as a shortcut.
     pub fn prompt_key(&mut self, key: char) -> bool {
+        // Deleting asks one question, answered with one key: nothing typed here
+        // is text, and nothing but `y` goes ahead.
+        if let Some(Prompt {
+            kind: PromptKind::Delete(target),
+            ..
+        }) = &self.prompt
+        {
+            if matches!(key, 'y' | 'Y') {
+                let target = target.clone();
+                self.prompt = None;
+                self.delete(&target);
+            }
+            return true;
+        }
         match self.prompt.as_mut() {
             Some(prompt) => {
                 prompt.input.push(key);
@@ -1982,6 +2208,10 @@ impl App {
     pub fn submit_prompt(&mut self) {
         match self.prompt.as_ref().map(|prompt| prompt.kind.clone()) {
             Some(PromptKind::Server) => return self.submit_server(),
+            Some(PromptKind::Rename(target)) => return self.submit_rename(target),
+            Some(PromptKind::Relocate(target)) => return self.submit_relocate(target),
+            // Only `y` deletes; Enter is not an answer.
+            Some(PromptKind::Delete(_)) => return,
             Some(PromptKind::Feed) => {}
             None => return,
         }
@@ -2082,6 +2312,11 @@ impl App {
     pub fn click(&mut self, pos: Position, now: Instant) {
         // An open prompt owns the screen; a stray click must not act behind it.
         if self.prompt.is_some() {
+            return;
+        }
+        // Like a key, a click closes the key list and does nothing else.
+        if self.show_keys {
+            self.show_keys = false;
             return;
         }
         if self.add_area.contains(pos) {
@@ -2494,19 +2729,11 @@ mod tests {
             .expect("the log stays up after the move");
         assert_eq!((log.files_done, log.files), (2, 2));
         assert_eq!(log.bytes_done, log.bytes);
-        assert!(log.finished.is_some() && log.current.is_none());
-        let sent: Vec<_> = log
-            .log
-            .iter()
-            .filter_map(|line| match line {
-                LogLine::Sent { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
+        assert!(log.finished.is_some() && log.sending.is_empty());
         assert_eq!(
-            sent,
-            ["01 song.wav", "02 song.wav"],
-            "names are inside the folder"
+            log.log,
+            [LogLine::Note("deleted 2 files here".into())],
+            "files that arrived are not listed, only how it ended"
         );
         assert!(app.hide_transfer_log(), "Escape closes the log first");
         assert!(app.transfer_view().is_none());
@@ -2641,6 +2868,154 @@ mod tests {
             app.status
         );
         assert!(!app.audio.is_paused(), "came back paused: {}", app.status);
+    }
+
+    /// `r`, `m` and `x` on local things: a folder renamed in place, a track moved
+    /// into another folder, a folder deleted only once `y` says so.
+    #[test]
+    fn local_things_are_renamed_moved_and_deleted() {
+        let lib = Library::new("edit-local");
+        let mut app = lib.app();
+        let type_in = |app: &mut App, text: &str| {
+            if let Some(prompt) = app.prompt.as_mut() {
+                prompt.input.clear();
+            }
+            for c in text.chars() {
+                app.prompt_key(c);
+            }
+            app.submit_prompt();
+        };
+
+        app.select_folder(folder_row(&app, "Beta"));
+        app.wait_for_tracks();
+        app.ask_rename();
+        assert_eq!(app.prompt.as_ref().map(|p| p.input.as_str()), Some("Beta"));
+        type_in(&mut app, "Gamma");
+        assert!(
+            app.prompt.is_none(),
+            "{:?}",
+            app.prompt.as_ref().map(|p| &p.hint)
+        );
+        assert!(lib.0.join("Gamma").is_dir() && !lib.0.join("Beta").exists());
+        app.wait_for_tracks();
+
+        // A track, from the right pane, into another folder that does not exist yet.
+        app.select_folder(folder_row(&app, "Gamma"));
+        app.wait_for_tracks();
+        app.focus = Pane::Tracks;
+        app.track_state.select(Some(0));
+        app.ask_relocate();
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.input.as_str()),
+            Some("Gamma/01 song.wav")
+        );
+        type_in(&mut app, "Singles/01 song.wav");
+        assert!(lib.0.join("Singles/01 song.wav").is_file());
+
+        // Onto something that exists: refused, field kept open.
+        app.track_state.select(Some(0));
+        app.ask_relocate();
+        type_in(&mut app, "Alpha/01 song.wav");
+        assert!(
+            app.prompt
+                .as_ref()
+                .is_some_and(|p| p.hint.contains("exists"))
+        );
+        app.cancel_prompt();
+
+        // Delete waits for `y`: Enter and any other key do nothing.
+        app.focus = Pane::Folders;
+        app.select_folder(folder_row(&app, "Gamma"));
+        app.ask_delete();
+        app.submit_prompt();
+        app.prompt_key('n');
+        assert!(lib.0.join("Gamma").is_dir(), "deleted without a y");
+        app.prompt_key('y');
+        assert!(app.prompt.is_none());
+        assert!(!lib.0.join("Gamma").exists(), "{}", app.status);
+    }
+
+    /// The same keys on a server folder go through the server.
+    #[test]
+    fn server_things_are_renamed_and_deleted() {
+        let lib = Library::new("edit-remote");
+        let served = crate::server::TempDir::new("edit-remote-served");
+        std::fs::create_dir_all(served.0.join("Far")).unwrap();
+        std::fs::write(served.0.join("Far/01.wav"), silent_wav(1)).unwrap();
+        let addr = crate::server::spawn_for_test(&served.0, Some("k"));
+        let mut app = lib.app();
+        app.settings_file = None;
+        app.remote = config::Remote {
+            server: Some(format!("tuneterm://{addr}")),
+            token: Some("k".into()),
+        };
+        remote::Server::connect(&format!("tuneterm://{addr}"), Some("k")).unwrap();
+        app.relist_root();
+
+        app.select_folder(folder_row(&app, "Far"));
+        app.ask_rename();
+        app.prompt.as_mut().unwrap().input = "Near".into();
+        app.submit_prompt();
+        assert!(
+            app.prompt.is_none(),
+            "{:?}",
+            app.prompt.as_ref().map(|p| &p.hint)
+        );
+        assert!(served.0.join("Near/01.wav").is_file());
+        assert!(
+            app.folders.iter().any(|f| f.label == "Near"),
+            "not listed again"
+        );
+
+        app.select_folder(folder_row(&app, "Near"));
+        app.ask_delete();
+        app.prompt_key('y');
+        assert!(!served.0.join("Near").exists(), "{}", app.status);
+    }
+
+    /// Quit after the cursor wandered off the playing album: the restart goes
+    /// back to the album — highlighted in the folder above it, not entered — and
+    /// the track carries on.
+    #[test]
+    fn a_restart_goes_back_to_what_was_playing_not_to_the_cursor() {
+        let lib = Library::new("resume-wandered");
+        let file = lib.0.join("settings.txt");
+
+        let mut before = lib.app();
+        before.settings_file = Some(file.clone());
+        before.select_folder(folder_row(&before, "Artist"));
+        before.wait_for_tracks();
+        before.enter_folder();
+        before.wait_for_tracks();
+        before.select_folder(folder_row(&before, "Late"));
+        before.wait_for_tracks();
+        before.play_index(1);
+        let track = before.now_playing().expect("playing").path.clone();
+
+        // Wander: up to the root, onto another album.
+        before.leave_folder();
+        before.select_folder(folder_row(&before, "Beta"));
+        before.wait_for_tracks();
+        before.save_settings(true);
+
+        let mut after = lib.raw_app();
+        after.restore(config::load_settings_from(&file));
+        after.wait_for_tracks();
+        settle_resume(&mut after);
+
+        assert_eq!(
+            after.cwd,
+            lib.0.join("Artist"),
+            "the folder that holds the album"
+        );
+        assert_eq!(
+            after.selected_folder().map(|f| f.label.as_str()),
+            Some("Late"),
+            "the cursor is on the album, not inside it"
+        );
+        assert!(after.can_leave(), "the way back up to the root is there");
+        assert_eq!(after.now_playing().map(|t| t.path.clone()), Some(track));
+        assert!(!after.audio.is_paused(), "{}", after.status);
     }
 
     /// A mistyped address is refused where it was typed, and an unreachable one

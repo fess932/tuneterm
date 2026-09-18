@@ -252,7 +252,7 @@ fn push(server: &Server, args: &[String]) -> anyhow::Result<()> {
     let mut total = 0;
     let pushed = remote::push(server, &local, &base, &uploaded, |step| match step {
         remote::Step::Plan { files, .. } => total = files,
-        remote::Step::Start { .. } => {}
+        remote::Step::Start { .. } | remote::Step::Failed { .. } => {}
         remote::Step::Done { index, sent } => {
             let how = if sent.skipped { "same" } else { "sent" };
             println!(

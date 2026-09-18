@@ -107,6 +107,9 @@ pub struct Session {
     /// What was playing, identified the way a `Track` is: a path, or a URL for a
     /// stream.
     pub track: Option<String>,
+    /// The folder the queue was started from, when that is not the one being
+    /// browsed: the cursor can wander off while the album plays on.
+    pub queue: Option<PathBuf>,
     /// How far into it.
     pub position: Duration,
     /// Whether it was playing rather than paused, so it comes back the way it was
@@ -187,6 +190,7 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> 
         ("selected", path_value(session.selected.as_deref())),
         ("feed", session.feed.clone()),
         ("track", session.track.clone()),
+        ("queue", path_value(session.queue.as_deref())),
     ] {
         // An absent value is left out rather than written empty: the file is meant
         // to be read by a person, and a column of bare `=` says nothing.
@@ -253,6 +257,7 @@ fn parse_settings(text: &str) -> Settings {
             "selected" => settings.session.selected = Some(PathBuf::from(value)),
             "feed" => settings.session.feed = Some(value.to_string()),
             "track" => settings.session.track = Some(value.to_string()),
+            "queue" => settings.session.queue = Some(PathBuf::from(value)),
             "server" => settings.remote.server = Some(value.to_string()),
             "token" => settings.remote.token = Some(value.to_string()),
             "position" => {
@@ -452,6 +457,7 @@ mod tests {
                 selected: Some(PathBuf::from("/music/Deep Purple/=1")),
                 feed: Some("https://example.com/feed?format=rss&id=7".into()),
                 track: Some("https://example.com/ep 12.mp3".into()),
+                queue: Some(PathBuf::from("/music/Deep Purple/=1")),
                 position: Duration::from_secs_f64(93.4),
                 playing: true,
             },
@@ -481,6 +487,7 @@ mod tests {
             "track = https://example.com/ep 12.mp3",
             "position = 93.4",
             "playing = 1",
+            "queue = /music/Deep Purple/=1",
             "server = tuneterm://nas",
             "token = s3cret=with=equals",
         ] {

@@ -343,6 +343,33 @@ pub fn tracks(url: &str) -> Result<Vec<Track>, String> {
     server.tracks(&path)
 }
 
+/// Move or rename something on a server. `from` is its address; `to` is the new
+/// path on the same server, relative to its music folder.
+pub fn move_to(from: &str, to: &str) -> Result<(), String> {
+    let (server, path) = Server::for_url(from)?;
+    let request = timed(proto::MoveRequest {
+        from: path,
+        to: to.trim_matches('/').to_string(),
+    });
+    runtime()
+        .block_on(server.client().r#move(request))
+        .map_err(|status| describe(&status))?;
+    Ok(())
+}
+
+/// Delete a file, or a folder and everything in it, on a server.
+pub fn remove(url: &str) -> Result<(), String> {
+    let (server, path) = Server::for_url(url)?;
+    let request = timed(proto::RemoveRequest {
+        path,
+        recursive: true,
+    });
+    runtime()
+        .block_on(server.client().remove(request))
+        .map_err(|status| describe(&status))?;
+    Ok(())
+}
+
 /// Cover art for a track URL, for the cover worker.
 pub fn cover(url: &str) -> Option<Vec<u8>> {
     let (server, path) = Server::for_url(url).ok()?;
@@ -376,22 +403,34 @@ pub struct Pushed {
     pub error: Option<String>,
 }
 
+/// How many files a [`push`] sends at once. Each file costs a few round trips and
+/// an `fsync` on the server before the next could start; overlapping them hides
+/// that, and HTTP/2 carries them all over the one connection.
+pub const PARALLEL: usize = 4;
+
 /// What a [`push`] is doing, as it happens.
 pub enum Step<'a> {
     /// Before anything is sent: how much there is.
     Plan { files: usize, bytes: u64 },
-    /// A file is about to be checked and, unless the server has it, sent.
-    Start { remote: &'a str, size: u64 },
-    /// A file the server now has.
+    /// A file is being checked and, unless the server has it, sent. `sent` counts
+    /// its bytes as they go. Up to [`PARALLEL`] files are in flight at once.
+    Start {
+        remote: &'a str,
+        size: u64,
+        sent: &'a Arc<AtomicU64>,
+    },
+    /// A file the server now has. `index` is how many have finished so far.
     Done { index: usize, sent: &'a Sent },
+    /// A file that did not make it; the push stops starting new ones.
+    Failed { remote: &'a str },
 }
 
 /// Upload a file, or a folder with everything beneath it, to `base` on the server.
 /// Hidden files stay behind. Files already there with the same size are skipped.
 ///
-/// Blocking. `each` hears about every file; `uploaded` counts the bytes as they
-/// leave, for progress within a file — the file-level steps alone would leave a
-/// big FLAC looking stuck.
+/// Blocking, with [`PARALLEL`] files in flight. `each` hears about every file;
+/// `uploaded` counts all bytes as they leave, for progress within a file — the
+/// file-level steps alone would leave a big FLAC looking stuck.
 pub fn push(
     server: &Server,
     local: &Path,
@@ -439,35 +478,72 @@ pub fn push(
         total: files.len(),
         ..Pushed::default()
     };
-    for (index, (path, remote, size)) in files.into_iter().enumerate() {
-        let index = index + 1;
-        each(Step::Start {
-            remote: &remote,
-            size,
-        });
-        match push_one(server, &path, &remote, uploaded) {
-            Ok(sent) => {
-                each(Step::Done { index, sent: &sent });
-                pushed.done.push(sent);
+    // The callback stays on this thread; only the uploads run on the runtime.
+    runtime().block_on(async {
+        let mut waiting = files.into_iter();
+        let mut running = tokio::task::JoinSet::new();
+        loop {
+            // After a failure nothing new starts, but what is in flight finishes:
+            // those files are fine, and deleting them later depends on knowing.
+            while pushed.error.is_none() && running.len() < PARALLEL {
+                let Some((path, remote, size)) = waiting.next() else {
+                    break;
+                };
+                let file_sent = Arc::new(AtomicU64::new(0));
+                each(Step::Start {
+                    remote: &remote,
+                    size,
+                    sent: &file_sent,
+                });
+                let server = server.clone();
+                let uploaded = Arc::clone(uploaded);
+                running.spawn(async move {
+                    let result =
+                        push_one(&server, &path, &remote, size, &uploaded, &file_sent).await;
+                    (remote, result)
+                });
             }
-            Err(err) => {
-                // The reason first: it is what a truncated line must still show.
-                pushed.error = Some(format!("{err} — /{remote}"));
+            let Some(joined) = running.join_next().await else {
                 break;
+            };
+            match joined {
+                Ok((_, Ok(sent))) => {
+                    each(Step::Done {
+                        index: pushed.done.len() + 1,
+                        sent: &sent,
+                    });
+                    pushed.done.push(sent);
+                }
+                Ok((remote, Err(err))) => {
+                    each(Step::Failed { remote: &remote });
+                    // The reason first: it is what a truncated line must still show.
+                    pushed.error.get_or_insert(format!("{err} — /{remote}"));
+                }
+                Err(err) => {
+                    pushed.error.get_or_insert(err.to_string());
+                }
             }
         }
-    }
+    });
     pushed
 }
 
-fn push_one(
+async fn push_one(
     server: &Server,
     path: &Path,
     remote: &str,
+    size: u64,
     uploaded: &Arc<AtomicU64>,
+    file_sent: &Arc<AtomicU64>,
 ) -> Result<Sent, String> {
-    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-    let there = server.stat(remote)?;
+    let there = server
+        .client()
+        .stat(timed(StatRequest {
+            path: remote.into(),
+        }))
+        .await
+        .map_err(|status| describe(&status))?
+        .into_inner();
     let sent = Sent {
         local: path.to_path_buf(),
         remote: remote.to_string(),
@@ -475,7 +551,7 @@ fn push_one(
         skipped: there.exists && !there.is_dir && there.size == size,
     };
     if !sent.skipped {
-        let confirmed = runtime().block_on(upload(server, path, remote, size, uploaded))?;
+        let confirmed = upload(server, path, remote, size, uploaded, file_sent).await?;
         if confirmed != size {
             return Err(format!("the server has {confirmed} of {size} bytes"));
         }
@@ -490,6 +566,7 @@ async fn upload(
     remote: &str,
     size: u64,
     uploaded: &Arc<AtomicU64>,
+    file_sent: &Arc<AtomicU64>,
 ) -> Result<u64, String> {
     use tokio::io::AsyncReadExt;
 
@@ -503,7 +580,7 @@ async fn upload(
     // The header rides on the first chunk; the rest follow as the disk yields
     // them, so a big file never sits in memory whole.
     let (tx, rx) = tokio::sync::mpsc::channel::<proto::UploadRequest>(4);
-    let uploaded = Arc::clone(uploaded);
+    let counters = [Arc::clone(uploaded), Arc::clone(file_sent)];
     let reader = tokio::spawn(async move {
         let mut header = Some(header);
         loop {
@@ -521,7 +598,9 @@ async fn upload(
                 }
                 // Counted once the transport has taken it — at most a few chunks
                 // ahead of the wire, which is close enough for a progress bar.
-                uploaded.fetch_add(n as u64, Ordering::Relaxed);
+                for counter in &counters {
+                    counter.fetch_add(n as u64, Ordering::Relaxed);
+                }
             }
             if last {
                 break;
@@ -1020,15 +1099,13 @@ mod tests {
         );
         assert!(pushed.error.is_none(), "{:?}", pushed.error);
         assert_eq!(pushed.done.len(), 2, "the hidden file is not sent");
-        pushed.done.truncate(1);
+        // Files finish in any order when several are in flight.
+        let unconfirmed = pushed.done.pop().expect("two were sent").local;
+        let confirmed = pushed.done[0].local.clone();
         pushed.error = Some("stopped".into());
         remove_moved(&local.0.join("Lumen"), &pushed, &local.0).unwrap();
-        assert!(!album.join("01.wav").exists());
-        assert!(
-            album.join("02.wav").exists(),
-            "an unconfirmed file was deleted"
-        );
-        assert!(served.0.join("Lumen/2002/02.wav").is_file());
+        assert!(!confirmed.exists());
+        assert!(unconfirmed.exists(), "an unconfirmed file was deleted");
     }
 
     /// A complete move takes the folder with it, subfolders, `.DS_Store` and all;

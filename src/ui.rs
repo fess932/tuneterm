@@ -103,6 +103,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_transfer(frame, &view, middle);
     }
 
+    if app.show_keys {
+        draw_keys(frame);
+    }
+
     // Last, so it sits over everything.
     if app.prompt.is_some() {
         draw_prompt(frame, app);
@@ -251,14 +255,13 @@ fn draw_transfer(frame: &mut Frame, view: &crate::app::TransferView, pane: Rect)
         .log
         .iter()
         .map(|line| match line {
-            LogLine::Sent { name, size } => row("✓", name, human(*size), ACCENT),
-            LogLine::Same { name, .. } => row("=", name, "already there".into(), DIM),
             // Messages keep their start, which is where the reason is.
             LogLine::Failed(text) => message("✕", text, ACCENT_ALT),
             LogLine::Note(text) => message("·", text, DIM),
         })
         .collect();
-    if let Some((name, sent, size)) = &view.current {
+    // Everything in flight, each with its own share.
+    for (name, sent, size) in &view.sending {
         let percent = if *size == 0 { 100 } else { sent * 100 / size };
         lines.push(row("↑", name, format!("{percent}%"), ACCENT));
     }
@@ -307,6 +310,104 @@ fn draw_transfer(frame: &mut Frame, view: &crate::app::TransferView, pane: Rect)
             .unfilled_symbol(ratatui::symbols::line::HORIZONTAL),
         bar,
     );
+}
+
+/// Every key, grouped, in a box over the middle of the screen. `?` opens it and
+/// any key closes it.
+fn draw_keys(frame: &mut Frame) {
+    const GROUPS: &[(&str, &[(&str, &str)])] = &[
+        (
+            "Play",
+            &[
+                ("Space", "play / pause"),
+                ("n  p", "next / previous"),
+                ("[  ]", "seek -5s / +5s"),
+                ("+  -", "volume"),
+                ("s", "shuffle"),
+            ],
+        ),
+        (
+            "Browse",
+            &[
+                ("↑ ↓  j k", "move"),
+                ("PgUp PgDn", "move by 10"),
+                ("Tab  ← →", "switch pane"),
+                ("Enter", "open folder / play"),
+                ("Backspace", "up a folder"),
+                ("1  2  3", "Local / Feeds / Radio"),
+            ],
+        ),
+        (
+            "Library",
+            &[
+                ("a", "add or change the server"),
+                ("u", "move a [u] folder to the server"),
+                ("l", "show / hide the move log"),
+                ("r", "rename"),
+                ("m", "move to another folder"),
+                ("x", "delete, y to confirm"),
+            ],
+        ),
+        ("Feeds", &[("a", "add a feed"), ("d", "remove the feed")]),
+        (
+            "App",
+            &[
+                ("?", "this list"),
+                ("Esc", "close what is open, else quit"),
+                ("q", "quit"),
+            ],
+        ),
+    ];
+
+    // Two columns, so the whole list fits a terminal of ordinary height.
+    let column = |groups: &[(&str, &[(&str, &str)])]| {
+        let mut lines = Vec::new();
+        for (index, (group, keys)) in groups.iter().enumerate() {
+            if index > 0 {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                group.to_string(),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            for (key, what) in *keys {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {key:<11}"), Style::new().fg(TEXT)),
+                    Span::styled(what.to_string(), Style::new().fg(DIM)),
+                ]));
+            }
+        }
+        lines
+    };
+    let left = column(&GROUPS[..2]);
+    let right = column(&GROUPS[2..]);
+
+    let screen = frame.area();
+    let width = 88.min(screen.width);
+    let height = (left.len().max(right.len()) as u16 + 2).min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(
+            " Keys ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(
+            Line::from(Span::styled(" any key closes ", Style::new().fg(DIM))).right_aligned(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [first, second] =
+        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(inner);
+    frame.render_widget(Paragraph::new(left), first);
+    frame.render_widget(Paragraph::new(right), second);
 }
 
 /// Keep the start of `text` within `max` characters, marking the cut.
@@ -862,6 +963,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     // they are worth, and the volume readout, which the shuffle button sits beside,
     // is last because it is the one you can most afford to lose.
     let keys = [
+        // First, so it is the last thing a narrow terminal cuts off.
+        ("?", "keys"),
         ("Tab", "pane"),
         ("↑↓", "move"),
         ("⏎", "open"),
@@ -1031,6 +1134,33 @@ mod tests {
         }
     }
 
+    /// The key list fits an ordinary terminal whole: every group, down to the last.
+    #[test]
+    fn the_key_list_fits_an_ordinary_terminal() {
+        let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        let mut app = app();
+        app.show_keys = true;
+        terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for text in [
+            "Play",
+            "Browse",
+            "Library",
+            "Feeds",
+            "rename",
+            "delete, y to confirm",
+            "quit",
+        ] {
+            assert!(screen.contains(text), "{text} is not on screen");
+        }
+    }
+
     /// Regression: a short pane used to panic on `clamp(min, max)` with max < min.
     #[test]
     fn survives_tiny_terminals() {
@@ -1040,6 +1170,7 @@ mod tests {
                 let mut app = app();
                 if prompt {
                     app.open_add_feed();
+                    app.show_keys = true;
                 }
                 terminal
                     .draw(|frame| super::draw(frame, &mut app))
