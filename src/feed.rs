@@ -71,8 +71,7 @@ pub fn parse(xml: &str) -> Result<Channel, String> {
             }
 
             Event::Text(text) => {
-                let Ok(value) = text.decode() else { continue };
-                let value = value.trim().to_string();
+                let value = text.xml10_content().trim().to_string();
                 if value.is_empty() {
                     continue;
                 }
@@ -84,7 +83,7 @@ pub fn parse(xml: &str) -> Result<Channel, String> {
                 );
             }
             Event::CData(data) => {
-                let value = String::from_utf8_lossy(data.as_ref()).trim().to_string();
+                let value = data.xml10_content().trim().to_string();
                 if value.is_empty() {
                     continue;
                 }
@@ -167,8 +166,7 @@ fn attribute(tag: &quick_xml::events::BytesStart, name: &str) -> Option<String> 
 
 /// Strip any `ns:` prefix. Namespaces are noise here — `itunes:duration` and a bare
 /// `duration` mean the same thing to us.
-fn local_name(raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw);
+fn local_name(text: &str) -> String {
     match text.rsplit_once(':') {
         Some((_, local)) => local.to_ascii_lowercase(),
         None => text.to_ascii_lowercase(),
@@ -279,9 +277,9 @@ mod tests {
 
     #[test]
     fn namespaces_are_ignored() {
-        assert_eq!(local_name(b"itunes:duration"), "duration");
-        assert_eq!(local_name(b"DC:Creator"), "creator");
-        assert_eq!(local_name(b"title"), "title");
+        assert_eq!(local_name("itunes:duration"), "duration");
+        assert_eq!(local_name("DC:Creator"), "creator");
+        assert_eq!(local_name("title"), "title");
     }
 
     /// A feed that is not a feed must come back empty, not panic.
