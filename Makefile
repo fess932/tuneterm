@@ -147,7 +147,7 @@ clean-cache: ## Empty the cover cache
 	@$(RM_CACHE)
 	@echo removed $(CACHE)
 
-# Mirrors the packaging step in .github/workflows/release.yml: same layout, same
+# Mirrors the packaging step in .github/workflows/ci.yml: same layout, same
 # tarball name, same sha256 — so a break here is a break there.
 release-dry: ## Build and package a tarball the way the release workflow does
 	@$(PACKAGE)

@@ -9,7 +9,6 @@ graphics protocols — with a unicode-halfblock fallback so it degrades instead 
 breaking.
 
 [![CI](https://github.com/fess932/tuneterm/actions/workflows/ci.yml/badge.svg)](https://github.com/fess932/tuneterm/actions/workflows/ci.yml)
-[![Release](https://github.com/fess932/tuneterm/actions/workflows/release.yml/badge.svg)](https://github.com/fess932/tuneterm/actions/workflows/release.yml)
 ![Rust](https://img.shields.io/badge/rust-2024%20edition-orange?logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 

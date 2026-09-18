@@ -1,7 +1,8 @@
 name: CI
 
-# One run per push: the checks, then — on main and on `v*` tags, and only if every
-# check passed — the server image, published to ghcr.io/fess932/tuneterm.
+# One run per push. The checks first; then, only if every one passed, the server
+# image (main and `v*` tags, published to ghcr.io/fess932/tuneterm) and, for a
+# `v*` tag, the binaries and the GitHub Release.
 
 on:
   push:
@@ -29,7 +30,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -76,7 +77,7 @@ jobs:
     name: buf
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: bufbuild/buf-action@v1
         with:
           lint: true
@@ -105,24 +106,24 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
 
       # Pushed by digest only; the tags go on in `image`, once both exist.
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -138,7 +139,7 @@ jobs:
           touch "digests/${digest#sha256:}"
           echo "PLATFORM_PAIR=$(echo '${{ matrix.platform }}' | tr / -)" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: digests/*
@@ -150,22 +151,22 @@ jobs:
     permissions:
       packages: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: digests
           pattern: digests-*
           merge-multiple: true
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -183,3 +184,83 @@ jobs:
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
 
       - run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+
+  # Binaries for every platform, on a `v*` tag — or by hand, to try the packaging
+  # without publishing anything.
+  release-build:
+    name: release ${{ matrix.target }}
+    needs: [check, proto]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install ALSA
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          staging="tuneterm-${{ matrix.target }}"
+          mkdir -p "$staging"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/tuneterm.exe" "$staging/"
+          else
+            cp "target/${{ matrix.target }}/release/tuneterm" "$staging/"
+          fi
+          cp README.md LICENSE "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
+          else
+            sha256sum "$staging.tar.gz" > "$staging.tar.gz.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tuneterm-${{ matrix.target }}
+          path: |
+            tuneterm-${{ matrix.target }}.tar.gz
+            tuneterm-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: release-build
+    # Only publish a Release for an actual tag; workflow_dispatch just builds.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          generate_release_notes: true
