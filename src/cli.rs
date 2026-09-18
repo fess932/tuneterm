@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::proto::{self, ListEntriesRequest, MoveRequest, RemoveRequest};
-use crate::remote::{self, Server};
+use crate::remote::{self, Server, human};
 
 /// The first argument, when it names one of these, decides the whole run.
 pub const COMMANDS: &[&str] = &["serve", "push", "ls", "rm", "mv"];
@@ -248,13 +248,19 @@ fn push(server: &Server, args: &[String]) -> anyhow::Result<()> {
     };
 
     let started = Instant::now();
-    let pushed = remote::push(server, &local, &base, |index, total, sent| {
-        let how = if sent.skipped { "same" } else { "sent" };
-        println!(
-            "[{index}/{total}] {how}   /{}  {}",
-            sent.remote,
-            human(sent.size)
-        );
+    let uploaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut total = 0;
+    let pushed = remote::push(server, &local, &base, &uploaded, |step| match step {
+        remote::Step::Plan { files, .. } => total = files,
+        remote::Step::Start { .. } => {}
+        remote::Step::Done { index, sent } => {
+            let how = if sent.skipped { "same" } else { "sent" };
+            println!(
+                "[{index}/{total}] {how}   /{}  {}",
+                sent.remote,
+                human(sent.size)
+            );
+        }
     });
 
     let skipped = pushed.done.iter().filter(|sent| sent.skipped).count();
@@ -278,21 +284,6 @@ fn push(server: &Server, args: &[String]) -> anyhow::Result<()> {
     match pushed.error {
         Some(err) => Err(anyhow::anyhow!(err)),
         None => Ok(()),
-    }
-}
-
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

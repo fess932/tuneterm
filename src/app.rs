@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -148,8 +149,9 @@ pub struct App {
     /// The server whose folders are listed beside the local ones at the root, and
     /// its token. Added with `a`, kept in the settings.
     pub remote: config::Remote,
-    /// A folder on its way to the server, if one is.
-    moving: Option<Arc<Mutex<Move>>>,
+    /// The last folder sent to the server — on its way, or done and its log still
+    /// on screen.
+    transfer: Option<Transfer>,
     /// Handed to the move's thread, so progress reaches the screen at once.
     wake: Wake,
     /// When the session last changed, if it has not been written out yet.
@@ -230,21 +232,89 @@ pub struct Prompt {
 pub enum PromptKind {
     Feed,
     Server,
-    /// Confirming a move: the local folder, and where it goes on the server.
-    Move {
-        local: PathBuf,
-        remote: String,
+}
+
+/// One line of a move's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogLine {
+    Sent {
+        name: String,
+        size: u64,
     },
+    /// Already on the server with the same size, so not sent again.
+    Same {
+        name: String,
+        size: u64,
+    },
+    Failed(String),
+    Note(String),
 }
 
 /// A folder on its way to the server, as its thread reports it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Move {
-    index: usize,
-    total: usize,
-    current: String,
+    title: String,
+    /// Where the folder goes on the server; stripped from names in the log, which
+    /// are all inside it.
+    base: String,
+    files: usize,
+    bytes: u64,
+    done_files: usize,
+    /// Bytes of files the server already had: done, but never sent.
+    skipped_bytes: u64,
+    /// The file being sent: its name, size, and the byte counter when it began.
+    current: Option<(String, u64, u64)>,
+    log: VecDeque<LogLine>,
+    started: Instant,
     /// Set once the thread is finished: what to say about it.
     finished: Option<String>,
+}
+
+impl Move {
+    /// Enough to scroll back through a big album; older lines are dropped.
+    const KEEP: usize = 500;
+
+    fn note(&mut self, line: LogLine) {
+        self.log.push_back(line);
+        while self.log.len() > Self::KEEP {
+            self.log.pop_front();
+        }
+    }
+
+    fn name(&self, remote: &str) -> String {
+        remote
+            .strip_prefix(&self.base)
+            .map(|rest| rest.trim_start_matches('/'))
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(remote)
+            .to_string()
+    }
+}
+
+/// A move, and whether its log is on screen.
+struct Transfer {
+    state: Arc<Mutex<Move>>,
+    /// Bytes sent so far, counted by the upload itself.
+    uploaded: Arc<AtomicU64>,
+    visible: bool,
+    /// The library has been listed again after it finished.
+    settled: bool,
+}
+
+/// What the log panel shows, taken in one go so the drawing never holds the lock.
+pub struct TransferView {
+    pub title: String,
+    pub log: Vec<LogLine>,
+    /// The file being sent: name, bytes sent, size.
+    pub current: Option<(String, u64, u64)>,
+    pub files_done: usize,
+    pub files: usize,
+    pub bytes_done: u64,
+    pub bytes: u64,
+    /// Bytes per second actually sent, skipped files left out.
+    pub speed: f64,
+    pub left: Option<Duration>,
+    pub finished: Option<String>,
 }
 
 /// What was playing when the app was last closed, waiting for a listing to appear
@@ -338,7 +408,7 @@ impl App {
             rng: Rng::new(),
             settings_file: config::settings_path(),
             remote: config::Remote::default(),
-            moving: None,
+            transfer: None,
             wake: wake.clone(),
             settings_dirty: None,
             saved_position: Duration::ZERO,
@@ -921,14 +991,14 @@ impl App {
         self.relist_root();
     }
 
-    /// Ask before moving the highlighted local folder to the server: the local
-    /// copy is deleted once the server has it.
-    pub fn ask_move(&mut self) {
+    /// Move the highlighted local folder to the server, at once: `u`. The local
+    /// copy is deleted file by file, as the server confirms each one.
+    pub fn move_selected(&mut self) {
         if self.remote.server.is_none() {
             self.status = "no server yet: a adds one".into();
             return;
         }
-        if self.moving.is_some() {
+        if self.is_moving() {
             self.status = "a move is already running".into();
             return;
         }
@@ -947,24 +1017,7 @@ impl App {
             .map(|part| part.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let server = self
-            .remote
-            .server
-            .as_deref()
-            .and_then(remote::authority_of)
-            .unwrap_or_default();
-        self.prompt = Some(Prompt {
-            kind: PromptKind::Move {
-                local: folder.path.clone(),
-                remote: rel.clone(),
-            },
-            title: "Move to server",
-            input: String::new(),
-            hint: format!(
-                "Enter uploads {} to {server}/{rel} and deletes it here · Esc keeps it",
-                folder.label
-            ),
-        });
+        self.start_move(folder.path.clone(), rel);
     }
 
     /// Upload on a thread of its own, then delete what the server confirmed.
@@ -983,77 +1036,197 @@ impl App {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let state = Arc::new(Mutex::new(Move::default()));
-        self.moving = Some(Arc::clone(&state));
+        let state = Arc::new(Mutex::new(Move {
+            title: format!(
+                "{label} → {}",
+                remote::authority_of(&address).unwrap_or_default()
+            ),
+            base: rel.clone(),
+            files: 0,
+            bytes: 0,
+            done_files: 0,
+            skipped_bytes: 0,
+            current: None,
+            log: VecDeque::new(),
+            started: Instant::now(),
+            finished: None,
+        }));
+        let uploaded = Arc::new(AtomicU64::new(0));
+        self.transfer = Some(Transfer {
+            state: Arc::clone(&state),
+            uploaded: Arc::clone(&uploaded),
+            visible: true,
+            settled: false,
+        });
         self.status = format!("moving {label}…");
 
         let wake = self.wake.clone();
         let spawned = std::thread::Builder::new()
             .name("move".into())
             .spawn(move || {
-                let report = |index: usize, total: usize, sent: &remote::Sent| {
-                    if let Ok(mut state) = state.lock() {
-                        state.index = index;
-                        state.total = total;
-                        state.current = sent.remote.clone();
+                let report = |step: remote::Step| {
+                    let Ok(mut state) = state.lock() else {
+                        return;
+                    };
+                    match step {
+                        remote::Step::Plan { files, bytes } => {
+                            state.files = files;
+                            state.bytes = bytes;
+                        }
+                        remote::Step::Start { remote, size, .. } => {
+                            let name = state.name(remote);
+                            state.current = Some((name, size, uploaded.load(Ordering::Relaxed)));
+                        }
+                        remote::Step::Done { index, sent } => {
+                            let name = state.name(&sent.remote);
+                            state.done_files = index;
+                            state.current = None;
+                            if sent.skipped {
+                                state.skipped_bytes += sent.size;
+                                state.note(LogLine::Same {
+                                    name,
+                                    size: sent.size,
+                                });
+                            } else {
+                                state.note(LogLine::Sent {
+                                    name,
+                                    size: sent.size,
+                                });
+                            }
+                        }
                     }
+                    drop(state);
                     wake.nudge();
                 };
-                let pushed = remote::push(&server, &local, &rel, report);
+                let pushed = remote::push(&server, &local, &rel, &uploaded, report);
                 let removed = remote::remove_moved(&local, &pushed);
+
+                let Ok(mut state) = state.lock() else {
+                    return;
+                };
+                state.current = None;
+                if let Some(err) = &pushed.error {
+                    state.note(LogLine::Failed(err.clone()));
+                }
                 let message = match (&pushed.error, removed) {
-                    (None, Ok(_)) => {
+                    (None, Ok(n)) => {
+                        state.note(LogLine::Note(format!("deleted {n} files here")));
                         format!("moved {label} to the server: {} files", pushed.done.len())
                     }
-                    (Some(err), Ok(n)) => {
-                        format!("move stopped after {n} of {} files: {err}", pushed.total)
+                    (Some(_), Ok(n)) => {
+                        state.note(LogLine::Note(format!(
+                            "deleted the {n} files the server has; the rest stay here"
+                        )));
+                        format!("move stopped after {n} of {} files", pushed.total)
                     }
-                    (_, Err(err)) => format!("uploaded, but could not delete here: {err}"),
+                    (_, Err(err)) => {
+                        state.note(LogLine::Failed(format!("could not delete here: {err}")));
+                        format!("uploaded, but could not delete here: {err}")
+                    }
                 };
-                if let Ok(mut state) = state.lock() {
-                    state.finished = Some(message);
-                }
+                state.finished = Some(message);
+                drop(state);
                 wake.nudge();
             });
         if let Err(err) = spawned {
-            self.moving = None;
+            self.transfer = None;
             self.status = format!("error: {err}");
         }
     }
 
-    /// Show a move's progress, and once it is done, the library as it now is.
-    pub fn poll_move(&mut self) {
-        let Some(state) = self.moving.clone() else {
-            return;
-        };
-        let Ok(state) = state.lock() else {
-            return;
-        };
-        match &state.finished {
-            None if state.total > 0 => {
-                self.status = format!("↑ {}/{} {}", state.index, state.total, state.current);
-            }
-            None => {}
-            Some(message) => {
-                self.status = message.clone();
-                drop(state);
-                self.moving = None;
-                // Both sides changed: nothing remembered about either still holds.
-                self.memo.clear();
-                self.memo_order.clear();
-                self.tracks_dir = None;
-                let cwd = self.cwd.clone();
-                let selected = self.folder_state.selected();
-                self.folders = self.list(&cwd).unwrap_or_default();
-                self.folder_state = TableState::default();
-                let rows = self.folder_row_count();
-                if rows > 0 {
-                    self.folder_state
-                        .select(Some(selected.unwrap_or(0).min(rows - 1)));
-                }
-                self.reload_tracks();
-            }
+    /// True while a folder is on its way to the server.
+    pub fn is_moving(&self) -> bool {
+        self.transfer
+            .as_ref()
+            .is_some_and(|transfer| !transfer.settled)
+    }
+
+    /// Show or hide the log of the last move. `l`.
+    pub fn toggle_transfer_log(&mut self) {
+        match self.transfer.as_mut() {
+            Some(transfer) => transfer.visible = !transfer.visible,
+            None => self.status = "nothing has been moved yet".into(),
         }
+    }
+
+    /// Hide the log if it is showing. True if it was, so Escape closes the log
+    /// rather than the player.
+    pub fn hide_transfer_log(&mut self) -> bool {
+        match self.transfer.as_mut() {
+            Some(transfer) if transfer.visible => {
+                transfer.visible = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The log panel's contents, if it is showing.
+    pub fn transfer_view(&self) -> Option<TransferView> {
+        let transfer = self.transfer.as_ref().filter(|t| t.visible)?;
+        let state = transfer.state.lock().ok()?;
+        let uploaded = transfer.uploaded.load(Ordering::Relaxed);
+        let elapsed = state.started.elapsed().as_secs_f64().max(0.001);
+        let speed = uploaded as f64 / elapsed;
+        let bytes_done = (uploaded + state.skipped_bytes).min(state.bytes);
+        let left = (state.finished.is_none() && speed > 0.0).then(|| {
+            Duration::from_secs_f64(state.bytes.saturating_sub(bytes_done) as f64 / speed)
+        });
+        Some(TransferView {
+            title: state.title.clone(),
+            log: state.log.iter().cloned().collect(),
+            current: state.current.as_ref().map(|(name, size, from)| {
+                (
+                    name.clone(),
+                    uploaded.saturating_sub(*from).min(*size),
+                    *size,
+                )
+            }),
+            files_done: state.done_files,
+            files: state.files,
+            bytes_done,
+            bytes: state.bytes,
+            speed,
+            left,
+            finished: state.finished.clone(),
+        })
+    }
+
+    /// Once a move is done, list the library as it now is. The log stays up until
+    /// it is hidden.
+    pub fn poll_move(&mut self) {
+        let Some(transfer) = self.transfer.as_ref() else {
+            return;
+        };
+        if transfer.settled {
+            return;
+        }
+        let finished = transfer
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.finished.clone());
+        let Some(message) = finished else {
+            return;
+        };
+        if let Some(transfer) = self.transfer.as_mut() {
+            transfer.settled = true;
+        }
+        self.status = message;
+        // Both sides changed: nothing remembered about either still holds.
+        self.memo.clear();
+        self.memo_order.clear();
+        self.tracks_dir = None;
+        let cwd = self.cwd.clone();
+        let selected = self.folder_state.selected();
+        self.folders = self.list(&cwd).unwrap_or_default();
+        self.folder_state = TableState::default();
+        let rows = self.folder_row_count();
+        if rows > 0 {
+            self.folder_state
+                .select(Some(selected.unwrap_or(0).min(rows - 1)));
+        }
+        self.reload_tracks();
     }
 
     /// Block until a move has finished. Tests only: the real loop polls.
@@ -1061,7 +1234,7 @@ impl App {
     pub(crate) fn wait_for_move(&mut self) {
         for _ in 0..2000 {
             self.poll_move();
-            if self.moving.is_none() {
+            if !self.is_moving() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1746,10 +1919,6 @@ impl App {
     pub fn submit_prompt(&mut self) {
         match self.prompt.as_ref().map(|prompt| prompt.kind.clone()) {
             Some(PromptKind::Server) => return self.submit_server(),
-            Some(PromptKind::Move { local, remote }) => {
-                self.prompt = None;
-                return self.start_move(local, remote);
-            }
             Some(PromptKind::Feed) => {}
             None => return,
         }
@@ -2237,7 +2406,7 @@ mod tests {
         );
     }
 
-    /// `u` asks, then uploads the folder and deletes it here; the root then lists
+    /// `u` uploads the folder and deletes it here; the root then lists
     /// the server's copy in its place.
     #[test]
     fn moving_a_folder_puts_it_on_the_server_and_takes_it_off_here() {
@@ -2252,19 +2421,33 @@ mod tests {
         };
 
         app.folder_state.select(Some(folder_row(&app, "Beta")));
-        app.ask_move();
-        assert!(
-            matches!(
-                app.prompt.as_ref().map(|p| &p.kind),
-                Some(PromptKind::Move { .. })
-            ),
-            "a move is confirmed first"
-        );
-        assert!(lib.0.join("Beta").is_dir(), "nothing happens before Enter");
-        app.submit_prompt();
+        app.move_selected();
+        assert!(app.prompt.is_none(), "no question asked");
         app.wait_for_move();
 
         assert!(app.status.starts_with("moved Beta"), "{}", app.status);
+        let log = app
+            .transfer_view()
+            .expect("the log stays up after the move");
+        assert_eq!((log.files_done, log.files), (2, 2));
+        assert_eq!(log.bytes_done, log.bytes);
+        assert!(log.finished.is_some() && log.current.is_none());
+        let sent: Vec<_> = log
+            .log
+            .iter()
+            .filter_map(|line| match line {
+                LogLine::Sent { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            ["01 song.wav", "02 song.wav"],
+            "names are inside the folder"
+        );
+        assert!(app.hide_transfer_log(), "Escape closes the log first");
+        assert!(app.transfer_view().is_none());
+        assert!(!app.hide_transfer_log(), "and then it is Escape again");
         assert!(!lib.0.join("Beta").exists(), "the local copy is gone");
         for name in ["01 song.wav", "02 song.wav"] {
             assert!(
@@ -2282,8 +2465,8 @@ mod tests {
 
         // A server folder is not offered for a move.
         app.folder_state.select(Some(folder_row(&app, "Beta")));
-        app.ask_move();
-        assert!(app.prompt.is_none());
+        app.move_selected();
+        assert!(!app.is_moving(), "a server folder is not moved");
     }
 
     /// The button at the end of the root: a click or Enter opens the field.

@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tonic::metadata::{Ascii, MetadataValue};
@@ -336,15 +337,28 @@ pub struct Pushed {
     pub error: Option<String>,
 }
 
+/// What a [`push`] is doing, as it happens.
+pub enum Step<'a> {
+    /// Before anything is sent: how much there is.
+    Plan { files: usize, bytes: u64 },
+    /// A file is about to be checked and, unless the server has it, sent.
+    Start { remote: &'a str, size: u64 },
+    /// A file the server now has.
+    Done { index: usize, sent: &'a Sent },
+}
+
 /// Upload a file, or a folder with everything beneath it, to `base` on the server.
 /// Hidden files stay behind. Files already there with the same size are skipped.
 ///
-/// Blocking. `each` hears about every file as it completes, for progress.
+/// Blocking. `each` hears about every file; `uploaded` counts the bytes as they
+/// leave, for progress within a file — the file-level steps alone would leave a
+/// big FLAC looking stuck.
 pub fn push(
     server: &Server,
     local: &Path,
     base: &str,
-    mut each: impl FnMut(usize, usize, &Sent),
+    uploaded: &Arc<AtomicU64>,
+    mut each: impl FnMut(Step),
 ) -> Pushed {
     let base = base.trim_matches('/');
     let files = match std::fs::metadata(local) {
@@ -370,14 +384,31 @@ pub fn push(
         }
     };
 
+    let files: Vec<(PathBuf, String, u64)> = files
+        .into_iter()
+        .map(|(path, remote)| {
+            let size = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+            (path, remote, size)
+        })
+        .collect();
+    each(Step::Plan {
+        files: files.len(),
+        bytes: files.iter().map(|(_, _, size)| size).sum(),
+    });
+
     let mut pushed = Pushed {
         total: files.len(),
         ..Pushed::default()
     };
-    for (index, (path, remote)) in files.into_iter().enumerate() {
-        match push_one(server, &path, &remote) {
+    for (index, (path, remote, size)) in files.into_iter().enumerate() {
+        let index = index + 1;
+        each(Step::Start {
+            remote: &remote,
+            size,
+        });
+        match push_one(server, &path, &remote, uploaded) {
             Ok(sent) => {
-                each(index + 1, pushed.total, &sent);
+                each(Step::Done { index, sent: &sent });
                 pushed.done.push(sent);
             }
             Err(err) => {
@@ -389,7 +420,12 @@ pub fn push(
     pushed
 }
 
-fn push_one(server: &Server, path: &Path, remote: &str) -> Result<Sent, String> {
+fn push_one(
+    server: &Server,
+    path: &Path,
+    remote: &str,
+    uploaded: &Arc<AtomicU64>,
+) -> Result<Sent, String> {
     let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
     let there = server.stat(remote)?;
     let sent = Sent {
@@ -399,7 +435,7 @@ fn push_one(server: &Server, path: &Path, remote: &str) -> Result<Sent, String> 
         skipped: there.exists && !there.is_dir && there.size == size,
     };
     if !sent.skipped {
-        let confirmed = runtime().block_on(upload(server, path, remote, size))?;
+        let confirmed = runtime().block_on(upload(server, path, remote, size, uploaded))?;
         if confirmed != size {
             return Err(format!("the server has {confirmed} of {size} bytes"));
         }
@@ -408,7 +444,13 @@ fn push_one(server: &Server, path: &Path, remote: &str) -> Result<Sent, String> 
 }
 
 /// Stream one file up. Returns the size the server says it stored.
-async fn upload(server: &Server, path: &Path, remote: &str, size: u64) -> Result<u64, String> {
+async fn upload(
+    server: &Server,
+    path: &Path,
+    remote: &str,
+    size: u64,
+    uploaded: &Arc<AtomicU64>,
+) -> Result<u64, String> {
     use tokio::io::AsyncReadExt;
 
     let mut file = tokio::fs::File::open(path)
@@ -421,6 +463,7 @@ async fn upload(server: &Server, path: &Path, remote: &str, size: u64) -> Result
     // The header rides on the first chunk; the rest follow as the disk yields
     // them, so a big file never sits in memory whole.
     let (tx, rx) = tokio::sync::mpsc::channel::<proto::UploadRequest>(4);
+    let uploaded = Arc::clone(uploaded);
     let reader = tokio::spawn(async move {
         let mut header = Some(header);
         loop {
@@ -436,6 +479,9 @@ async fn upload(server: &Server, path: &Path, remote: &str, size: u64) -> Result
                 if tx.send(chunk).await.is_err() {
                     break;
                 }
+                // Counted once the transport has taken it — at most a few chunks
+                // ahead of the wire, which is close enough for a progress bar.
+                uploaded.fetch_add(n as u64, Ordering::Relaxed);
             }
             if last {
                 break;
@@ -485,6 +531,22 @@ fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> io::Result
         }
     }
     Ok(())
+}
+
+/// A size the way `ls -h` writes it.
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// `dir/name` in the protocol's form, where "" is the top.
@@ -879,7 +941,13 @@ mod tests {
         let server = Server::open(&format!("tuneterm://k@{addr}")).unwrap();
 
         // Only one of the two confirmed: the other must stay.
-        let mut pushed = push(&server, &local.0.join("Lumen"), "Lumen", |_, _, _| {});
+        let uploaded = Arc::new(AtomicU64::new(0));
+        let mut pushed = push(&server, &local.0.join("Lumen"), "Lumen", &uploaded, |_| {});
+        assert_eq!(
+            uploaded.load(Ordering::Relaxed),
+            pushed.done.iter().map(|sent| sent.size).sum::<u64>(),
+            "every byte is counted once"
+        );
         assert!(pushed.error.is_none(), "{:?}", pushed.error);
         assert_eq!(pushed.done.len(), 2, "the hidden file is not sent");
         pushed.done.truncate(1);

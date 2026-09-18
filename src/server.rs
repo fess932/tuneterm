@@ -60,13 +60,16 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let service = Service::new(&config.root, config.token.clone())?;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local = listener.local_addr()?;
-    println!("serving {} on {local}", service.root.display());
-    println!(
-        "{}",
-        match config.token {
-            Some(_) => "token required; uploads, moves and removals allowed",
-            None => "no TUNETERM_TOKEN: open to anyone and read-only",
-        }
+    log(
+        "-",
+        format_args!(
+            "serving {} on {local} ({})",
+            service.root.display(),
+            match config.token {
+                Some(_) => "token required; uploads, moves and removals allowed",
+                None => "no TUNETERM_TOKEN: open to anyone and read-only",
+            }
+        ),
     );
 
     tonic::transport::Server::builder()
@@ -76,7 +79,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             shutdown(),
         )
         .await?;
-    println!("stopped");
+    log("-", format_args!("stopped"));
     Ok(())
 }
 
@@ -146,7 +149,10 @@ impl Service {
                 Some(given) if constant_time_eq(given.as_bytes(), expected.as_bytes()) => {
                     Ok(request)
                 }
-                _ => Err(Status::unauthenticated("wrong or missing token")),
+                _ => {
+                    log(&peer(&request), format_args!("✕ wrong or missing token"));
+                    Err(Status::unauthenticated("wrong or missing token"))
+                }
             }
         };
         tonic::service::interceptor::InterceptedService::new(
@@ -241,25 +247,83 @@ async fn blocking<T: Send + 'static>(
 
 type ChunkStream = Pin<Box<dyn Stream<Item = Result<ReadResponse, Status>> + Send>>;
 
+/// Who is asking, for the log: the client's IP, or `?` when the transport does
+/// not say.
+fn peer<T>(request: &Request<T>) -> String {
+    request
+        .remote_addr()
+        .map_or_else(|| "?".into(), |addr| addr.ip().to_string())
+}
+
+/// One line of the server's log: when, who, what. Plain stdout, one line per
+/// event, which is what `docker logs` wants.
+fn log(peer: &str, what: std::fmt::Arguments) {
+    println!("{}  {peer:<15} {what}", now());
+}
+
+/// Log a call that failed, with the reason the client was given.
+fn failed<T>(peer: &str, what: &str, result: Result<T, Status>) -> Result<T, Status> {
+    if let Err(status) = &result {
+        log(peer, format_args!("✕ {what}: {}", status.message()));
+    }
+    result
+}
+
+/// UTC wall-clock time, `YYYY-MM-DD HH:MM:SS`. Hand-rolled: a date crate for
+/// one log prefix is not worth it.
+fn now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+fn size(bytes: u64) -> String {
+    crate::remote::human(bytes)
+}
+
 #[tonic::async_trait]
 impl LibraryService for Service {
     async fn list_folders(
         &self,
         request: Request<ListFoldersRequest>,
     ) -> Result<Response<ListFoldersResponse>, Status> {
-        let dir = self.existing(&request.into_inner().path)?;
-        let this = self.clone();
-        let folders = blocking(move || {
-            Ok(library::list_subdirs(&dir)
-                .into_iter()
-                .map(|folder| Folder {
-                    path: this.relative(&folder.path),
-                    name: folder.label,
-                    count: folder.count as u32,
-                })
-                .collect())
-        })
-        .await?;
+        let peer = peer(&request);
+        let path = request.into_inner().path;
+        let result = async {
+            let dir = self.existing(&path)?;
+            let this = self.clone();
+            blocking(move || {
+                Ok(library::list_subdirs(&dir)
+                    .into_iter()
+                    .map(|folder| Folder {
+                        path: this.relative(&folder.path),
+                        name: folder.label,
+                        count: folder.count as u32,
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await
+        }
+        .await;
+        let folders = failed(&peer, &format!("folders /{path}"), result)?;
+        log(&peer, format_args!("folders /{path} → {}", folders.len()));
         Ok(Response::new(ListFoldersResponse { folders }))
     }
 
@@ -267,22 +331,37 @@ impl LibraryService for Service {
         &self,
         request: Request<ListTracksRequest>,
     ) -> Result<Response<ListTracksResponse>, Status> {
-        let dir = self.existing(&request.into_inner().path)?;
-        let this = self.clone();
-        let tracks = blocking(move || {
-            Ok(library::scan_tracks_deep(&dir, &Cancel::never())
-                .into_iter()
-                .map(|track| Track {
-                    size: std::fs::metadata(&track.path).map_or(0, |meta| meta.len()),
-                    path: this.relative(&track.path),
-                    title: track.title,
-                    artist: track.artist,
-                    album: track.album,
-                    duration_ms: track.duration.map(|d| d.as_millis() as u64),
-                })
-                .collect())
-        })
-        .await?;
+        let peer = peer(&request);
+        let path = request.into_inner().path;
+        let started = std::time::Instant::now();
+        let result = async {
+            let dir = self.existing(&path)?;
+            let this = self.clone();
+            blocking(move || {
+                Ok(library::scan_tracks_deep(&dir, &Cancel::never())
+                    .into_iter()
+                    .map(|track| Track {
+                        size: std::fs::metadata(&track.path).map_or(0, |meta| meta.len()),
+                        path: this.relative(&track.path),
+                        title: track.title,
+                        artist: track.artist,
+                        album: track.album,
+                        duration_ms: track.duration.map(|d| d.as_millis() as u64),
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await
+        }
+        .await;
+        let tracks = failed(&peer, &format!("tracks /{path}"), result)?;
+        log(
+            &peer,
+            format_args!(
+                "tracks  /{path} → {} in {} ms",
+                tracks.len(),
+                started.elapsed().as_millis()
+            ),
+        );
         Ok(Response::new(ListTracksResponse { tracks }))
     }
 
@@ -290,16 +369,32 @@ impl LibraryService for Service {
         &self,
         request: Request<GetCoverRequest>,
     ) -> Result<Response<GetCoverResponse>, Status> {
-        let path = self.existing(&request.into_inner().path)?;
-        let data =
-            blocking(move || Ok(library::load_cover_bytes(&path).unwrap_or_default())).await?;
+        let peer = peer(&request);
+        let path = request.into_inner().path;
+        let result = async {
+            let real = self.existing(&path)?;
+            blocking(move || Ok(library::load_cover_bytes(&real).unwrap_or_default())).await
+        }
+        .await;
+        let data = failed(&peer, &format!("cover /{path}"), result)?;
+        let found = if data.is_empty() {
+            "none".to_string()
+        } else {
+            size(data.len() as u64)
+        };
+        log(&peer, format_args!("cover   /{path} ({found})"));
         Ok(Response::new(GetCoverResponse { data }))
     }
 
+    /// Not logged when it works: `push` asks once per file, and the upload that
+    /// follows says everything worth saying.
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        let info = match self.existing(&request.into_inner().path) {
-            Ok(path) => {
-                let meta = tokio::fs::metadata(&path).await.map_err(internal)?;
+        let peer = peer(&request);
+        let path = request.into_inner().path;
+        let info = match self.existing(&path) {
+            Ok(real) => {
+                let meta = tokio::fs::metadata(&real).await.map_err(internal);
+                let meta = failed(&peer, &format!("stat /{path}"), meta)?;
                 StatResponse {
                     exists: true,
                     is_dir: meta.is_dir(),
@@ -307,7 +402,7 @@ impl LibraryService for Service {
                 }
             }
             Err(status) if status.code() == tonic::Code::NotFound => StatResponse::default(),
-            Err(status) => return Err(status),
+            Err(status) => return failed(&peer, &format!("stat /{path}"), Err(status)),
         };
         Ok(Response::new(info))
     }
@@ -315,12 +410,29 @@ impl LibraryService for Service {
     type ReadStream = ChunkStream;
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ChunkStream>, Status> {
+        let peer = peer(&request);
         let request = request.into_inner();
-        let path = self.existing(&request.path)?;
-        let mut file = tokio::fs::File::open(&path).await.map_err(internal)?;
-        file.seek(io::SeekFrom::Start(request.offset))
-            .await
-            .map_err(internal)?;
+        let path = request.path.clone();
+        let result = async {
+            let real = self.existing(&request.path)?;
+            let mut file = tokio::fs::File::open(&real).await.map_err(internal)?;
+            let len = file.metadata().await.map_err(internal)?.len();
+            file.seek(io::SeekFrom::Start(request.offset))
+                .await
+                .map_err(internal)?;
+            Ok((file, len))
+        }
+        .await;
+        let (mut file, len) = failed(&peer, &format!("play /{path}"), result)?;
+        // Opening a track reads from 0; anything else is the player seeking.
+        if request.offset == 0 {
+            log(&peer, format_args!("play    /{path} ({})", size(len)));
+        } else {
+            log(
+                &peer,
+                format_args!("seek    /{path} @ {}", size(request.offset)),
+            );
+        }
 
         // A small buffer: the stream only runs ahead of the reader by this many
         // chunks, so a client that seeks away wastes at most that much.
@@ -332,6 +444,7 @@ impl LibraryService for Service {
                     Ok(0) => return,
                     Ok(n) => n,
                     Err(err) => {
+                        log(&peer, format_args!("✕ play /{path}: {err}"));
                         let _ = tx.send(Err(internal(err))).await;
                         return;
                     }
@@ -350,25 +463,33 @@ impl LibraryService for Service {
         &self,
         request: Request<ListEntriesRequest>,
     ) -> Result<Response<ListEntriesResponse>, Status> {
-        let dir = self.existing(&request.into_inner().path)?;
-        let mut read = tokio::fs::read_dir(&dir).await.map_err(internal)?;
-        let mut entries = Vec::new();
-        while let Some(entry) = read.next_entry().await.map_err(internal)? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Hidden, which includes uploads still in flight.
-            if name.starts_with('.') {
-                continue;
+        let peer = peer(&request);
+        let path = request.into_inner().path;
+        let result = async {
+            let dir = self.existing(&path)?;
+            let mut read = tokio::fs::read_dir(&dir).await.map_err(internal)?;
+            let mut entries = Vec::new();
+            while let Some(entry) = read.next_entry().await.map_err(internal)? {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // Hidden, which includes uploads still in flight.
+                if name.starts_with('.') {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                entries.push(Entry {
+                    name,
+                    is_dir: meta.is_dir(),
+                    size: if meta.is_dir() { 0 } else { meta.len() },
+                });
             }
-            let Ok(meta) = entry.metadata().await else {
-                continue;
-            };
-            entries.push(Entry {
-                name,
-                is_dir: meta.is_dir(),
-                size: if meta.is_dir() { 0 } else { meta.len() },
-            });
+            entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+            Ok(entries)
         }
-        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        .await;
+        let entries = failed(&peer, &format!("ls /{path}"), result)?;
+        log(&peer, format_args!("ls      /{path} → {}", entries.len()));
         Ok(Response::new(ListEntriesResponse { entries }))
     }
 
@@ -376,7 +497,10 @@ impl LibraryService for Service {
         &self,
         request: Request<Streaming<UploadRequest>>,
     ) -> Result<Response<UploadResponse>, Status> {
-        self.writable()?;
+        let peer = peer(&request);
+        if let Err(status) = self.writable() {
+            return failed(&peer, "upload", Err(status));
+        }
         let mut stream = request.into_inner();
         let first = stream
             .message()
@@ -385,60 +509,84 @@ impl LibraryService for Service {
         let header = first
             .header
             .ok_or_else(|| Status::invalid_argument("the first message needs a header"))?;
-        let path = self.creatable(&header.path)?;
+        let what = format!("upload /{}", header.path);
+        let path = failed(&peer, &what, self.creatable(&header.path))?;
         if path.is_dir() {
-            return Err(Status::already_exists(format!(
-                "/{} is a folder",
-                header.path
-            )));
+            return failed(
+                &peer,
+                &what,
+                Err(Status::already_exists(format!(
+                    "/{} is a folder",
+                    header.path
+                ))),
+            );
         }
         let parent = path.parent().unwrap_or(&self.root).to_path_buf();
-        tokio::fs::create_dir_all(&parent).await.map_err(internal)?;
+        let made = tokio::fs::create_dir_all(&parent).await.map_err(internal);
+        failed(&peer, &what, made)?;
+        log(
+            &peer,
+            format_args!("↑ start /{} ({})", header.path, size(header.size)),
+        );
+        let started = std::time::Instant::now();
 
         // Hidden, so neither a listing nor a scan picks up half a file.
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let temp = parent.join(format!(".{name}.{}.part", std::process::id()));
         let result = receive(&temp, first.data, &mut stream, header.size).await;
-        match result {
-            Ok(()) => {
-                tokio::fs::rename(&temp, &path).await.map_err(internal)?;
-                println!("upload /{} ({} bytes)", self.relative(&path), header.size);
-                Ok(Response::new(UploadResponse { size: header.size }))
-            }
-            Err(status) => {
-                let _ = tokio::fs::remove_file(&temp).await;
-                Err(status)
-            }
+        let result = match result {
+            Ok(()) => tokio::fs::rename(&temp, &path).await.map_err(internal),
+            Err(status) => Err(status),
+        };
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp).await;
         }
+        failed(&peer, &what, result)?;
+        log(
+            &peer,
+            format_args!(
+                "✓ saved /{} ({} in {:.1} s)",
+                header.path,
+                size(header.size),
+                started.elapsed().as_secs_f64()
+            ),
+        );
+        Ok(Response::new(UploadResponse { size: header.size }))
     }
 
     async fn remove(
         &self,
         request: Request<RemoveRequest>,
     ) -> Result<Response<RemoveResponse>, Status> {
-        self.writable()?;
+        let peer = peer(&request);
         let request = request.into_inner();
-        let path = self.existing(&request.path)?;
-        if path == *self.root {
-            return Err(Status::permission_denied(
-                "refusing to remove the music folder",
-            ));
-        }
-        let meta = tokio::fs::symlink_metadata(&path).await.map_err(internal)?;
-        let removed = if !meta.is_dir() {
-            tokio::fs::remove_file(&path).await
-        } else if request.recursive {
-            tokio::fs::remove_dir_all(&path).await
-        } else {
-            tokio::fs::remove_dir(&path).await
-        };
-        removed.map_err(|err| match err.kind() {
-            io::ErrorKind::DirectoryNotEmpty => {
-                Status::failed_precondition("folder is not empty; remove it recursively")
+        let what = format!("remove /{}", request.path);
+        let result = async {
+            self.writable()?;
+            let path = self.existing(&request.path)?;
+            if path == *self.root {
+                return Err(Status::permission_denied(
+                    "refusing to remove the music folder",
+                ));
             }
-            _ => internal(err),
-        })?;
-        println!("remove /{}", self.relative(&path));
+            let meta = tokio::fs::symlink_metadata(&path).await.map_err(internal)?;
+            let removed = if !meta.is_dir() {
+                tokio::fs::remove_file(&path).await
+            } else if request.recursive {
+                tokio::fs::remove_dir_all(&path).await
+            } else {
+                tokio::fs::remove_dir(&path).await
+            };
+            removed.map_err(|err| match err.kind() {
+                io::ErrorKind::DirectoryNotEmpty => {
+                    Status::failed_precondition("folder is not empty; remove it recursively")
+                }
+                _ => internal(err),
+            })
+        }
+        .await;
+        failed(&peer, &what, result)?;
+        log(&peer, format_args!("{what}"));
         Ok(Response::new(RemoveResponse {}))
     }
 
@@ -446,29 +594,35 @@ impl LibraryService for Service {
         &self,
         request: Request<MoveRequest>,
     ) -> Result<Response<MoveResponse>, Status> {
-        self.writable()?;
+        let peer = peer(&request);
         let request = request.into_inner();
-        let from = self.existing(&request.from)?;
-        if from == *self.root {
-            return Err(Status::permission_denied(
-                "refusing to move the music folder",
-            ));
+        let what = format!("move /{} → /{}", request.from, request.to);
+        let result = async {
+            self.writable()?;
+            let from = self.existing(&request.from)?;
+            if from == *self.root {
+                return Err(Status::permission_denied(
+                    "refusing to move the music folder",
+                ));
+            }
+            let to = self.creatable(&request.to)?;
+            if to.exists() {
+                return Err(Status::already_exists(format!(
+                    "/{} already exists",
+                    request.to
+                )));
+            }
+            if to.starts_with(&from) {
+                return Err(Status::invalid_argument("cannot move a folder into itself"));
+            }
+            if let Some(parent) = to.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(internal)?;
+            }
+            tokio::fs::rename(&from, &to).await.map_err(internal)
         }
-        let to = self.creatable(&request.to)?;
-        if to.exists() {
-            return Err(Status::already_exists(format!(
-                "/{} already exists",
-                request.to
-            )));
-        }
-        if to.starts_with(&from) {
-            return Err(Status::invalid_argument("cannot move a folder into itself"));
-        }
-        if let Some(parent) = to.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(internal)?;
-        }
-        tokio::fs::rename(&from, &to).await.map_err(internal)?;
-        println!("move /{} -> /{}", self.relative(&from), self.relative(&to));
+        .await;
+        failed(&peer, &what, result)?;
+        log(&peer, format_args!("{what}"));
         Ok(Response::new(MoveResponse {}))
     }
 }
@@ -596,6 +750,15 @@ mod tests {
         for bad in ["..", "a/../..", "a/./b", "../etc/passwd"] {
             assert!(lexical(bad).is_err(), "{bad} was let through");
         }
+    }
+
+    #[test]
+    fn the_log_clock_reads_like_a_date() {
+        let stamp = now();
+        assert_eq!(stamp.len(), "2026-09-18 15:40:12".len(), "{stamp}");
+        assert!(stamp.starts_with("20"), "{stamp}");
+        assert_eq!(&stamp[4..5], "-");
+        assert_eq!(&stamp[13..14], ":");
     }
 
     #[test]

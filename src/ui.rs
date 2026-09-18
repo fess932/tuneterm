@@ -96,6 +96,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_tabs(frame, app, strip);
     draw_help(frame, app, help);
 
+    // Over the track list, which is the pane least needed while a folder moves.
+    if app.tab != Tab::Radio
+        && let Some(view) = app.transfer_view()
+    {
+        draw_transfer(frame, &view, middle);
+    }
+
     // Last, so it sits over everything.
     if app.prompt.is_some() {
         draw_prompt(frame, app);
@@ -170,6 +177,135 @@ fn draw_feeds(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// A floating input, drawn over whatever is behind it.
+/// The log of a folder moving to the server, as a small card in the bottom-right
+/// corner of the track list — where the list is usually empty, and clear of the
+/// player's own controls. The last few files, the one on its way with its own
+/// percentage, and a bar for the whole move.
+fn draw_transfer(frame: &mut Frame, view: &crate::app::TransferView, pane: Rect) {
+    use crate::app::LogLine;
+    use crate::remote::human;
+
+    // Inside the pane's border, so the card reads as part of it.
+    let room = Rect {
+        x: pane.x + 1,
+        y: pane.y + 1,
+        width: pane.width.saturating_sub(2),
+        height: pane.height.saturating_sub(2),
+    };
+    let width = room.width.min(56);
+    let height = room.height.min(8);
+    if width < 24 || height < 4 {
+        return;
+    }
+    let area = Rect {
+        x: room.x + room.width - width,
+        y: room.y + room.height - height,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let done = view.finished.is_some();
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if done { DIM } else { ACCENT }))
+        .title(Span::styled(
+            format!(" {} {} ", if done { "✓" } else { "↑" }, view.title),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(" l hides ", Style::new().fg(DIM))).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = inner.width as usize;
+
+    // Name on the left, note on the right; a long name loses its start, since the
+    // end — the file — is the part worth reading.
+    let row = |mark: &str, name: &str, note: String, colour: Color| {
+        let fixed = mark.chars().count() + 1 + note.chars().count() + 1;
+        let name = shorten_start(name, width.saturating_sub(fixed));
+        let gap = width.saturating_sub(fixed - 1 + name.chars().count());
+        Line::from(vec![
+            Span::styled(format!("{mark} "), Style::new().fg(colour)),
+            Span::styled(name, Style::new().fg(TEXT)),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(note, Style::new().fg(DIM)),
+        ])
+    };
+
+    let mut lines: Vec<Line> = view
+        .log
+        .iter()
+        .map(|line| match line {
+            LogLine::Sent { name, size } => row("✓", name, human(*size), ACCENT),
+            LogLine::Same { name, .. } => row("=", name, "already there".into(), DIM),
+            LogLine::Failed(text) => row("✕", text, String::new(), ACCENT_ALT),
+            LogLine::Note(text) => row("·", text, String::new(), DIM),
+        })
+        .collect();
+    if let Some((name, sent, size)) = &view.current {
+        let percent = if *size == 0 { 100 } else { sent * 100 / size };
+        lines.push(row("↑", name, format!("{percent}%"), ACCENT));
+    }
+
+    // The newest lines, filling the card down to the bar.
+    let [list, bar] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let skip = lines.len().saturating_sub(list.height as usize);
+    let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
+    frame.render_widget(Paragraph::new(lines), list);
+
+    let ratio = if view.bytes == 0 {
+        1.0
+    } else {
+        (view.bytes_done as f64 / view.bytes as f64).clamp(0.0, 1.0)
+    };
+    let label = match (&view.finished, view.left) {
+        (Some(message), _) => message.clone(),
+        (None, left) => {
+            let mut label = format!(
+                "{}/{} · {} / {}",
+                view.files_done,
+                view.files,
+                human(view.bytes_done),
+                human(view.bytes)
+            );
+            if let Some(left) = left {
+                label.push_str(&format!(
+                    " · {}/s · {}",
+                    human(view.speed as u64),
+                    crate::library::fmt_duration(left)
+                ));
+            }
+            label
+        }
+    };
+    frame.render_widget(
+        LineGauge::default()
+            .ratio(ratio)
+            .label(Span::styled(
+                shorten_start(&label, width.saturating_sub(8)),
+                Style::new().fg(if done { ACCENT } else { TEXT }),
+            ))
+            .filled_style(Style::new().fg(ACCENT))
+            .unfilled_style(Style::new().fg(DIM))
+            .filled_symbol(ratatui::symbols::line::THICK_HORIZONTAL)
+            .unfilled_symbol(ratatui::symbols::line::HORIZONTAL),
+        bar,
+    );
+}
+
+/// Keep the end of `text` within `max` characters, marking the cut.
+fn shorten_start(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let tail: String = text.chars().skip(count - (max - 1)).collect();
+    format!("…{tail}")
+}
+
 fn draw_prompt(frame: &mut Frame, app: &App) {
     let Some(prompt) = app.prompt.as_ref() else {
         return;

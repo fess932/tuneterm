@@ -124,10 +124,11 @@ BROWSING
     whole discography. Enter descends, Backspace goes back up.
 
 KEYS
-    Tab, h/l, arrows  Switch pane            Space         Play / pause
+    Tab, arrows       Switch pane            Space         Play / pause
     j/k, PgUp/PgDn    Move selection         n / p         Next / previous
     Enter             Open folder / play     [ / ]         Seek -/+ 5s
     a                 Add a server (Local)   u             Move to the server
+    l                 Show / hide move log
     Backspace         Go up a folder         + / -         Volume
     1 - 3             Switch source          s             Shuffle
     q, Esc, Ctrl-C    Quit
@@ -456,7 +457,8 @@ fn run(
         // finished job rings `wakes` and this returns at once. The timeout is only
         // how often a screen that nobody is touching still needs a look-in — for
         // the clock, the progress bar, and noticing that a track has ended.
-        let idle = if app.is_playing_something() {
+        // A move counts too: its log shows bytes as they go.
+        let idle = if app.is_playing_something() || app.is_moving() {
             Duration::from_millis(120)
         } else {
             Duration::from_millis(500)
@@ -517,10 +519,13 @@ fn on_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
+        // Escape closes the move log first, if it is up.
+        KeyCode::Esc if app.hide_transfer_log() => {}
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('l') => app.toggle_transfer_log(),
         KeyCode::Tab | KeyCode::BackTab => app.focus_next(),
-        KeyCode::Left | KeyCode::Char('h') => app.focus = Pane::Folders,
-        KeyCode::Right | KeyCode::Char('l') => app.focus = Pane::Tracks,
+        KeyCode::Left => app.focus = Pane::Folders,
+        KeyCode::Right => app.focus = Pane::Tracks,
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::PageDown => app.move_selection(10),
@@ -539,7 +544,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_shuffle(),
         KeyCode::Char('a') if app.tab == app::Tab::Feeds => app.open_add_feed(),
         KeyCode::Char('a') if app.tab == app::Tab::Local => app.open_add_server(),
-        KeyCode::Char('u') if app.tab == app::Tab::Local => app.ask_move(),
+        KeyCode::Char('u') if app.tab == app::Tab::Local => app.move_selected(),
         KeyCode::Char('d') if app.tab == app::Tab::Feeds => app.remove_selected_feed(),
         KeyCode::Char('1') => app.select_tab(app::Tab::Local),
         KeyCode::Char('2') => app.select_tab(app::Tab::Feeds),
