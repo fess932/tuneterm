@@ -308,8 +308,13 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
         ]));
     }
     rows.extend(app.folders.iter().map(|f| {
+        // `[u]` marks what is only here and would go to the server with `u`.
+        let mut name = vec![Span::styled(format!("{}/", f.label), Style::new().fg(TEXT))];
+        if app.can_move(f) {
+            name.push(Span::styled(" [u]", Style::new().fg(ACCENT_ALT)));
+        }
         Row::new(vec![
-            Cell::from(format!("{}/", f.label)).style(Style::new().fg(TEXT)),
+            Cell::from(Line::from(name)),
             // Right-aligned so the note sits in a column whatever the digit count.
             Cell::from(Line::from(format!("{} {COUNT_MARK}", f.count)).alignment(Alignment::Right))
                 .style(Style::new().fg(DIM)),
@@ -323,10 +328,18 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!(" {} ", app.here())
     };
-    let block = pane_block("", focused).title_bottom(Span::styled(
+    let mut block = pane_block("", focused).title_bottom(Span::styled(
         here,
         Style::new().fg(if focused { ACCENT } else { DIM }),
     ));
+    let actions = match app.remote.server {
+        Some(_) => " a server · u move ",
+        None => " a add server ",
+    };
+    if focused {
+        block = block
+            .title_bottom(Line::from(Span::styled(actions, Style::new().fg(DIM))).right_aligned());
+    }
     let table = Table::new(rows, [Constraint::Min(0), Constraint::Length(7)])
         .header(
             Row::new(vec![

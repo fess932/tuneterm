@@ -16,21 +16,21 @@ breaking.
 </div>
 
 ```
-╭ Library ───────────────╮╭ Tracks ───────────────────────╮╭ Now Playing ──────╮
-│FOLDER              №   ││  #  TITLE          ARTIST TIME││                   │
-│Deep Purple / =1    13  ││▶  1 Show Me        Deep P 3:41││   ▄▄▄▄▄▄▄▄▄▄▄▄▄   │
-│Lumen / Диссонанс   20  ││   2 A Bit On The S Deep P 4:12││   █ real cover █  │
-│Moby / Last Night   14  ││   3 Sharp Shooter  Deep P 3:29││   █   pixels  █   │
-│                        ││   4 Portable Door  Deep P 3:12││   ▀▀▀▀▀▀▀▀▀▀▀▀▀   │
-│                        ││                               ││                   │
-│                        ││                               ││     Show Me       │
-│                        ││                               ││    Deep Purple    │
-│                        ││                               ││        =1         │
-│                        ││                               ││ 1:02 / 3:41 ──────│
-│                        ││                               ││╭───╮╭───────╮╭───╮│
-│                        ││                               │││ ⏮ ││⏸ Pause││ ⏭ ││
-│                        ││                               ││╰───╯╰───────╯╰───╯│
-╰────────────────────────╯╰───────────────────────────────╯╰───────────────────╯
+╭ Library ─────────────────╮╭ Tracks ──────────────────────────────────╮╭ Now Playing ───────────────╮
+│FOLDER                  № ││  #  TITLE                ARTIST      TIME││                            │
+│Deep Purple / =1       13 ││▶  1 Show Me              Deep Purple 3:41││      ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄      │
+│Lumen / Диссонанс      20 ││   2 A Bit On The Side    Deep Purple 4:12││      █  real cover  █      │
+│Moby / Last Night      14 ││   3 Sharp Shooter        Deep Purple 3:29││      █    pixels    █      │
+│                          ││   4 Portable Door        Deep Purple 3:12││      ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀      │
+│                          ││                                          ││                            │
+│                          ││                                          ││          Show Me           │
+│                          ││                                          ││        Deep Purple         │
+│                          ││                                          ││             =1             │
+│                          ││                                          ││ 1:02 / 3:41 ━━━━━━━──────  │
+│                          ││                                          ││ ╭────╮ ╭──────────╮ ╭────╮ │
+│                          ││                                          ││ │ |< │ │ || Pause │ │ >| │ │
+│                          ││                                          ││ ╰────╯ ╰──────────╯ ╰────╯ │
+╰──────────────────────────╯╰──────────────────────────────────────────╯╰────────────────────────────╯
  Tab pane  ↑↓ move  ⏎ play  Space pause  n/p track  [/] seek  +/- vol  s shuffle
 ```
 
@@ -199,7 +199,7 @@ exactly like a local folder — same panes, same `..`, same breadcrumb, same ses
 restore. The protocol is [proto/tuneterm/v1/library.proto](proto/tuneterm/v1/library.proto).
 
 ```sh
-docker compose up -d                         # or: make image && make image-run MUSIC=~/Music
+docker compose up -d                         # ghcr.io/fess932/tuneterm, amd64 and arm64
 tuneterm tuneterm://TOKEN@nas                # browse and play it
 ```
 
@@ -207,7 +207,8 @@ tuneterm tuneterm://TOKEN@nas                # browse and play it
 the volume to where the music is, the token to something long. Without a token the
 server is open to anyone and read-only.
 
-The image is the server alone — built with `--no-default-features`, so no ALSA and no
+The image is built by CI on every push to `main` (`make image` builds one locally).
+It is the server alone — built with `--no-default-features`, so no ALSA and no
 terminal graphics — on distroless, about 40 MB. It runs as root, so on a rootful
 Docker host whatever `push` uploads is owned by root. Without Docker, `tuneterm serve
 ~/Music` does the same thing.

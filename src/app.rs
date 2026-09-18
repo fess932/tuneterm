@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -10,9 +11,10 @@ use ratatui_image::protocol::StatefulProtocol;
 
 use crate::config::{self, Feed};
 use crate::cover::{self, CoverLoader};
-use crate::library::{self, Folder, Store, Track};
+use crate::library::{self, Folder, Track};
 use crate::media::{self, Command, NowPlaying};
 use crate::player::{self, AudioPlayer};
+use crate::remote;
 use crate::worker::{Cancel, Wake, Worker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +69,6 @@ impl Tab {
 
 pub struct App {
     pub root: PathBuf,
-    /// Where `root` lives: here, or on a `tuneterm serve`.
-    pub store: Store,
     /// Which source is on screen.
     pub tab: Tab,
     /// Directory the left pane is listing. Never climbs above `root`.
@@ -145,9 +145,13 @@ pub struct App {
     /// Where the settings are written, held rather than looked up for the same
     /// reason as `feeds_file`: tests must not touch the user's real file.
     pub settings_file: Option<PathBuf>,
-    /// The server and token from the settings. The app never changes them, but it
-    /// rewrites the whole file, so it has to hand them back.
-    remote_settings: config::Remote,
+    /// The server whose folders are listed beside the local ones at the root, and
+    /// its token. Added with `a`, kept in the settings.
+    pub remote: config::Remote,
+    /// A folder on its way to the server, if one is.
+    moving: Option<Arc<Mutex<Move>>>,
+    /// Handed to the move's thread, so progress reaches the screen at once.
+    wake: Wake,
     /// When the session last changed, if it has not been written out yet.
     settings_dirty: Option<Instant>,
     /// The playhead as last written, so `tick` can tell how far it has drifted.
@@ -214,10 +218,33 @@ pub struct App {
 /// Kept as state rather than a blocking read so the rest of the app keeps running
 /// behind it: the music plays, the cover arrives, the progress bar moves.
 pub struct Prompt {
+    pub kind: PromptKind,
     pub title: &'static str,
     pub input: String,
     /// Shown under the field: usage, or why the last attempt was refused.
     pub hint: String,
+}
+
+/// What Enter in the prompt does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptKind {
+    Feed,
+    Server,
+    /// Confirming a move: the local folder, and where it goes on the server.
+    Move {
+        local: PathBuf,
+        remote: String,
+    },
+}
+
+/// A folder on its way to the server, as its thread reports it.
+#[derive(Debug, Default)]
+struct Move {
+    index: usize,
+    total: usize,
+    current: String,
+    /// Set once the thread is finished: what to say about it.
+    finished: Option<String>,
 }
 
 /// What was playing when the app was last closed, waiting for a listing to appear
@@ -271,8 +298,7 @@ impl App {
     /// `wake` is what every worker rings when it has something, so the loop can
     /// wait instead of asking.
     pub fn new(root: PathBuf, picker: Picker, media: media::Bridge, wake: Wake) -> Result<Self> {
-        let (store, root) = Store::for_root(root).map_err(anyhow::Error::msg)?;
-        let listed = store.subdirs(&root);
+        let listed = library::subdirs(&root);
         let unreachable = listed.as_ref().err().cloned();
         let folders = listed.unwrap_or_default();
         let mut folder_state = TableState::default();
@@ -284,7 +310,6 @@ impl App {
             cwd: root.clone(),
             trail: Vec::new(),
             root,
-            store: store.clone(),
             folders,
             tracks: Vec::new(),
             folder_state,
@@ -298,7 +323,7 @@ impl App {
                 "scan",
                 wake.clone(),
                 move |dir: PathBuf, cancel: &Cancel| {
-                    let tracks = store.tracks(&dir, cancel);
+                    let tracks = library::tracks(&dir, cancel);
                     (dir, tracks)
                 },
             ),
@@ -312,7 +337,9 @@ impl App {
             shuffle_order: Vec::new(),
             rng: Rng::new(),
             settings_file: config::settings_path(),
-            remote_settings: config::Remote::default(),
+            remote: config::Remote::default(),
+            moving: None,
+            wake: wake.clone(),
             settings_dirty: None,
             saved_position: Duration::ZERO,
             resume: None,
@@ -363,7 +390,7 @@ impl App {
             should_quit: false,
         };
         let empty = app.folders.is_empty()
-            && matches!(app.store, Store::Local)
+            && library::remote_url(&app.root).is_none()
             && library::scan_tracks(&app.root).is_empty();
         app.status = if let Some(err) = unreachable {
             format!("error: {err}")
@@ -388,7 +415,14 @@ impl App {
     /// step checks, and anything that no longer holds is dropped rather than
     /// reported — a first run and a stale line should both just start normally.
     pub fn restore(&mut self, settings: config::Settings) {
-        self.remote_settings = settings.remote.clone();
+        self.remote = settings.remote.clone();
+        if let Some(server) = self.remote.server.clone() {
+            // Registers the token, so every address on that server finds it.
+            match remote::Server::connect(&server, self.remote.token.as_deref()) {
+                Ok(_) => self.relist_root(),
+                Err(err) => self.status = format!("server: {err}"),
+            }
+        }
         self.audio.set_volume(settings.volume.get());
         self.shuffle = settings.shuffle;
 
@@ -434,36 +468,33 @@ impl App {
     /// `selected` is the row that was highlighted there, which is what decides the
     /// track listing — often a subfolder, and the folder itself when it has none.
     fn restore_folder(&mut self, folder: &Path, selected: Option<&Path>) {
-        // Only ever inside the root: the folder on the command line decides what
-        // this run is browsing, and a remembered path from a different library has
-        // no business overriding it.
-        let Ok(rest) = folder.strip_prefix(&self.root) else {
+        // Only ever inside the root or on the server: the folder on the command
+        // line decides what this run is browsing, and a remembered path from a
+        // different library has no business overriding it.
+        if !folder.starts_with(&self.root) && library::remote_url(folder).is_none() {
             return;
-        };
+        }
 
+        // Walk down the way browsing would have: at each level, into the row that
+        // leads towards `folder`. A server's folders sit among the local ones at
+        // the root, so this finds its way onto the server with no special case.
         let mut cwd = self.root.clone();
         let mut trail = Vec::new();
-        for part in rest.components() {
-            let next = cwd.join(part);
-            let Some(row) = self
-                .store
-                .subdirs(&cwd)
-                .unwrap_or_default()
-                .iter()
-                .position(|sub| sub.path == next)
-            else {
+        while cwd != folder {
+            let rows = self.list(&cwd).unwrap_or_default();
+            let Some(row) = rows.iter().position(|sub| folder.starts_with(&sub.path)) else {
                 // A folder that is no longer listed — deleted, or emptied of audio.
                 // Stop at the deepest point that still exists.
                 break;
             };
             // The row, not the index: every level below the root carries a `..`.
             trail.push((cwd.clone(), row + usize::from(!trail.is_empty())));
-            cwd = next;
+            cwd = rows[row].path.clone();
         }
 
         self.cwd = cwd;
         self.trail = trail;
-        self.folders = self.store.subdirs(&self.cwd).unwrap_or_default();
+        self.folders = self.list(&self.cwd.clone()).unwrap_or_default();
         self.folder_state = TableState::default();
 
         // Land on the folder that was highlighted, and on the first real row when
@@ -720,7 +751,7 @@ impl App {
             return;
         };
         let target = folder.path.clone();
-        let subdirs = match self.store.subdirs(&target) {
+        let subdirs = match self.list(&target) {
             Ok(subdirs) => subdirs,
             Err(err) => {
                 self.status = format!("error: {err}");
@@ -750,7 +781,7 @@ impl App {
         let Some((parent, selected)) = self.trail.last().cloned() else {
             return;
         };
-        let folders = match self.store.subdirs(&parent) {
+        let folders = match self.list(&parent) {
             Ok(folders) => folders,
             Err(err) => {
                 self.status = format!("error: {err}");
@@ -769,20 +800,280 @@ impl App {
         self.reload_tracks();
     }
 
+    /// The folders of `dir`. At the root of a local library that is the local
+    /// folders and the server's side by side, as one list: a folder that exists in
+    /// both is shown once, as the local one, since that still has something to
+    /// move.
+    ///
+    /// A server that cannot be reached leaves the local folders standing, and says
+    /// why in the status line.
+    fn list(&mut self, dir: &Path) -> Result<Vec<Folder>, String> {
+        let mut folders = library::subdirs(dir)?;
+        let Some(server) = self.remote.server.clone() else {
+            return Ok(folders);
+        };
+        if dir != self.root || library::remote_url(&self.root).is_some() {
+            return Ok(folders);
+        }
+        match library::subdirs(Path::new(&server)) {
+            Ok(remote) => {
+                let here: std::collections::HashSet<String> =
+                    folders.iter().map(|f| f.label.clone()).collect();
+                folders.extend(remote.into_iter().filter(|f| !here.contains(&f.label)));
+                folders.sort_by(|a, b| a.label.cmp(&b.label));
+            }
+            Err(err) => self.status = format!("server: {err}"),
+        }
+        Ok(folders)
+    }
+
+    /// List the root again, keeping the cursor where it was as far as it can.
+    fn relist_root(&mut self) {
+        if self.cwd != self.root {
+            return;
+        }
+        let root = self.root.clone();
+        let selected = self.selected_folder().map(|f| f.path.clone());
+        self.folders = self.list(&root).unwrap_or_default();
+        let row = selected
+            .and_then(|path| self.folders.iter().position(|f| f.path == path))
+            .unwrap_or(0);
+        self.folder_state = TableState::default();
+        if !self.folders.is_empty() {
+            self.folder_state.select(Some(row));
+        }
+        self.reload_tracks();
+    }
+
+    /// True for a local folder that `u` would move to the server.
+    pub fn can_move(&self, folder: &Folder) -> bool {
+        self.remote.server.is_some()
+            && library::remote_url(&folder.path).is_none()
+            && library::remote_url(&self.root).is_none()
+            && folder.path.starts_with(&self.root)
+    }
+
+    pub fn open_add_server(&mut self) {
+        let hint = match self.remote.server.as_deref().and_then(remote::authority_of) {
+            Some(current) => format!("now {current} · host, or TOKEN@host:port · Enter · Esc"),
+            None => "host, or TOKEN@host:port · Enter to add · Esc to cancel".into(),
+        };
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Server,
+            title: "Server",
+            input: String::new(),
+            hint,
+        });
+    }
+
+    fn submit_server(&mut self) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        if prompt.input.trim().is_empty() {
+            self.prompt = None;
+            return;
+        }
+        let (server, token) = match remote::split_address(&prompt.input) {
+            Ok(split) => split,
+            Err(err) => {
+                prompt.hint = err;
+                return;
+            }
+        };
+        if let Err(err) = remote::Server::connect(&server, token.as_deref()) {
+            prompt.hint = err;
+            return;
+        }
+        self.prompt = None;
+        self.status = format!(
+            "server {}",
+            remote::authority_of(&server).unwrap_or_default()
+        );
+        self.remote = config::Remote {
+            server: Some(server),
+            token,
+        };
+        // Written now rather than on the usual delay: this is something the user
+        // typed, not the playhead drifting.
+        self.write_settings();
+        self.memo.clear();
+        self.memo_order.clear();
+        self.relist_root();
+    }
+
+    /// Ask before moving the highlighted local folder to the server: the local
+    /// copy is deleted once the server has it.
+    pub fn ask_move(&mut self) {
+        if self.remote.server.is_none() {
+            self.status = "no server yet: a adds one".into();
+            return;
+        }
+        if self.moving.is_some() {
+            self.status = "a move is already running".into();
+            return;
+        }
+        let Some(folder) = self.selected_folder().cloned() else {
+            return;
+        };
+        if !self.can_move(&folder) {
+            self.status = format!("{} is already on the server", folder.label);
+            return;
+        }
+        let Ok(rel) = folder.path.strip_prefix(&self.root) else {
+            return;
+        };
+        let rel = rel
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let server = self
+            .remote
+            .server
+            .as_deref()
+            .and_then(remote::authority_of)
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Move {
+                local: folder.path.clone(),
+                remote: rel.clone(),
+            },
+            title: "Move to server",
+            input: String::new(),
+            hint: format!(
+                "Enter uploads {} to {server}/{rel} and deletes it here · Esc keeps it",
+                folder.label
+            ),
+        });
+    }
+
+    /// Upload on a thread of its own, then delete what the server confirmed.
+    fn start_move(&mut self, local: PathBuf, rel: String) {
+        let Some(address) = self.remote.server.clone() else {
+            return;
+        };
+        let server = match remote::Server::connect(&address, self.remote.token.as_deref()) {
+            Ok(server) => server,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
+            }
+        };
+        let label = local
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let state = Arc::new(Mutex::new(Move::default()));
+        self.moving = Some(Arc::clone(&state));
+        self.status = format!("moving {label}…");
+
+        let wake = self.wake.clone();
+        let spawned = std::thread::Builder::new()
+            .name("move".into())
+            .spawn(move || {
+                let report = |index: usize, total: usize, sent: &remote::Sent| {
+                    if let Ok(mut state) = state.lock() {
+                        state.index = index;
+                        state.total = total;
+                        state.current = sent.remote.clone();
+                    }
+                    wake.nudge();
+                };
+                let pushed = remote::push(&server, &local, &rel, report);
+                let removed = remote::remove_moved(&local, &pushed);
+                let message = match (&pushed.error, removed) {
+                    (None, Ok(_)) => {
+                        format!("moved {label} to the server: {} files", pushed.done.len())
+                    }
+                    (Some(err), Ok(n)) => {
+                        format!("move stopped after {n} of {} files: {err}", pushed.total)
+                    }
+                    (_, Err(err)) => format!("uploaded, but could not delete here: {err}"),
+                };
+                if let Ok(mut state) = state.lock() {
+                    state.finished = Some(message);
+                }
+                wake.nudge();
+            });
+        if let Err(err) = spawned {
+            self.moving = None;
+            self.status = format!("error: {err}");
+        }
+    }
+
+    /// Show a move's progress, and once it is done, the library as it now is.
+    pub fn poll_move(&mut self) {
+        let Some(state) = self.moving.clone() else {
+            return;
+        };
+        let Ok(state) = state.lock() else {
+            return;
+        };
+        match &state.finished {
+            None if state.total > 0 => {
+                self.status = format!("↑ {}/{} {}", state.index, state.total, state.current);
+            }
+            None => {}
+            Some(message) => {
+                self.status = message.clone();
+                drop(state);
+                self.moving = None;
+                // Both sides changed: nothing remembered about either still holds.
+                self.memo.clear();
+                self.memo_order.clear();
+                self.tracks_dir = None;
+                let cwd = self.cwd.clone();
+                let selected = self.folder_state.selected();
+                self.folders = self.list(&cwd).unwrap_or_default();
+                self.folder_state = TableState::default();
+                let rows = self.folder_row_count();
+                if rows > 0 {
+                    self.folder_state
+                        .select(Some(selected.unwrap_or(0).min(rows - 1)));
+                }
+                self.reload_tracks();
+            }
+        }
+    }
+
+    /// Block until a move has finished. Tests only: the real loop polls.
+    #[cfg(test)]
+    pub(crate) fn wait_for_move(&mut self) {
+        for _ in 0..2000 {
+            self.poll_move();
+            if self.moving.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the move never finished");
+    }
+
     pub fn can_leave(&self) -> bool {
         !self.trail.is_empty()
     }
 
     /// Breadcrumb for the pane title: the root's name plus the way down.
     pub fn here(&self) -> String {
-        let root_name = match self.store.label() {
-            Some(label) => label.to_string(),
+        let root_name = match library::remote_url(&self.root) {
+            Some(url) => remote::authority_of(url).unwrap_or_default(),
             None => self
                 .root
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| self.root.display().to_string()),
         };
+        // On the server, beside the local folders: the same breadcrumb, marked.
+        if self.cwd != self.root
+            && let Some(url) = library::remote_url(&self.cwd)
+        {
+            let path = remote::path_of(url).replace('/', " / ");
+            return match library::remote_url(&self.root) {
+                Some(_) => format!("{root_name} / {path}"),
+                None => format!("{root_name} / {path} ☁"),
+            };
+        }
         match self.cwd.strip_prefix(&self.root) {
             Ok(rest) if rest.as_os_str().is_empty() => root_name,
             Ok(rest) => {
@@ -1154,7 +1445,7 @@ impl App {
                 position: self.audio.position(),
                 playing: self.is_playing_something() && !self.audio.is_paused(),
             },
-            remote: self.remote_settings.clone(),
+            remote: self.remote.clone(),
         };
         self.saved_position = settings.session.position;
         if let Err(err) = config::save_settings_to(&path, &settings) {
@@ -1402,6 +1693,7 @@ impl App {
 
     pub fn open_add_feed(&mut self) {
         self.prompt = Some(Prompt {
+            kind: PromptKind::Feed,
             title: "Add feed",
             input: String::new(),
             hint: "paste an RSS URL · Enter to add · Esc to cancel".into(),
@@ -1433,6 +1725,15 @@ impl App {
     /// Accept the typed URL. Stays open with a reason when it is not usable, since
     /// closing on a typo would throw away what was pasted.
     pub fn submit_prompt(&mut self) {
+        match self.prompt.as_ref().map(|prompt| prompt.kind.clone()) {
+            Some(PromptKind::Server) => return self.submit_server(),
+            Some(PromptKind::Move { local, remote }) => {
+                self.prompt = None;
+                return self.start_move(local, remote);
+            }
+            Some(PromptKind::Feed) => {}
+            None => return,
+        }
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
@@ -1841,10 +2142,121 @@ mod tests {
         assert_eq!(app.tracks.len(), 6, "both albums of the artist");
     }
 
-    /// A server is browsed by the very same code as a folder: listing, descending,
-    /// the `..` row, the breadcrumb, climbing back — and a track plays from it.
+    /// Drive the loop until a stream has opened or failed.
+    fn wait_for_open(app: &mut App) {
+        for _ in 0..400 {
+            app.poll_open();
+            if !app.is_opening() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the stream never opened");
+    }
+
+    /// A local library with a server added: one list at the root, local folders
+    /// marked, server folders opened and left the same way as local ones, and a
+    /// track played from the server.
     #[test]
-    fn a_server_browses_and_plays_like_a_folder() {
+    fn server_folders_sit_beside_local_ones() {
+        let lib = Library::new("beside");
+        let served = crate::server::TempDir::new("beside-served");
+        let wav = silent_wav(2);
+        for (album, name) in [("Gamma", "01 far.wav"), ("Alpha", "01 there.wav")] {
+            let dir = served.0.join(album);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), &wav).unwrap();
+        }
+        let addr = crate::server::spawn_for_test(&served.0, Some("k"));
+
+        let mut app = lib.app();
+        let settings = lib.0.join("settings.txt");
+        app.settings_file = Some(settings.clone());
+        app.open_add_server();
+        for c in format!("k@{addr}").chars() {
+            app.prompt_key(c);
+        }
+        app.submit_prompt();
+        assert!(app.prompt.is_none(), "{:?}", app.prompt.as_ref().map(|p| &p.hint));
+
+        // Alpha is in both: shown once, as the local one.
+        let labels: Vec<_> = app.folders.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["Alpha", "Artist", "Beta", "Gamma"]);
+        let marked: Vec<_> = app
+            .folders
+            .iter()
+            .filter(|f| app.can_move(f))
+            .map(|f| f.label.as_str())
+            .collect();
+        assert_eq!(marked, ["Alpha", "Artist", "Beta"], "local ones are marked");
+
+        // Kept, with the token apart from the address.
+        let saved = config::load_settings_from(&settings).remote;
+        assert_eq!(saved.server, Some(format!("tuneterm://{addr}")));
+        assert_eq!(saved.token.as_deref(), Some("k"));
+
+        // Into the server's folder, and back out onto the same row.
+        let row = folder_row(&app, "Gamma");
+        app.select_folder(row);
+        app.enter_folder();
+        app.wait_for_tracks();
+        assert_eq!(app.tracks.len(), 1, "a leaf lists its own tracks");
+        assert_eq!(app.focus, Pane::Tracks, "a leaf moves focus instead");
+        app.play_index(0);
+        wait_for_open(&mut app);
+        assert!(app.status.starts_with("playing"), "{}", app.status);
+        assert_eq!(
+            app.now_playing().map(|t| t.path.clone()),
+            Some(PathBuf::from(format!("tuneterm://{addr}/Gamma/01 far.wav")))
+        );
+    }
+
+    /// `u` asks, then uploads the folder and deletes it here; the root then lists
+    /// the server's copy in its place.
+    #[test]
+    fn moving_a_folder_puts_it_on_the_server_and_takes_it_off_here() {
+        let lib = Library::new("move");
+        let served = crate::server::TempDir::new("move-served");
+        let addr = crate::server::spawn_for_test(&served.0, Some("k"));
+        let mut app = lib.app();
+        app.settings_file = None;
+        app.remote = config::Remote {
+            server: Some(format!("tuneterm://{addr}")),
+            token: Some("k".into()),
+        };
+
+        app.folder_state.select(Some(folder_row(&app, "Beta")));
+        app.ask_move();
+        assert!(
+            matches!(app.prompt.as_ref().map(|p| &p.kind), Some(PromptKind::Move { .. })),
+            "a move is confirmed first"
+        );
+        assert!(lib.0.join("Beta").is_dir(), "nothing happens before Enter");
+        app.submit_prompt();
+        app.wait_for_move();
+
+        assert!(app.status.starts_with("moved Beta"), "{}", app.status);
+        assert!(!lib.0.join("Beta").exists(), "the local copy is gone");
+        for name in ["01 song.wav", "02 song.wav"] {
+            assert!(served.0.join("Beta").join(name).is_file(), "{name} not on the server");
+        }
+        let beta = app
+            .folders
+            .iter()
+            .find(|f| f.label == "Beta")
+            .expect("Beta still listed, from the server");
+        assert!(library::remote_url(&beta.path).is_some());
+        assert!(!app.can_move(beta));
+
+        // A server folder is not offered for a move.
+        app.folder_state.select(Some(folder_row(&app, "Beta")));
+        app.ask_move();
+        assert!(app.prompt.is_none());
+    }
+
+    /// Given a server address as the folder, the player browses that server alone.
+    #[test]
+    fn a_server_as_the_root_browses_like_a_folder() {
         let lib = Library::new("served");
         let addr = crate::server::spawn_for_test(&lib.0, None);
         let mut app = App::new(
@@ -1859,33 +2271,16 @@ mod tests {
         let labels: Vec<_> = app.folders.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(labels, ["Alpha", "Artist", "Beta"]);
         assert_eq!(app.here(), addr.to_string());
-        assert!(!app.shows_up_row(), "no way up from the top of a server");
 
         app.folder_state.select(Some(folder_row(&app, "Artist")));
         app.enter_folder();
         app.wait_for_tracks();
-        assert_eq!(app.cwd, PathBuf::from("/Artist"));
-        assert!(app.shows_up_row());
+        assert_eq!(app.cwd, PathBuf::from(format!("tuneterm://{addr}/Artist")));
         assert_eq!(app.here(), format!("{addr} / Artist"));
         assert_eq!(app.tracks.len(), 2, "the first album, Early, is listed");
 
-        app.play_index(0);
-        assert!(app.is_opening(), "a stream opens off the drawing thread");
-        for _ in 0..400 {
-            app.poll_open();
-            if !app.is_opening() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(app.status.starts_with("playing"), "{}", app.status);
-
         app.leave_folder();
-        assert_eq!(app.cwd, PathBuf::from("/"));
-        assert_eq!(
-            app.selected_folder().map(|f| f.label.as_str()),
-            Some("Artist")
-        );
+        assert_eq!(app.selected_folder().map(|f| f.label.as_str()), Some("Artist"));
     }
 
     #[test]

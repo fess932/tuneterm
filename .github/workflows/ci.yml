@@ -73,11 +73,3 @@ jobs:
           # Nothing is deployed that an older schema would have to keep talking to.
           breaking: false
           push: false
-
-  image:
-    name: docker image
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t tuneterm-server .
-      - run: docker run --rm tuneterm-server --version

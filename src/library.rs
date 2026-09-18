@@ -28,6 +28,7 @@ fn is_audio(path: &Path) -> bool {
 }
 
 /// A directory that directly contains audio files.
+#[derive(Clone)]
 pub struct Folder {
     pub label: String,
     pub path: PathBuf,
@@ -50,53 +51,31 @@ pub struct Track {
     pub art_url: Option<String>,
 }
 
-/// Where the library lives: this machine's filesystem, or a `tuneterm serve`.
+/// A path that names something on a `tuneterm serve` rather than on this disk.
 ///
-/// Paths look the same either way — a remote folder is `/Artist/Album`, rooted at
-/// the server's music folder — so the browsing code, the trail back up, the memo
-/// and the saved session never need to ask which one they are walking.
-#[derive(Clone)]
-pub enum Store {
-    Local,
-    Remote(Box<crate::remote::Server>),
+/// A folder on a server is browsed by its address, `tuneterm://host:port/Artist`,
+/// the same way a feed episode is played by its URL. So the browser, the trail
+/// back up, the memo and the saved session carry remote folders with no idea that
+/// they are remote; only these few functions look.
+pub fn remote_url(path: &Path) -> Option<&str> {
+    path.to_str().filter(|text| crate::remote::is_remote(text))
 }
 
-impl Store {
-    /// The store a root argument names, and the root to browse in it. A
-    /// `tuneterm://` address is a server, browsed from its top; anything else is a
-    /// folder here.
-    pub fn for_root(root: PathBuf) -> Result<(Self, PathBuf), String> {
-        match root.to_str() {
-            Some(url) if crate::remote::is_remote(url) => {
-                let server = crate::remote::Server::open(url)?;
-                Ok((Store::Remote(Box::new(server)), PathBuf::from("/")))
-            }
-            _ => Ok((Store::Local, root)),
-        }
+/// Subfolders of `dir`, here or on a server.
+pub fn subdirs(dir: &Path) -> Result<Vec<Folder>, String> {
+    match remote_url(dir) {
+        Some(url) => crate::remote::folders(url),
+        None => Ok(list_subdirs(dir)),
     }
+}
 
-    /// What to call the root in the breadcrumb, when it is not a folder name.
-    pub fn label(&self) -> Option<&str> {
-        match self {
-            Store::Local => None,
-            Store::Remote(server) => Some(server.authority()),
-        }
-    }
-
-    pub fn subdirs(&self, dir: &Path) -> Result<Vec<Folder>, String> {
-        match self {
-            Store::Local => Ok(list_subdirs(dir)),
-            Store::Remote(server) => server.folders(dir),
-        }
-    }
-
-    /// See [`scan_tracks_deep`]. A server does the walk itself, in one call, so the
-    /// cancel can only discard its answer rather than cut it short.
-    pub fn tracks(&self, dir: &Path, cancel: &Cancel) -> Result<Vec<Track>, String> {
-        match self {
-            Store::Local => Ok(scan_tracks_deep(dir, cancel)),
-            Store::Remote(server) => server.tracks(dir),
-        }
+/// Every track at or below `dir`, here or on a server. See [`scan_tracks_deep`].
+/// A server does the walk itself in one call, so the cancel can only discard its
+/// answer rather than cut it short.
+pub fn tracks(dir: &Path, cancel: &Cancel) -> Result<Vec<Track>, String> {
+    match remote_url(dir) {
+        Some(url) => crate::remote::tracks(url),
+        None => Ok(scan_tracks_deep(dir, cancel)),
     }
 }
 

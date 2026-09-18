@@ -111,6 +111,13 @@ SOURCES
     highlighted entry. The list lives in feeds.txt in the config directory.
     Radio is a placeholder.
 
+SERVER FOLDERS
+    On the Local tab, a adds a tuneterm server (host, or TOKEN@host:port). Its
+    folders then list at the root beside the local ones, and open the same way.
+    Local folders are marked [u]: u moves the highlighted one to the server —
+    it is uploaded, and deleted here once the server has every file. Address
+    and token are kept in settings.txt.
+
 BROWSING
     The left pane is a folder browser. Moving the cursor lists everything in the
     highlighted folder *and its subfolders* on the right, so an artist shows their
@@ -120,6 +127,7 @@ KEYS
     Tab, h/l, arrows  Switch pane            Space         Play / pause
     j/k, PgUp/PgDn    Move selection         n / p         Next / previous
     Enter             Open folder / play     [ / ]         Seek -/+ 5s
+    a                 Add a server (Local)   u             Move to the server
     Backspace         Go up a folder         + / -         Volume
     1 - 3             Switch source          s             Shuffle
     q, Esc, Ctrl-C    Quit
@@ -245,9 +253,7 @@ fn scan_report(root: &Path) -> io::Result<()> {
     let stdout = io::stdout();
     let out = &mut stdout.lock();
 
-    let (store, root) = library::Store::for_root(root.to_path_buf()).map_err(io::Error::other)?;
-    let root = root.as_path();
-    let folders = store.subdirs(root).map_err(io::Error::other)?;
+    let folders = library::subdirs(root).map_err(io::Error::other)?;
     writeln!(out, "root: {}", root.display())?;
     writeln!(out, "subfolders: {}", folders.len())?;
     for folder in folders.iter().take(10) {
@@ -259,9 +265,7 @@ fn scan_report(root: &Path) -> io::Result<()> {
         Some(folder) => (folder.label.clone(), folder.path.clone()),
         None => (root.display().to_string(), root.to_path_buf()),
     };
-    let tracks = store
-        .tracks(&dir, &worker::Cancel::never())
-        .map_err(io::Error::other)?;
+    let tracks = library::tracks(&dir, &worker::Cancel::never()).map_err(io::Error::other)?;
     writeln!(out, "\ntracks under \"{label}\": {}", tracks.len())?;
     for track in tracks.iter().take(5) {
         writeln!(
@@ -313,10 +317,6 @@ pub fn main(args: Vec<String>) -> Result<()> {
 
     // One-off: entries predate the art/audio split and are now unreachable.
     cache::tidy();
-
-    // Before anything can open a server: a `tuneterm://` root without a token in it
-    // uses the one from the settings.
-    crate::remote::set_default_token(config::load_settings().remote.token);
 
     let root = args.root.unwrap_or_else(default_root);
     if args.scan {
@@ -485,6 +485,7 @@ fn run(
         app.poll_tracks();
         app.poll_feed();
         app.poll_open();
+        app.poll_move();
         app.poll_seek();
         app.refresh_cover_for_resize();
         app.poll_media();
@@ -537,6 +538,8 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('-') => app.nudge_volume(-0.05),
         KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_shuffle(),
         KeyCode::Char('a') if app.tab == app::Tab::Feeds => app.open_add_feed(),
+        KeyCode::Char('a') if app.tab == app::Tab::Local => app.open_add_server(),
+        KeyCode::Char('u') if app.tab == app::Tab::Local => app.ask_move(),
         KeyCode::Char('d') if app.tab == app::Tab::Feeds => app.remove_selected_feed(),
         KeyCode::Char('1') => app.select_tab(app::Tab::Local),
         KeyCode::Char('2') => app.select_tab(app::Tab::Feeds),

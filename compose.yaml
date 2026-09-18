@@ -5,8 +5,7 @@
 
 services:
   tuneterm:
-    build: .
-    image: tuneterm-server
+    image: ghcr.io/fess932/tuneterm:latest
     restart: unless-stopped
     ports:
       - "7700:7700"

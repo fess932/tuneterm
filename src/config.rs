@@ -75,15 +75,15 @@ pub struct Settings {
     /// The session, in as much detail as it can be put back: which source was
     /// showing, where in it you were, and what was playing.
     pub session: Session,
-    /// A `tuneterm serve` to talk to. Set by hand, never by the app — which only
-    /// has to carry it through its own writes.
+    /// The `tuneterm serve` whose folders show beside the local ones.
     pub remote: Remote,
 }
 
-/// The server `push`, `ls`, `mv` and `rm` use when not given one, and the token for
-/// any server whose address does not carry its own.
+/// A server, as added with `a` in the player. `push`, `ls`, `mv` and `rm` use it
+/// too when not given one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Remote {
+    /// `tuneterm://host:port`, without the token.
     pub server: Option<String>,
     pub token: Option<String>,
 }
@@ -172,9 +172,7 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> 
     text.push_str(&format!("shuffle = {}\n", u8::from(settings.shuffle)));
 
     let remote = &settings.remote;
-    text.push_str(
-        "\n# a tuneterm server: `server` for push, ls, mv and rm; `token` for any server\n",
-    );
+    text.push_str("\n# the tuneterm server whose folders show beside the local ones\n");
     for (key, value) in [("server", &remote.server), ("token", &remote.token)] {
         if let Some(value) = value.as_deref().filter(|value| !value.is_empty()) {
             text.push_str(&format!("{key} = {value}\n"));
