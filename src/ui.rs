@@ -328,13 +328,30 @@ fn draw_folders(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!(" {} ", app.here())
     };
+    // Last, after the folders: the way to add a server, or to change it.
+    if app.shows_server_row() {
+        let label = match app
+            .remote
+            .server
+            .as_deref()
+            .and_then(crate::remote::authority_of)
+        {
+            Some(server) => format!("☁ {server}"),
+            None => "+ Add server".to_string(),
+        };
+        rows.push(Row::new(vec![
+            Cell::from(label).style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Cell::from(""),
+        ]));
+    }
+
     let mut block = pane_block("", focused).title_bottom(Span::styled(
         here,
         Style::new().fg(if focused { ACCENT } else { DIM }),
     ));
     let actions = match app.remote.server {
-        Some(_) => " a server · u move ",
-        None => " a add server ",
+        Some(_) => " u: move [u] folder to server ",
+        None => " a: add server ",
     };
     if focused {
         block = block

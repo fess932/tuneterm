@@ -599,7 +599,19 @@ impl App {
 
     /// Rows in the folder pane, `..` included.
     pub fn folder_row_count(&self) -> usize {
-        self.folders.len() + usize::from(self.shows_up_row())
+        self.folders.len() + usize::from(self.shows_up_row()) + usize::from(self.shows_server_row())
+    }
+
+    /// True when the folder pane ends in the server button: `+ Add server`, or the
+    /// server's name to change it. Only at the root of a local library, which is
+    /// where the server's folders appear.
+    pub fn shows_server_row(&self) -> bool {
+        self.cwd == self.root && library::remote_url(&self.root).is_none()
+    }
+
+    /// True when the cursor is on the server button.
+    pub fn on_server_row(&self) -> bool {
+        self.shows_server_row() && self.folder_state.selected() == Some(self.folder_row_count() - 1)
     }
 
     /// The folder a row points at. `None` for the `..` row.
@@ -747,6 +759,10 @@ impl App {
             self.leave_folder();
             return;
         }
+        if self.on_server_row() {
+            self.open_add_server();
+            return;
+        }
         let Some(folder) = self.selected_folder() else {
             return;
         };
@@ -854,13 +870,16 @@ impl App {
     }
 
     pub fn open_add_server(&mut self) {
+        let example = "e.g. nas:7700, or with its token: TOKEN@nas:7700";
         let hint = match self.remote.server.as_deref().and_then(remote::authority_of) {
-            Some(current) => format!("now {current} · host, or TOKEN@host:port · Enter · Esc"),
-            None => "host, or TOKEN@host:port · Enter to add · Esc to cancel".into(),
+            Some(current) => {
+                format!("now {current}. Type a new address — {example} · Esc keeps it")
+            }
+            None => format!("server address — {example} · Enter adds · Esc cancels"),
         };
         self.prompt = Some(Prompt {
             kind: PromptKind::Server,
-            title: "Server",
+            title: "Add server",
             input: String::new(),
             hint,
         });
@@ -1895,8 +1914,11 @@ impl App {
         match pane {
             Pane::Folders => {
                 self.select_folder(index);
+                // A button, so one click is enough — like `+ Add feed`.
+                if self.on_server_row() {
+                    self.open_add_server();
                 // Same gesture as a file manager: one click selects, two descends.
-                if repeat {
+                } else if repeat {
                     self.enter_folder();
                 }
             }
@@ -2264,6 +2286,40 @@ mod tests {
         assert!(app.prompt.is_none());
     }
 
+    /// The button at the end of the root: a click or Enter opens the field.
+    #[test]
+    fn the_server_button_opens_the_field() {
+        let lib = Library::new("button");
+        let mut app = lib.app();
+        let button = app.folder_row_count() - 1;
+
+        app.folder_state.select(Some(button));
+        assert!(app.on_server_row());
+        app.enter_selected();
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(PromptKind::Server)
+        ));
+        app.cancel_prompt();
+
+        app.folder_state.select(Some(0));
+        app.folder_rows = rows(0, 1, 10);
+        app.click(
+            Position {
+                x: 2,
+                y: 1 + button as u16,
+            },
+            Instant::now(),
+        );
+        assert!(
+            matches!(
+                app.prompt.as_ref().map(|p| &p.kind),
+                Some(PromptKind::Server)
+            ),
+            "one click is enough for a button"
+        );
+    }
+
     /// Given a server address as the folder, the player browses that server alone.
     #[test]
     fn a_server_as_the_root_browses_like_a_folder() {
@@ -2326,9 +2382,15 @@ mod tests {
         let lib = Library::new("up-row");
         let mut app = lib.app();
 
-        // At the root there is nowhere to go up to, so no `..`.
+        // At the root there is nowhere to go up to, so no `..` — but the server
+        // button closes the list.
         assert!(!app.shows_up_row());
-        assert_eq!(app.folder_row_count(), app.folders.len());
+        assert!(app.shows_server_row());
+        assert_eq!(app.folder_row_count(), app.folders.len() + 1);
+        assert!(
+            app.folder_at(app.folders.len()).is_none(),
+            "the last row is the button"
+        );
         assert_eq!(app.folder_at(0).map(|f| f.label.as_str()), Some("Alpha"));
         assert!(!app.on_up_row());
 
@@ -2339,6 +2401,7 @@ mod tests {
         app.wait_for_tracks();
 
         assert!(app.shows_up_row());
+        assert!(!app.shows_server_row(), "the button is only at the root");
         assert_eq!(app.folder_row_count(), app.folders.len() + 1);
         assert!(app.folder_at(0).is_none(), "row 0 is `..`, not a folder");
         assert_eq!(app.folder_at(1).map(|f| f.label.as_str()), Some("Early"));
@@ -3479,7 +3542,8 @@ mod tests {
         let lib = Library::new("scroll-burst");
         let mut app = lib.app();
         app.folder_rows = rows(0, 1, 10);
-        let last = app.folders.len() - 1;
+        // The server button is the last row at the root.
+        let last = app.folder_row_count() - 1;
 
         for _ in 0..200 {
             app.scroll(Position { x: 2, y: 2 }, 1);
