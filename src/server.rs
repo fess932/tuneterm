@@ -14,7 +14,7 @@
 //!
 //! # Changes
 //!
-//! Upload, remove and move need a token. A server started without one is read-only,
+//! Upload, remove, move and stars need a token. A server started without one is read-only,
 //! so running it on a trusted network with no setup at all is safe for the music.
 
 use std::io;
@@ -35,8 +35,10 @@ use crate::proto::{
     CHUNK, Entry, Folder, GetCoverRequest, GetCoverResponse, ListEntriesRequest,
     ListEntriesResponse, ListFoldersRequest, ListFoldersResponse, ListTracksRequest,
     ListTracksResponse, MAX_MESSAGE, MoveRequest, MoveResponse, ReadRequest, ReadResponse,
-    RemoveRequest, RemoveResponse, StatRequest, StatResponse, Track, UploadRequest, UploadResponse,
+    RemoveRequest, RemoveResponse, SetRatingRequest, SetRatingResponse, StatRequest, StatResponse,
+    Track, UploadRequest, UploadResponse,
 };
+use crate::ratings::Ratings;
 use crate::worker::Cancel;
 
 pub struct Config {
@@ -111,6 +113,8 @@ pub struct Service {
     /// Canonical, so containment can be checked against canonical paths.
     root: Arc<PathBuf>,
     writable: bool,
+    /// The one piece of state that is not the files themselves.
+    ratings: Arc<Ratings>,
 }
 
 impl Service {
@@ -123,6 +127,7 @@ impl Service {
             ));
         }
         Ok(Self {
+            ratings: Arc::new(Ratings::load(&root)),
             root: Arc::new(root),
             writable: token.is_some(),
         })
@@ -312,11 +317,17 @@ impl LibraryService for Service {
             blocking(move || {
                 Ok(library::list_subdirs(&dir)
                     .into_iter()
-                    .map(|folder| Folder {
-                        path: this.relative(&folder.path),
-                        name: folder.label,
-                        count: folder.count as u32,
-                        newest: folder.newest,
+                    .map(|folder| {
+                        let path = this.relative(&folder.path);
+                        // Stars count as a change, so a player that remembered
+                        // the folder asks for it again.
+                        let newest = folder.newest.max(this.ratings.newest_under(&path));
+                        Folder {
+                            path,
+                            name: folder.label,
+                            count: folder.count as u32,
+                            newest,
+                        }
                     })
                     .collect::<Vec<_>>())
             })
@@ -341,13 +352,17 @@ impl LibraryService for Service {
             blocking(move || {
                 Ok(library::scan_tracks_deep(&dir, &Cancel::never())
                     .into_iter()
-                    .map(|track| Track {
-                        size: std::fs::metadata(&track.path).map_or(0, |meta| meta.len()),
-                        path: this.relative(&track.path),
-                        title: track.title,
-                        artist: track.artist,
-                        album: track.album,
-                        duration_ms: track.duration.map(|d| d.as_millis() as u64),
+                    .map(|track| {
+                        let path = this.relative(&track.path);
+                        Track {
+                            size: std::fs::metadata(&track.path).map_or(0, |meta| meta.len()),
+                            stars: this.ratings.get(&path).map(u32::from),
+                            path,
+                            title: track.title,
+                            artist: track.artist,
+                            album: track.album,
+                            duration_ms: track.duration.map(|d| d.as_millis() as u64),
+                        }
                     })
                     .collect::<Vec<_>>())
             })
@@ -583,7 +598,10 @@ impl LibraryService for Service {
                     Status::failed_precondition("folder is not empty; remove it recursively")
                 }
                 _ => internal(err),
-            })
+            })?;
+            self.ratings
+                .removed(&self.relative(&path))
+                .map_err(internal)
         }
         .await;
         failed(&peer, &what, result)?;
@@ -619,12 +637,41 @@ impl LibraryService for Service {
             if let Some(parent) = to.parent() {
                 tokio::fs::create_dir_all(parent).await.map_err(internal)?;
             }
-            tokio::fs::rename(&from, &to).await.map_err(internal)
+            tokio::fs::rename(&from, &to).await.map_err(internal)?;
+            self.ratings
+                .moved(&self.relative(&from), &self.relative(&to))
+                .map_err(internal)
         }
         .await;
         failed(&peer, &what, result)?;
         log(&peer, format_args!("{what}"));
         Ok(Response::new(MoveResponse {}))
+    }
+
+    async fn set_rating(
+        &self,
+        request: Request<SetRatingRequest>,
+    ) -> Result<Response<SetRatingResponse>, Status> {
+        let peer = peer(&request);
+        let request = request.into_inner();
+        let what = format!("stars {} /{}", request.stars, request.path);
+        let result = async {
+            self.writable()?;
+            if request.stars > 3 {
+                return Err(Status::invalid_argument("stars are 1 to 3, or 0 for none"));
+            }
+            let path = self.existing(&request.path)?;
+            if !path.is_file() || !library::is_audio(&path) {
+                return Err(Status::invalid_argument("stars are for tracks"));
+            }
+            self.ratings
+                .set(&self.relative(&path), request.stars as u8)
+                .map_err(internal)
+        }
+        .await;
+        failed(&peer, &what, result)?;
+        log(&peer, format_args!("{what}"));
+        Ok(Response::new(SetRatingResponse {}))
     }
 }
 

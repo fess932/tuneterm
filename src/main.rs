@@ -20,6 +20,7 @@ mod net;
 #[cfg(feature = "player")]
 mod player;
 mod proto;
+mod ratings;
 mod remote;
 mod server;
 #[cfg(feature = "player")]

@@ -20,7 +20,7 @@ const COVER_NAMES: &[&str] = &[
     "AlbumArt.jpg",
 ];
 
-fn is_audio(path: &Path) -> bool {
+pub fn is_audio(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| AUDIO_EXT.contains(&e.to_ascii_lowercase().as_str()))
@@ -74,6 +74,9 @@ pub struct Track {
     pub url: Option<String>,
     /// Artwork to fetch, for tracks whose picture is not in a tag.
     pub art_url: Option<String>,
+    /// Stars, 1 to 3, given on the server the track lives on. Only a server keeps
+    /// them, so every player that browses it sees the same ones.
+    pub stars: Option<u8>,
 }
 
 /// A path that names something on a `tuneterm serve` rather than on this disk.
@@ -343,6 +346,7 @@ fn read_track(path: PathBuf) -> Track {
         path,
         url: None,
         art_url: None,
+        stars: None,
     };
 
     if let Ok(tagged) = lofty::read_from_path(&track.path) {
@@ -423,6 +427,7 @@ pub fn tracks_from_feed(channel: &crate::feed::Channel) -> Vec<Track> {
             duration: episode.duration,
             url: Some(episode.url.clone()),
             art_url: episode.art_url.clone(),
+            stars: None,
         })
         .collect()
 }

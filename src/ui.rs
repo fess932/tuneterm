@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, LineGauge, Paragraph, Row, Table, Wrap};
 use ratatui_image::{FilterType, Resize, StatefulImage};
 
-use crate::app::{App, Pane, Tab};
+use crate::app::{App, Pane, Tab, stars_text};
 use crate::library::fmt_duration;
 
 const ACCENT: Color = Color::Rgb(137, 180, 250);
@@ -324,6 +324,7 @@ fn draw_keys(frame: &mut Frame) {
                 ("[  ]", "seek -5s / +5s"),
                 ("+  -", "volume"),
                 ("s", "shuffle"),
+                ("*", "stars on a server track: 1 → 2 → 3 → none"),
             ],
         ),
         (
@@ -680,9 +681,16 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 Style::new().fg(TEXT)
             };
+            // Nothing at all for a track without stars: the column is for the
+            // ones that have them.
+            let stars = t
+                .stars
+                .map(|stars| stars_text(Some(stars)))
+                .unwrap_or_default();
             Row::new(vec![
                 Cell::from(marker).style(Style::new().fg(ACCENT_ALT)),
                 Cell::from(format!("{:>2}", i + 1)).style(Style::new().fg(DIM)),
+                Cell::from(stars).style(Style::new().fg(ACCENT_ALT)),
                 Cell::from(t.title.clone()).style(title_style),
                 Cell::from(t.artist.clone()).style(Style::new().fg(DIM)),
                 Cell::from(
@@ -700,19 +708,23 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
         [
             Constraint::Length(1),
             Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Min(10),
             Constraint::Percentage(30),
             Constraint::Length(5),
         ],
     )
     .header(
-        Row::new(vec!["", "#", "TITLE", "ARTIST", "TIME"])
+        Row::new(vec!["", "#", "", "TITLE", "ARTIST", "TIME"])
             .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)),
     )
     .block(pane_block(&title, focused))
     .row_highlight_style(row_highlight(focused));
 
     app.track_rows = rows_area(area);
+    // Past the marker, the number and a column gap after each: fixed widths, so
+    // the stars always start here.
+    app.track_star_x = Some(app.track_rows.x + 1 + 1 + 2 + 1);
     frame.render_stateful_widget(table, area, &mut app.track_state);
 }
 
@@ -723,17 +735,19 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // The art gets whatever the info block, progress bar and button do not need.
     const INFO_H: u16 = 3;
+    const STARS_H: u16 = 1;
     const CONTROLS_H: u16 = 5;
-    let budget = inner.height.saturating_sub(INFO_H + CONTROLS_H);
+    let budget = inner.height.saturating_sub(INFO_H + STARS_H + CONTROLS_H);
     // The loader needs this to know how far to shrink an oversized cover.
     app.art_budget = Rect::new(inner.x, inner.y, inner.width, budget);
     let art_size = art_cells(app, inner.width, budget);
 
     // Two flexible gaps centre the art + info group in the space above the
     // controls, instead of stranding it at the top of a tall pane.
-    let [_, art, info, _, controls] = Layout::vertical([
+    let [_, art, stars, info, _, controls] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(art_size.1),
+        Constraint::Length(STARS_H),
         Constraint::Length(INFO_H),
         Constraint::Min(0),
         Constraint::Length(CONTROLS_H),
@@ -741,6 +755,7 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
     .areas(inner);
 
     draw_art(frame, app, centre_in(art, art_size));
+    draw_stars(frame, app, stars);
     draw_info(frame, app, info);
     draw_controls(frame, app, controls);
 }
@@ -835,6 +850,36 @@ fn draw_art(frame: &mut Frame, app: &mut App, target: Rect) {
         lines.push(Line::from(caption).fg(DIM));
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), target);
     }
+}
+
+/// The stars under the cover, each one clickable. Only for a track on a server —
+/// only a server keeps stars — and hollow and faint until it has some, so an
+/// unrated track shows where to click without shouting about it.
+fn draw_stars(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.star_areas = [Rect::ZERO; 3];
+    let Some(track) = app.now_playing() else {
+        return;
+    };
+    if crate::library::remote_url(&track.path).is_none() {
+        return;
+    }
+    let given = track.stars;
+    let style = if given.is_some() {
+        Style::new().fg(ACCENT_ALT)
+    } else {
+        Style::new().fg(DIM)
+    };
+    // `★ ★ ★`: a gap between them, so each is two cells to hit rather than one.
+    let text = stars_text(given)
+        .chars()
+        .map(String::from)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = centre_in(area, (5, 1));
+    for (star, hit) in app.star_areas.iter_mut().enumerate() {
+        *hit = cells_at(line, star as u16 * 2, 2);
+    }
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), line);
 }
 
 fn draw_info(frame: &mut Frame, app: &mut App, area: Rect) {

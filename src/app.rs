@@ -225,6 +225,11 @@ pub struct App {
     pub should_quit: bool,
     /// The key list, drawn over everything until the next key.
     pub show_keys: bool,
+
+    /// The three stars under the cover, for hit-testing. Zero while nothing plays.
+    pub star_areas: [Rect; 3],
+    /// Screen columns of the stars in the track list, one per star.
+    pub track_star_x: Option<u16>,
 }
 
 /// A floating one-line input. Opened by the Add button, closed by Enter or Escape.
@@ -311,6 +316,12 @@ impl Listing {
             found,
         }
     }
+}
+
+/// Stars as they are drawn: filled for what was given, hollow for the rest.
+pub fn stars_text(stars: Option<u8>) -> String {
+    let given = usize::from(stars.unwrap_or(0));
+    "★".repeat(given) + &"☆".repeat(3 - given)
 }
 
 /// One line of a move's log: something that went wrong, or how it ended. Files
@@ -549,6 +560,8 @@ impl App {
             status: String::new(),
             should_quit: false,
             show_keys: false,
+            star_areas: [Rect::ZERO; 3],
+            track_star_x: None,
         };
         let empty = app.folders.is_empty()
             && library::remote_url(&app.root).is_none()
@@ -2071,6 +2084,54 @@ impl App {
         }
     }
 
+    /// Give `track` this many stars — or take them away, when it already has
+    /// exactly that many, the way a second click on the same star undoes it.
+    ///
+    /// Only a track on a server has stars: the server keeps them, which is what
+    /// lets every player browsing it see the same ones.
+    pub fn rate(&mut self, track: &Track, stars: u8) {
+        let Some(url) = library::remote_url(&track.path).map(str::to_string) else {
+            self.status = "stars are for tracks on the server".into();
+            return;
+        };
+        let stars = stars.clamp(1, 3);
+        let stars = if track.stars == Some(stars) {
+            None
+        } else {
+            Some(stars)
+        };
+        if let Err(err) = remote::set_rating(&url, stars.unwrap_or(0)) {
+            self.status = format!("stars: {err}");
+            return;
+        }
+        // Every copy of the track this player holds, so the list, the queue and
+        // the memo all agree without asking the server again.
+        let copies = self.tracks.iter_mut().chain(self.queue.iter_mut()).chain(
+            self.memo
+                .values_mut()
+                .flat_map(|(_, tracks)| tracks.iter_mut()),
+        );
+        for copy in copies.filter(|copy| copy.path == track.path) {
+            copy.stars = stars;
+        }
+        self.status = match stars {
+            Some(_) => format!("{} {}", stars_text(stars), track.title),
+            None => format!("no stars for {}", track.title),
+        };
+    }
+
+    /// `*`: one star more for what is playing, round to none after three.
+    pub fn cycle_rating(&mut self) {
+        let Some(track) = self.now_playing().cloned() else {
+            return;
+        };
+        match track.stars {
+            Some(3) => self.rate(&track, 3),
+            Some(stars) => self.rate(&track, stars + 1),
+            None => self.rate(&track, 1),
+        }
+    }
+
     /// Turn shuffling on or off.
     ///
     /// Turning it on scrambles the rest of the queue but leaves the current track
@@ -2620,6 +2681,25 @@ impl App {
         }
         if self.shuffle_area.contains(pos) {
             self.toggle_shuffle();
+            return;
+        }
+        if let Some(star) = self.star_areas.iter().position(|area| area.contains(pos))
+            && let Some(track) = self.now_playing().cloned()
+        {
+            self.rate(&track, star as u8 + 1);
+            return;
+        }
+        // The stars of a row in the list: that track, playing or not.
+        if let Some(x) = self.track_star_x
+            && self.track_rows.contains(pos)
+            && (x..x + 3).contains(&pos.x)
+            && let Some(row) = self.row_at(Pane::Tracks, pos)
+            && let Some(track) = self.tracks.get(row).cloned()
+            && library::remote_url(&track.path).is_some()
+        {
+            self.focus = Pane::Tracks;
+            self.track_state.select(Some(row));
+            self.rate(&track, (pos.x - x) as u8 + 1);
             return;
         }
         let Some(pane) = self.pane_at(pos) else {
@@ -3694,6 +3774,7 @@ mod tests {
             duration: None,
             url: Some(url.to_string()),
             art_url: None,
+            stars: None,
         }
     }
 
@@ -4469,6 +4550,98 @@ mod tests {
             app.memo.contains_key(&lib.0.join("Artist")),
             "folders listed on the way are remembered"
         );
+    }
+
+    /// An app on `lib` browsing the server at `addr`, with the token `k`.
+    fn app_on_server(lib: &Library, addr: std::net::SocketAddr) -> App {
+        let mut app = lib.app();
+        app.settings_file = Some(lib.0.join("settings.txt"));
+        app.open_add_server();
+        for c in format!("k@{addr}").chars() {
+            app.prompt_key(c);
+        }
+        app.submit_prompt();
+        assert!(
+            app.prompt.is_none(),
+            "{:?}",
+            app.prompt.as_ref().map(|p| &p.hint)
+        );
+        app.wait_for_tracks();
+        app
+    }
+
+    /// Stars live on the server: given by one player, clicked under the cover or
+    /// in the list, and seen by another — even one that remembered the folder from
+    /// before they were given.
+    #[test]
+    fn stars_are_kept_on_the_server_and_seen_by_every_player() {
+        let served = crate::server::TempDir::new("stars-served");
+        let dir = served.0.join("Gamma");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("01 far.wav"), silent_wav(2)).unwrap();
+        std::fs::write(dir.join("02 near.wav"), silent_wav(2)).unwrap();
+        let addr = crate::server::spawn_for_test(&served.0, Some("k"));
+
+        let one = Library::new("stars-one");
+        let two = Library::new("stars-two");
+        let mut first = app_on_server(&one, addr);
+        let mut second = app_on_server(&two, addr);
+
+        // The second player reads Gamma before any stars exist, and remembers it.
+        second.select_folder(folder_row(&second, "Gamma"));
+        second.wait_for_tracks();
+        assert_eq!(second.tracks[0].stars, None);
+
+        // Two stars for the playing track, clicked under the cover.
+        first.select_folder(folder_row(&first, "Gamma"));
+        first.wait_for_tracks();
+        first.play_index(0);
+        wait_for_open(&mut first);
+        first.star_areas = [
+            Rect::new(10, 20, 2, 1),
+            Rect::new(12, 20, 2, 1),
+            Rect::new(14, 20, 2, 1),
+        ];
+        first.click(Position { x: 13, y: 20 }, Instant::now());
+        assert_eq!(
+            first.now_playing().and_then(|t| t.stars),
+            Some(2),
+            "{}",
+            first.status
+        );
+        assert_eq!(first.tracks[0].stars, Some(2), "the list agrees");
+
+        // Three for the second track, clicked in its row of the list.
+        first.track_rows = rows(30, 1, 10);
+        first.track_star_x = Some(35);
+        first.click(Position { x: 37, y: 2 }, Instant::now());
+        assert_eq!(first.tracks[1].stars, Some(3), "{}", first.status);
+
+        // The second player browses away and back: the folder changed, so it is
+        // read again rather than served from memory.
+        second.select_folder(folder_row(&second, "Alpha"));
+        second.wait_for_tracks();
+        second.relist_root();
+        second.select_folder(folder_row(&second, "Gamma"));
+        second.wait_for_tracks();
+        let stars: Vec<_> = second.tracks.iter().map(|t| t.stars).collect();
+        assert_eq!(stars, [Some(2), Some(3)]);
+
+        // The same star again takes them away.
+        first.click(Position { x: 13, y: 20 }, Instant::now());
+        assert_eq!(first.now_playing().and_then(|t| t.stars), None);
+    }
+
+    /// A local track has no stars to give: only a server keeps them.
+    #[test]
+    fn a_local_track_takes_no_stars() {
+        let lib = Library::new("stars-local");
+        let mut app = lib.app();
+        app.wait_for_tracks();
+        app.play_index(0);
+        app.cycle_rating();
+        assert_eq!(app.now_playing().and_then(|t| t.stars), None);
+        assert_eq!(app.status, "stars are for tracks on the server");
     }
 
     /// Block until the folder playback is running on into has been listed.

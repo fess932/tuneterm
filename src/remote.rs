@@ -307,6 +307,7 @@ impl Server {
                     // find a track's art, the way the local library does.
                     art_url: Some(url.clone()),
                     url: Some(url),
+                    stars: track.stars.map(|stars| stars.min(3) as u8),
                 }
             })
             .collect())
@@ -342,6 +343,19 @@ pub fn folders(url: &str) -> Result<Vec<Folder>, String> {
 pub fn tracks(url: &str) -> Result<Vec<Track>, String> {
     let (server, path) = Server::for_url(url)?;
     server.tracks(&path)
+}
+
+/// Give the track at a server address this many stars, 0 to take them away.
+pub fn set_rating(url: &str, stars: u8) -> Result<(), String> {
+    let (server, path) = Server::for_url(url)?;
+    let request = timed(proto::SetRatingRequest {
+        path,
+        stars: stars.into(),
+    });
+    runtime()
+        .block_on(server.client().set_rating(request))
+        .map_err(|status| describe(&status))?;
+    Ok(())
 }
 
 /// Move or rename something on a server. `from` is its address; `to` is the new

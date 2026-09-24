@@ -553,6 +553,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('+') | KeyCode::Char('=') => app.nudge_volume(0.05),
         KeyCode::Char('-') => app.nudge_volume(-0.05),
         KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_shuffle(),
+        KeyCode::Char('*') => app.cycle_rating(),
         KeyCode::Char('a') if app.tab == app::Tab::Feeds => app.open_add_feed(),
         KeyCode::Char('a') if app.tab == app::Tab::Local => app.open_add_server(),
         KeyCode::Char('u') if app.tab == app::Tab::Local => app.move_selected(),

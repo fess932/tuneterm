@@ -44,6 +44,11 @@ service LibraryService {
 
   rpc Remove(RemoveRequest) returns (RemoveResponse);
   rpc Move(MoveRequest) returns (MoveResponse);
+
+  // Stars for a track, 1 to 3, or 0 to take them away. Kept by the server, so
+  // every player browsing it sees the same ones; a folder's `newest` moves with
+  // them, which is how those players find out.
+  rpc SetRating(SetRatingRequest) returns (SetRatingResponse);
 }
 
 message ListFoldersRequest {
@@ -80,6 +85,8 @@ message Track {
   // Absent when the file could not be read far enough to tell.
   optional uint64 duration_ms = 5;
   uint64 size = 6;
+  // 1 to 3, absent when it has none.
+  optional uint32 stars = 7;
 }
 
 message GetCoverRequest {
@@ -153,3 +160,11 @@ message MoveRequest {
 }
 
 message MoveResponse {}
+
+message SetRatingRequest {
+  // A track.
+  string path = 1;
+  uint32 stars = 2;
+}
+
+message SetRatingResponse {}
