@@ -33,6 +33,31 @@ pub struct Folder {
     pub label: String,
     pub path: PathBuf,
     pub count: usize,
+    /// Newest modification time under it, of the folders as well as the audio,
+    /// in nanoseconds since the epoch. With `count`, what says whether a listing
+    /// read earlier still holds; see [`Folder::stamp`].
+    pub newest: u64,
+}
+
+/// What a folder looked like when its tracks were read. Unequal means read again.
+///
+/// A folder's own time moves when something in it is added, removed or renamed,
+/// and a file's when it is written — a tag edit included. The count catches what
+/// times alone can miss: a copy keeps the old file's time, and FAT and exFAT do
+/// not keep a folder's time at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    count: usize,
+    newest: u64,
+}
+
+impl Folder {
+    pub fn stamp(&self) -> Stamp {
+        Stamp {
+            count: self.count,
+            newest: self.newest,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -102,7 +127,7 @@ pub fn list_subdirs(dir: &Path) -> Vec<Folder> {
     subdirs
         .into_iter()
         .filter_map(|path| {
-            let count = count_audio(&path, MAX_DEPTH);
+            let (count, newest) = count_audio(&path, MAX_DEPTH);
             (count > 0).then(|| Folder {
                 label: path
                     .file_name()
@@ -110,6 +135,7 @@ pub fn list_subdirs(dir: &Path) -> Vec<Folder> {
                     .unwrap_or_else(|| path.to_string_lossy().into_owned()),
                 path,
                 count,
+                newest,
             })
         })
         .collect()
@@ -128,27 +154,48 @@ fn is_hidden(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Audio files at or below `dir`. No tags are read.
-fn count_audio(dir: &Path, depth: usize) -> usize {
+/// Audio files at or below `dir`, and the newest time among them and the folders
+/// they are in. No tags are read and no file is opened: one `stat` each, which is
+/// what telling a folder from a file already cost — on Windows not even that, as
+/// the listing carries the times.
+fn count_audio(dir: &Path, depth: usize) -> (usize, u64) {
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return (0, 0);
+    };
+    let mut newest = nanos(&meta);
     if depth == 0 {
-        return 0;
+        return (0, newest);
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
+        return (0, newest);
     };
-    entries
-        .flatten()
-        .map(|entry| {
-            let path = entry.path();
-            if is_hidden(&path) {
-                0
-            } else if path.is_dir() {
-                count_audio(&path, depth - 1)
-            } else {
-                usize::from(is_audio(&path))
-            }
-        })
-        .sum()
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_hidden(&path) {
+            continue;
+        }
+        // Following links, as `is_dir` did.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            let (below, time) = count_audio(&path, depth - 1);
+            count += below;
+            newest = newest.max(time);
+        } else if is_audio(&path) {
+            count += 1;
+            newest = newest.max(nanos(&meta));
+        }
+    }
+    (count, newest)
+}
+
+fn nanos(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos() as u64)
 }
 
 /// Every audio file at or below `dir`, tags resolved, ordered by path.

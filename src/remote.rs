@@ -278,6 +278,7 @@ impl Server {
                 label: folder.name,
                 path: PathBuf::from(self.url_for(&folder.path)),
                 count: folder.count as usize,
+                newest: folder.newest,
             })
             .collect())
     }

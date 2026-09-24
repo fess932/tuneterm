@@ -316,6 +316,7 @@ impl LibraryService for Service {
                         path: this.relative(&folder.path),
                         name: folder.label,
                         count: folder.count as u32,
+                        newest: folder.newest,
                     })
                     .collect::<Vec<_>>())
             })

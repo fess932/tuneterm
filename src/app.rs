@@ -12,7 +12,7 @@ use ratatui_image::protocol::StatefulProtocol;
 
 use crate::config::{self, Feed};
 use crate::cover::{self, CoverLoader};
-use crate::library::{self, Folder, Track};
+use crate::library::{self, Folder, Stamp, Track};
 use crate::media::{self, Command, NowPlaying};
 use crate::player::{self, AudioPlayer};
 use crate::remote;
@@ -98,7 +98,13 @@ pub struct App {
     pub tracks_loading: bool,
     /// Hands back the directory it scanned, so a result can never be filed under
     /// whatever the cursor has moved to meanwhile.
-    scan: Worker<PathBuf, (PathBuf, Result<Vec<Track>, String>)>,
+    scan: Worker<Listing, Listed>,
+    /// Lists the folder playback runs on into once the queue is used up. Its own
+    /// worker, so that a cursor moving meanwhile cannot supersede it.
+    follow: Worker<Listing, Listed>,
+    follow_generation: u64,
+    /// The folder being listed for that, while it is.
+    following_into: Option<PathBuf>,
     /// Opens remote streams, which blocks for as long as the server takes. Hands
     /// back the URL for the same reason the scan hands back its directory.
     open: Worker<String, (String, Result<player::RemoteSource, String>)>,
@@ -106,8 +112,9 @@ pub struct App {
     /// The URL being opened, if any.
     opening: Option<String>,
     scan_generation: u64,
-    /// Recently listed directories, so moving back over a folder is instant.
-    memo: HashMap<PathBuf, Vec<Track>>,
+    /// Recently listed directories, so moving back over a folder is instant — as
+    /// long as it still looks the way it did when it was read.
+    memo: HashMap<PathBuf, (Stamp, Vec<Track>)>,
     memo_order: VecDeque<PathBuf>,
     pub cover: Option<StatefulProtocol>,
     /// Pixel size of the cover as it will be drawn. Needed in full, not just as a
@@ -246,6 +253,64 @@ pub enum PromptKind {
     Relocate(PathBuf),
     /// Waiting for `y` before deleting this folder or track.
     Delete(PathBuf),
+}
+
+/// A folder to list, and — for `..`, which lists the folder being browsed — its
+/// folders one by one, with the tracks of those already read and unchanged since.
+///
+/// So listing everything costs only the folders never looked at or changed since,
+/// and at the root takes in the server's the same way as the local ones: the
+/// root's folder list already holds both, each folder once.
+pub struct Listing {
+    dir: PathBuf,
+    /// How `dir` looked in its parent's list, to file the answer under. `None` for
+    /// a listing that is not remembered.
+    stamp: Option<Stamp>,
+    parts: Vec<(PathBuf, Stamp, Option<Vec<Track>>)>,
+}
+
+/// What a [`Listing`] came back with: the tracks, and the folders it had to read on
+/// the way, for the memo.
+pub struct Listed {
+    dir: PathBuf,
+    stamp: Option<Stamp>,
+    tracks: Result<Vec<Track>, String>,
+    found: Vec<(PathBuf, Stamp, Vec<Track>)>,
+}
+
+impl Listing {
+    fn run(self, cancel: &Cancel) -> Listed {
+        if self.parts.is_empty() {
+            let tracks = library::tracks(&self.dir, cancel);
+            return Listed {
+                dir: self.dir,
+                stamp: self.stamp,
+                tracks,
+                found: Vec::new(),
+            };
+        }
+        // The folder's own files first, the way a folder's own files come first.
+        let mut tracks = library::scan_tracks(&self.dir);
+        let mut found = Vec::new();
+        for (path, stamp, known) in self.parts {
+            match known {
+                Some(known) => tracks.extend(known),
+                // A server that stopped answering costs its own folders only.
+                None => {
+                    if let Ok(listed) = library::tracks(&path, cancel) {
+                        tracks.extend(listed.iter().cloned());
+                        found.push((path, stamp, listed));
+                    }
+                }
+            }
+        }
+        Listed {
+            dir: self.dir,
+            stamp: self.stamp,
+            tracks: Ok(tracks),
+            found,
+        }
+    }
 }
 
 /// One line of a move's log: something that went wrong, or how it ended. Files
@@ -399,10 +464,10 @@ impl App {
         let listed = library::subdirs(&root);
         let unreachable = listed.as_ref().err().cloned();
         let folders = listed.unwrap_or_default();
-        let mut folder_state = TableState::default();
-        if !folders.is_empty() {
-            folder_state.select(Some(0));
-        }
+        // On the first folder rather than on `..`, which at the root would list —
+        // and read the tags of — the whole library before anything was asked of it.
+        let folder_state =
+            TableState::default().with_selected(Some(usize::from(!folders.is_empty())));
 
         let mut app = Self {
             cwd: root.clone(),
@@ -418,14 +483,10 @@ impl App {
             queue_dir: None,
             tracks_dir: None,
             tracks_loading: false,
-            scan: Worker::spawn(
-                "scan",
-                wake.clone(),
-                move |dir: PathBuf, cancel: &Cancel| {
-                    let tracks = library::tracks(&dir, cancel);
-                    (dir, tracks)
-                },
-            ),
+            scan: Worker::spawn("scan", wake.clone(), Listing::run),
+            follow: Worker::spawn("follow", wake.clone(), Listing::run),
+            follow_generation: 0,
+            following_into: None,
             scan_generation: 0,
             memo: HashMap::new(),
             memo_order: VecDeque::new(),
@@ -633,8 +694,8 @@ impl App {
                 // Stop at the deepest point that still exists.
                 break;
             };
-            // The row, not the index: every level below the root carries a `..`.
-            trail.push((cwd.clone(), row + usize::from(!trail.is_empty())));
+            // The row, not the index: every level carries a `..`.
+            trail.push((cwd.clone(), row + 1));
             cwd = rows[row].path.clone();
         }
 
@@ -645,10 +706,15 @@ impl App {
 
         // Land on the folder that was highlighted, and on the first real row when
         // it has gone.
-        let row = selected
-            .and_then(|selected| self.folders.iter().position(|sub| sub.path == selected))
-            .map(|index| index + usize::from(self.shows_up_row()))
-            .unwrap_or_else(|| usize::from(self.shows_up_row()));
+        // `..` lists the folder itself, so that is the row that was on it.
+        let row = if selected == Some(self.cwd.as_path()) {
+            0
+        } else {
+            selected
+                .and_then(|selected| self.folders.iter().position(|sub| sub.path == selected))
+                .map(|index| index + 1)
+                .unwrap_or(usize::from(!self.folders.is_empty()))
+        };
         if self.folder_row_count() > 0 {
             self.folder_state
                 .select(Some(row.min(self.folder_row_count() - 1)));
@@ -731,7 +797,44 @@ impl App {
     /// [`Self::folder_at`] and [`Self::folder_row_count`] rather than doing the
     /// off-by-one by hand.
     pub fn shows_up_row(&self) -> bool {
-        self.can_leave()
+        // At the root too: there it climbs nowhere, and lists the whole library.
+        true
+    }
+
+    /// What to ask a worker for to list `dir`. For `..` on a local folder that is
+    /// every folder on screen — at the root, the server's among them — and what is
+    /// still good of each. A server's own folder lists itself whole in one call.
+    fn listing(&self, dir: PathBuf) -> Listing {
+        if dir == self.cwd && library::remote_url(&self.cwd).is_none() {
+            let parts = self
+                .folders
+                .iter()
+                .map(|f| (f.path.clone(), f.stamp(), self.remembered(f)))
+                .collect();
+            return Listing {
+                dir,
+                stamp: None,
+                parts,
+            };
+        }
+        let stamp = self
+            .folders
+            .iter()
+            .find(|f| f.path == dir)
+            .map(Folder::stamp);
+        Listing {
+            dir,
+            stamp,
+            parts: Vec::new(),
+        }
+    }
+
+    /// What was read of `folder`, unless it has changed since.
+    fn remembered(&self, folder: &Folder) -> Option<Vec<Track>> {
+        self.memo
+            .get(&folder.path)
+            .filter(|(stamp, _)| *stamp == folder.stamp())
+            .map(|(_, tracks)| tracks.clone())
     }
 
     /// Rows in the folder pane, `..` included.
@@ -791,8 +894,14 @@ impl App {
         }
         self.tracks_dir = Some(dir.clone());
 
-        if let Some(cached) = self.memo.get(&dir) {
-            let tracks = cached.clone();
+        // `..` is put together from its folders each time instead, so a file added
+        // loose beside them is never missed.
+        let cached = self
+            .folders
+            .iter()
+            .find(|f| f.path == dir)
+            .and_then(|f| self.remembered(f));
+        if let Some(tracks) = cached {
             // Whatever scan was running is for the folder we just left, and nothing
             // will clear the flag for it: this listing is already complete.
             self.tracks_loading = false;
@@ -801,7 +910,8 @@ impl App {
         }
         self.tracks_loading = true;
         self.scan_generation += 1;
-        self.scan.request(self.scan_generation, dir);
+        let listing = self.listing(dir);
+        self.scan.request(self.scan_generation, listing);
     }
 
     /// Block until the pending scan lands. Tests only: the real loop polls.
@@ -825,9 +935,18 @@ impl App {
                 newest = Some(scanned);
             }
         }
-        let Some((dir, tracks)) = newest else {
+        let Some(Listed {
+            dir,
+            stamp,
+            tracks,
+            found,
+        }) = newest
+        else {
             return;
         };
+        for (path, stamp, listed) in found {
+            self.remember(path, stamp, listed);
+        }
         // The generation can still match a folder we have left: the memo path serves a
         // listing without asking for a scan, so it bumps nothing. Only the directory
         // says whose tracks these are.
@@ -837,7 +956,9 @@ impl App {
         self.tracks_loading = false;
         match tracks {
             Ok(tracks) => {
-                self.remember(dir, tracks.clone());
+                if let Some(stamp) = stamp {
+                    self.remember(dir, stamp, tracks.clone());
+                }
                 self.show_tracks(tracks);
             }
             // Not remembered, so moving back onto the folder asks again.
@@ -859,9 +980,9 @@ impl App {
     }
 
     /// Bounded so browsing a large tree cannot grow without limit.
-    fn remember(&mut self, dir: PathBuf, tracks: Vec<Track>) {
-        const KEEP: usize = 64;
-        if self.memo.insert(dir.clone(), tracks).is_none() {
+    fn remember(&mut self, dir: PathBuf, stamp: Stamp, tracks: Vec<Track>) {
+        const KEEP: usize = 256;
+        if self.memo.insert(dir.clone(), (stamp, tracks)).is_none() {
             self.memo_order.push_back(dir);
         }
         while self.memo_order.len() > KEEP {
@@ -893,7 +1014,12 @@ impl App {
     /// Descend into the highlighted folder, or back out when `..` is highlighted.
     pub fn enter_folder(&mut self) {
         if self.on_up_row() {
-            self.leave_folder();
+            // `..` at the root has nowhere to climb: what it lists is the point.
+            if self.can_leave() {
+                self.leave_folder();
+            } else {
+                self.focus = Pane::Tracks;
+            }
             return;
         }
         if self.on_server_row() {
@@ -986,15 +1112,18 @@ impl App {
             return;
         }
         let root = self.root.clone();
+        let on_up = self.on_up_row();
         let selected = self.selected_folder().map(|f| f.path.clone());
         self.folders = self.list(&root).unwrap_or_default();
-        let row = selected
-            .and_then(|path| self.folders.iter().position(|f| f.path == path))
-            .unwrap_or(0);
-        self.folder_state = TableState::default();
-        if !self.folders.is_empty() {
-            self.folder_state.select(Some(row));
-        }
+        let row = if on_up {
+            0
+        } else {
+            selected
+                .and_then(|path| self.folders.iter().position(|f| f.path == path))
+                .unwrap_or(0)
+                + usize::from(!self.folders.is_empty())
+        };
+        self.folder_state = TableState::default().with_selected(Some(row));
         self.reload_tracks();
     }
 
@@ -1068,6 +1197,8 @@ impl App {
         self.write_settings();
         self.memo.clear();
         self.memo_order.clear();
+        // The root's listing now takes in a different server.
+        self.tracks_dir = None;
         self.relist_root();
     }
 
@@ -1785,6 +1916,7 @@ impl App {
     fn stop_playback(&mut self) {
         self.audio.stop();
         self.opening = None;
+        self.following_into = None;
         self.queue_pos = None;
         self.resume_at = None;
         self.resume_playing = false;
@@ -1794,14 +1926,141 @@ impl App {
         match self.queue_pos {
             Some(current) => match self.following(current) {
                 Some(next) => self.play_queue_index(next),
-                None => {
-                    self.stop_playback();
-                    self.status = "end of queue".into();
-                }
+                None => self.follow_on(),
             },
             // Nothing queued yet: start from whatever is on screen.
             None => self.play_selected_track(),
         }
+    }
+
+    /// The queue is used up: go on into the folder after the one it came from, the
+    /// way the folder pane lists them, climbing out when that was the last one.
+    /// Stops only at the end of the library, or of a feed.
+    fn follow_on(&mut self) {
+        let next = self
+            .queue_dir
+            .clone()
+            .and_then(|dir| self.folder_after(&dir));
+        let Some(next) = next else {
+            self.stop_playback();
+            self.status = "end of queue".into();
+            return;
+        };
+        self.audio.stop();
+        self.status = format!("on to {}", next.label);
+        self.follow_into(next);
+    }
+
+    fn follow_into(&mut self, folder: Folder) {
+        if let Some(tracks) = self.remembered(&folder) {
+            return self.play_folder(folder.path, tracks);
+        }
+        self.following_into = Some(folder.path.clone());
+        self.follow_generation += 1;
+        let listing = Listing {
+            stamp: Some(folder.stamp()),
+            dir: folder.path,
+            parts: Vec::new(),
+        };
+        self.follow.request(self.follow_generation, listing);
+    }
+
+    /// Pick up the folder playback is running on into. Cheap, so it runs every loop.
+    pub fn poll_follow(&mut self) {
+        let mut newest = None;
+        for (generation, listed) in self.follow.drain() {
+            if generation == self.follow_generation {
+                newest = Some(listed);
+            }
+        }
+        let Some(Listed {
+            dir,
+            stamp,
+            tracks: listed,
+            found,
+        }) = newest
+        else {
+            return;
+        };
+        for (path, stamp, tracks) in found {
+            self.remember(path, stamp, tracks);
+        }
+        // Stopped, or something else started, while it was being listed.
+        if self.following_into.as_ref() != Some(&dir) {
+            return;
+        }
+        self.following_into = None;
+        match listed {
+            Ok(tracks) => {
+                if let Some(stamp) = stamp {
+                    self.remember(dir.clone(), stamp, tracks.clone());
+                }
+                self.play_folder(dir, tracks);
+            }
+            Err(err) => {
+                self.stop_playback();
+                self.status = format!("error: {err}");
+            }
+        }
+    }
+
+    /// Make `dir` the queue and start it from the top — or from wherever shuffle
+    /// says — moving the cursor along when it was on the folder just finished.
+    fn play_folder(&mut self, dir: PathBuf, tracks: Vec<Track>) {
+        let finished = self.queue_dir.replace(dir.clone());
+        self.queue = tracks;
+        if self.queue.is_empty() {
+            // Nothing playable after all; the count said otherwise. Keep going.
+            return self.follow_on();
+        }
+        let first = if self.shuffle {
+            self.reshuffle_from(None);
+            self.shuffle_order[0]
+        } else {
+            0
+        };
+        if self.tab == Tab::Local
+            && finished.is_some()
+            && self.selected_folder().map(|f| &f.path) == finished.as_ref()
+            && let Some(index) = self.folders.iter().position(|f| f.path == dir)
+        {
+            self.folder_state.select(Some(index + 1));
+            self.reload_tracks();
+        }
+        self.play_queue_index(first);
+    }
+
+    /// The folder listed after `dir` in its parent, or after its parent in the
+    /// grandparent, and so on up to the root. `None` past the last one.
+    fn folder_after(&mut self, dir: &Path) -> Option<Folder> {
+        let mut dir = dir.to_path_buf();
+        while dir != self.root {
+            let parent = self.parent_of(&dir)?;
+            let siblings = self.list(&parent).ok()?;
+            let at = siblings.iter().position(|f| f.path == dir)?;
+            if let Some(next) = siblings.get(at + 1) {
+                return Some(next.clone());
+            }
+            dir = parent;
+        }
+        None
+    }
+
+    /// The folder `dir` is listed in. A server's top-level folders sit among the
+    /// local ones, so their parent is the local root, not the server's own.
+    fn parent_of(&self, dir: &Path) -> Option<PathBuf> {
+        if library::remote_url(&self.root).is_none()
+            && let Some(server) = self.remote.server.as_deref()
+            && let Some(url) = library::remote_url(dir)
+            && url
+                .strip_prefix(server)
+                .is_some_and(|rest| !rest.trim_matches('/').contains('/'))
+        {
+            return Some(self.root.clone());
+        }
+        let parent = dir.parent()?;
+        (parent.starts_with(&self.root) || library::remote_url(parent).is_some())
+            .then(|| parent.to_path_buf())
     }
 
     pub fn prev_track(&mut self) {
@@ -1997,6 +2256,7 @@ impl App {
     pub fn tick(&mut self) {
         if self.queue_pos.is_some()
             && !self.is_opening()
+            && self.following_into.is_none()
             && self.audio.is_finished()
             && !self.audio.is_paused()
         {
@@ -2625,7 +2885,7 @@ mod tests {
     fn the_listing_is_recursive() {
         let lib = Library::new("recursive");
         let mut app = lib.app();
-        app.folder_state.select(Some(1)); // Artist/, which holds no files itself
+        app.folder_state.select(Some(2)); // Artist/, which holds no files itself
         app.reload_tracks();
         app.wait_for_tracks();
         assert_eq!(app.tracks.len(), 6, "both albums of the artist");
@@ -2682,6 +2942,10 @@ mod tests {
             .map(|f| f.label.as_str())
             .collect();
         assert_eq!(marked, ["Alpha", "Artist", "Beta"], "local ones are marked");
+        assert!(
+            app.folders.iter().all(|f| f.newest > 0),
+            "every folder has a time, the server's included"
+        );
 
         // Kept, with the token apart from the address.
         let saved = config::load_settings_from(&settings).remote;
@@ -3128,7 +3392,7 @@ mod tests {
     fn enter_descends_and_backspace_returns_to_the_same_row() {
         let lib = Library::new("descend");
         let mut app = lib.app();
-        app.folder_state.select(Some(1)); // Artist/
+        app.folder_state.select(Some(2)); // Artist/
         app.reload_tracks();
         app.wait_for_tracks();
 
@@ -3143,7 +3407,7 @@ mod tests {
         app.leave_folder();
         app.wait_for_tracks();
         assert_eq!(app.cwd, lib.0);
-        assert_eq!(app.folder_state.selected(), Some(1), "row restored");
+        assert_eq!(app.folder_state.selected(), Some(2), "row restored");
         assert!(!app.can_leave(), "the root is the floor");
     }
 
@@ -3154,19 +3418,25 @@ mod tests {
         let lib = Library::new("up-row");
         let mut app = lib.app();
 
-        // At the root there is nowhere to go up to, so no `..` — but the server
-        // button closes the list.
-        assert!(!app.shows_up_row());
+        // At the root `..` climbs nowhere but is still there, listing the whole
+        // library — and the server button closes the list.
+        assert!(app.shows_up_row());
         assert!(app.shows_server_row());
-        assert_eq!(app.folder_row_count(), app.folders.len() + 1);
+        assert_eq!(app.folder_row_count(), app.folders.len() + 2);
         assert!(
-            app.folder_at(app.folders.len()).is_none(),
+            app.folder_at(app.folders.len() + 1).is_none(),
             "the last row is the button"
         );
-        assert_eq!(app.folder_at(0).map(|f| f.label.as_str()), Some("Alpha"));
+        assert!(app.folder_at(0).is_none(), "row 0 is `..`, not a folder");
+        assert_eq!(app.folder_at(1).map(|f| f.label.as_str()), Some("Alpha"));
+        assert_eq!(
+            app.folder_state.selected(),
+            Some(1),
+            "starts on the first folder"
+        );
         assert!(!app.on_up_row());
 
-        app.folder_state.select(Some(1)); // Artist/
+        app.folder_state.select(Some(2)); // Artist/
         app.reload_tracks();
         app.wait_for_tracks();
         app.enter_folder();
@@ -3190,7 +3460,7 @@ mod tests {
     fn enter_on_the_up_row_climbs() {
         let lib = Library::new("enter-up");
         let mut app = lib.app();
-        app.folder_state.select(Some(1));
+        app.folder_state.select(Some(2));
         app.reload_tracks();
         app.wait_for_tracks();
         app.enter_folder();
@@ -3210,7 +3480,7 @@ mod tests {
     fn the_up_row_lists_the_current_folder() {
         let lib = Library::new("up-listing");
         let mut app = lib.app();
-        app.folder_state.select(Some(1)); // Artist/
+        app.folder_state.select(Some(2)); // Artist/
         app.reload_tracks();
         app.wait_for_tracks();
         app.enter_folder();
@@ -3229,7 +3499,7 @@ mod tests {
         let mut app = lib.app();
         app.folder_rows = rows(0, 1, 10);
 
-        let at = Position { x: 2, y: 2 }; // row 1 == Artist/
+        let at = Position { x: 2, y: 3 }; // row 2 == Artist/
         let now = Instant::now();
         app.click(at, now);
         app.wait_for_tracks();
@@ -3261,7 +3531,7 @@ mod tests {
         let lib = Library::new("dbl-up");
         let mut app = lib.app();
         app.folder_rows = rows(0, 1, 10);
-        app.folder_state.select(Some(1));
+        app.folder_state.select(Some(2));
         app.reload_tracks();
         app.wait_for_tracks();
         app.enter_folder();
@@ -3282,7 +3552,7 @@ mod tests {
     fn entering_a_leaf_moves_focus_instead() {
         let lib = Library::new("leaf");
         let mut app = lib.app();
-        app.folder_state.select(Some(0)); // Alpha/, files only
+        app.folder_state.select(Some(1)); // Alpha/, files only
         app.reload_tracks();
         app.wait_for_tracks();
 
@@ -3310,7 +3580,7 @@ mod tests {
         assert!(started.is_some(), "playback failed: {}", app.status);
 
         // Wander off to a different folder entirely.
-        app.folder_state.select(Some(1));
+        app.folder_state.select(Some(2));
         app.reload_tracks();
         app.wait_for_tracks();
         assert_eq!(app.tracks.len(), 6, "now listing the artist");
@@ -3329,16 +3599,58 @@ mod tests {
         );
     }
 
+    /// A folder that changed since it was read is read again once the folder list
+    /// is rebuilt — a file added, or one rewritten in place with the count the same,
+    /// the way a tag edit is.
+    #[test]
+    fn a_changed_folder_is_not_served_from_memory() {
+        /// Browsing, which is what lists the root again — unlike a refresh, which
+        /// forgets everything anyway.
+        fn in_and_out_of_artist(app: &mut App) {
+            app.select_folder(2);
+            app.wait_for_tracks();
+            app.enter_folder();
+            app.wait_for_tracks();
+            app.leave_folder();
+            app.wait_for_tracks();
+        }
+
+        let lib = Library::new("memo-stale");
+        let mut app = lib.app(); // Alpha is listed, and remembered
+        app.wait_for_tracks();
+        assert_eq!(app.tracks.len(), 3);
+
+        std::fs::write(lib.0.join("Alpha").join("04 new.wav"), silent_wav(1)).unwrap();
+        in_and_out_of_artist(&mut app);
+        app.select_folder(1);
+        assert!(app.tracks_loading, "Alpha grew, yet came from the memo");
+        app.wait_for_tracks();
+        assert_eq!(app.tracks.len(), 4);
+
+        // Same count, newer file.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(lib.0.join("Alpha").join("01 song.wav"), silent_wav(3)).unwrap();
+        in_and_out_of_artist(&mut app);
+        app.select_folder(1);
+        assert!(app.tracks_loading, "a rewritten file went unnoticed");
+        app.wait_for_tracks();
+
+        // And unchanged, it is remembered again.
+        in_and_out_of_artist(&mut app);
+        app.select_folder(1);
+        assert!(!app.tracks_loading, "an unchanged folder was read again");
+    }
+
     /// A second visit to a folder must come from the memo, not another scan.
     #[test]
     fn revisiting_a_folder_is_served_from_memory() {
         let lib = Library::new("memo");
         let mut app = lib.app();
-        app.folder_state.select(Some(1));
+        app.folder_state.select(Some(2));
         app.reload_tracks();
         app.wait_for_tracks();
 
-        app.folder_state.select(Some(0));
+        app.folder_state.select(Some(1));
         app.reload_tracks();
         assert!(!app.tracks_loading, "Alpha should have been remembered");
         assert_eq!(app.tracks.len(), 3);
@@ -3352,8 +3664,8 @@ mod tests {
         let lib = Library::new("stale-scan");
         let mut app = lib.app(); // Alpha is listed, and now remembered
 
-        app.select_folder(1); // Artist/, 6 tracks — the scan is in flight
-        app.select_folder(0); // straight back to Alpha, served from the memo
+        app.select_folder(2); // Artist/, 6 tracks — the scan is in flight
+        app.select_folder(1); // straight back to Alpha, served from the memo
         assert_eq!(app.tracks.len(), 3, "Alpha, from the memo");
 
         // Every chance for the Artist scan to finish and be picked up.
@@ -3364,10 +3676,10 @@ mod tests {
         assert_eq!(app.tracks.len(), 3, "Artist's scan landed on Alpha");
 
         // And the memo still has to answer for the right folders.
-        app.select_folder(1);
+        app.select_folder(2);
         app.wait_for_tracks();
         assert_eq!(app.tracks.len(), 6, "Artist");
-        app.select_folder(0);
+        app.select_folder(1);
         app.wait_for_tracks();
         assert_eq!(app.tracks.len(), 3, "Alpha, remembered as Artist's tracks");
     }
@@ -3467,12 +3779,12 @@ mod tests {
         let mut app = lib.app();
         app.folder_rows = rows(0, 1, 10);
 
-        app.click(Position { x: 2, y: 2 }, Instant::now());
+        app.click(Position { x: 2, y: 3 }, Instant::now());
         app.wait_for_tracks();
 
         assert_eq!(app.focus, Pane::Folders);
-        assert_eq!(app.folder_state.selected(), Some(1), "second row");
-        // Row 1 is Artist/, whose six tracks live in two subfolders.
+        assert_eq!(app.folder_state.selected(), Some(2), "third row");
+        // Row 2 is Artist/, whose six tracks live in two subfolders.
         assert_eq!(app.tracks.len(), 6, "listed recursively");
     }
 
@@ -3505,7 +3817,7 @@ mod tests {
         assert_eq!(app.track_state.selected(), Some(1), "tracks scrolled");
         assert_eq!(
             app.folder_state.selected(),
-            Some(0),
+            Some(1),
             "focused pane untouched"
         );
     }
@@ -4083,7 +4395,7 @@ mod tests {
     fn shuffle_plays_the_whole_queue_exactly_once() {
         let lib = Library::new("shuffle-cover");
         let mut app = lib.app();
-        app.select_folder(1); // Artist, four tracks under Late plus two under Early
+        app.select_folder(2); // Artist, four tracks under Late plus two under Early
         app.wait_for_tracks();
         let total = app.tracks.len();
         assert!(total >= 4, "need a few tracks to shuffle, got {total}");
@@ -4096,9 +4408,9 @@ mod tests {
             app.next_track();
             heard.push(app.queue_pos.expect("still playing"));
         }
+        // Used up, so on into the next folder rather than round this one again.
         app.next_track();
-        assert!(!app.is_playing_something(), "shuffle ran past the queue");
-        assert_eq!(app.status, "end of queue");
+        assert_eq!(app.following_into, Some(lib.0.join("Beta")));
 
         let mut seen = heard.clone();
         seen.sort_unstable();
@@ -4109,6 +4421,141 @@ mod tests {
             "a track was repeated or skipped: {heard:?}"
         );
         assert_eq!(heard[0], 0, "the track you started stays the one playing");
+    }
+
+    /// With a server, `..` at the root takes in its folders too — each folder once,
+    /// the local one where both have it, as in the folder list — and what was
+    /// already listed is not asked for again.
+    #[test]
+    fn the_whole_library_takes_in_the_server() {
+        let lib = Library::new("whole-served");
+        let served = crate::server::TempDir::new("whole-served-srv");
+        let wav = silent_wav(2);
+        for (album, name) in [("Gamma", "01 far.wav"), ("Alpha", "01 there.wav")] {
+            let dir = served.0.join(album);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), &wav).unwrap();
+        }
+        let addr = crate::server::spawn_for_test(&served.0, Some("k"));
+
+        let mut app = lib.app();
+        app.settings_file = Some(lib.0.join("settings.txt"));
+        app.open_add_server();
+        for c in format!("k@{addr}").chars() {
+            app.prompt_key(c);
+        }
+        app.submit_prompt();
+        app.wait_for_tracks();
+        assert!(
+            app.memo.contains_key(&lib.0.join("Alpha")),
+            "Alpha was listed"
+        );
+
+        app.select_folder(0);
+        app.wait_for_tracks();
+        let far = PathBuf::from(format!("tuneterm://{addr}/Gamma/01 far.wav"));
+        let there = PathBuf::from(format!("tuneterm://{addr}/Alpha/01 there.wav"));
+        assert_eq!(app.tracks.len(), 12, "eleven here and Gamma's one");
+        assert_eq!(
+            app.tracks.last().map(|t| &t.path),
+            Some(&far),
+            "in folder order"
+        );
+        assert!(
+            !app.tracks.iter().any(|t| t.path == there),
+            "Alpha is the local one"
+        );
+        assert!(
+            app.memo.contains_key(&lib.0.join("Artist")),
+            "folders listed on the way are remembered"
+        );
+    }
+
+    /// Block until the folder playback is running on into has been listed.
+    fn wait_for_follow(app: &mut App) {
+        for _ in 0..400 {
+            app.poll_follow();
+            if app.following_into.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the next folder was never listed");
+    }
+
+    /// `..` at the root is the whole library: every folder, and every level down.
+    #[test]
+    fn the_up_row_at_the_root_lists_everything() {
+        let lib = Library::new("root-up");
+        let mut app = lib.app();
+        app.select_folder(0);
+        app.wait_for_tracks();
+        assert_eq!(app.listing_dir(), lib.0);
+        assert_eq!(app.tracks.len(), 11, "Alpha, both albums of Artist, Beta");
+
+        // Enter there has nowhere to climb to, so it goes to the tracks.
+        app.enter_folder();
+        assert_eq!(app.cwd, lib.0);
+        assert_eq!(app.focus, Pane::Tracks);
+    }
+
+    /// The end of a folder is not the end of the music: it goes on into the one
+    /// listed after it, and the cursor follows it there.
+    #[test]
+    fn a_finished_folder_runs_on_into_the_next() {
+        let lib = Library::new("run-on");
+        let mut app = lib.app(); // on Alpha, three tracks
+        app.wait_for_tracks();
+        app.play_index(2);
+        app.next_track();
+        wait_for_follow(&mut app);
+
+        let playing = app.now_playing().expect("stopped at the end of Alpha");
+        assert!(
+            playing.path.starts_with(lib.0.join("Artist").join("Early")),
+            "{:?}",
+            playing.path
+        );
+        assert_eq!(
+            app.selected_folder().map(|f| f.label.as_str()),
+            Some("Artist")
+        );
+    }
+
+    /// Out of an album, on into the artist's next album; out of the artist's last,
+    /// on into what follows the artist; and past the last folder, a stop.
+    #[test]
+    fn running_on_climbs_out_and_stops_at_the_end() {
+        let lib = Library::new("run-on-climb");
+        let mut app = lib.app();
+        app.select_folder(2); // Artist/
+        app.wait_for_tracks();
+        app.enter_folder(); // on Early
+        app.wait_for_tracks();
+
+        app.play_index(1); // Early's last
+        app.next_track();
+        wait_for_follow(&mut app);
+        let playing = app.now_playing().expect("stopped after Early").path.clone();
+        assert!(
+            playing.starts_with(lib.0.join("Artist").join("Late")),
+            "{playing:?}"
+        );
+
+        app.queue_pos = Some(app.queue.len() - 1); // Late's last
+        app.next_track();
+        wait_for_follow(&mut app);
+        let playing = app
+            .now_playing()
+            .expect("stopped after Artist")
+            .path
+            .clone();
+        assert!(playing.starts_with(lib.0.join("Beta")), "{playing:?}");
+
+        app.queue_pos = Some(app.queue.len() - 1); // Beta's last, and the library's
+        app.next_track();
+        assert!(!app.is_playing_something());
+        assert_eq!(app.status, "end of queue");
     }
 
     /// The coverage test above would still pass if the "permutation" came back in

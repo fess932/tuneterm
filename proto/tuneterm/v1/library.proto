@@ -58,6 +58,10 @@ message Folder {
   string path = 1;
   string name = 2;
   uint32 count = 3;
+  // Newest modification time under the folder, in nanoseconds since the epoch.
+  // With the count, how a client tells a listing it read before is still good.
+  // 0 from a server that predates it, which never reads as a change.
+  uint64 newest = 4;
 }
 
 message ListTracksRequest {

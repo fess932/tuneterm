@@ -489,6 +489,7 @@ fn run(
         app.poll_tracks();
         app.poll_feed();
         app.poll_open();
+        app.poll_follow();
         app.poll_move();
         app.poll_seek();
         app.refresh_cover_for_resize();
